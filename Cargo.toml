@@ -1,0 +1,42 @@
+[package]
+name = "loupe"
+version = "0.1.0"
+edition = "2021"
+description = "Loupe — a mouse-first TUI for reviewing GitHub pull requests and local changes"
+license = "MIT"
+repository = "https://github.com/jjacoblee/Loupe"
+homepage = "https://github.com/jjacoblee/Loupe"
+readme = "README.md"
+keywords = ["tui", "github", "pull-request", "code-review", "git"]
+categories = ["command-line-utilities", "development-tools"]
+# The crate name `loupe` on crates.io belongs to an unrelated project, so
+# this package is guarded against accidental publishing. Install with
+# `cargo install --git` or the prebuilt release binaries; drop this (and
+# pick a unique name) if it is ever published to a registry.
+publish = false
+
+[[bin]]
+name = "loupe"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = "0.7"
+similar = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+unicode-width = "0.2"
+# Pure-Rust build (fancy-regex engine) — no C oniguruma dependency.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
+toml_edit = "0.25.13"
+
+[profile.release]
+lto = true
+strip = true
+# One codegen unit lets LLVM optimize across the whole crate — syntect's
+# regex-heavy highlighting gains measurably; only build time pays.
+codegen-units = 1

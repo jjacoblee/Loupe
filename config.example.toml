@@ -1,0 +1,29 @@
+# loupe configuration — copy to ~/.config/loupe/config.toml (global) or to
+# .loupe.toml at a repository root (per-repo; wins over the global file).
+# Every key is optional. `loupe --help` documents the semantics.
+#
+# You rarely need to edit this by hand: the first launch runs a setup
+# wizard that writes the global file, the in-app theme picker (press t)
+# saves your theme choice, and `loupe set-theme <name>` does it from the
+# shell.
+
+# Upstream GitHub organization (or user) that pull requests are opened
+# against. When set, loupe lists and opens PRs on <org>/<repo-name> instead
+# of the clone's own owner — useful for fork workflows and for people who
+# work across several organizations. Pin per-project in .loupe.toml.
+#org = "acme"
+
+# Default startup mode when no --pr/--local/--auto flag is given:
+#   "auto"  — review uncommitted local changes if any, else the PR flow
+#   "pr"    — always go straight to pull requests
+#   "local" — always review local changes
+#mode = "auto"
+
+# Syntax-highlighting theme. `loupe --themes` prints every valid name;
+# press t inside loupe for a live-preview picker. Default: catppuccin-mocha.
+#theme = "catppuccin-mocha"
+
+# Starting width of the file panel, in columns. Drag the divider between the
+# panels (or press < / >) to change it while running; double-click the
+# divider to come back to the default of 34.
+#file_panel_width = 34
