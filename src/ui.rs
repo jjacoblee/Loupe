@@ -5,6 +5,7 @@ use crate::app::{App, ButtonId, FileEntry, Overlay, Screen, ViewMode};
 use crate::diff::{DisplayEntry, Row, RowKind, Side, TAB_WIDTH};
 use crate::gitops::StageState;
 use crate::highlight::HlLine;
+use crate::theme::palette;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -12,27 +13,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
-const BG_ADDED: Color = Color::Rgb(16, 50, 26);
-const BG_REMOVED: Color = Color::Rgb(58, 22, 22);
-const BG_EMPTY: Color = Color::Rgb(24, 24, 28);
-const BG_SELECTED: Color = Color::Rgb(28, 66, 120);
-/// Cursor row with no diff background of its own. The underline does the
-/// real work (it survives any background, and matches the editor's cursor
-/// line); this just makes it easier to find at a glance.
-const BG_CURSOR: Color = Color::Rgb(38, 38, 48);
-const FG_LN: Color = Color::Rgb(110, 110, 120);
-const FG_DIR: Color = Color::Rgb(140, 170, 230);
-const FG_VIEWED: Color = Color::Rgb(125, 125, 135);
-const FG_STAGE_ADD: Color = Color::Rgb(150, 200, 255);
-const FG_STAGE_PARTIAL: Color = Color::Rgb(230, 190, 100);
-const FG_FOLD: Color = Color::Rgb(130, 140, 160);
 /// Width of the Tree/Flat toggle drawn on the file panel's top border.
 const TOGGLE_W: usize = 13;
-
-const FG_DIVIDER: Color = Color::Rgb(60, 60, 70);
-const FG_DIVIDER_ACTIVE: Color = Color::Rgb(120, 170, 240);
-const BTN_BG: Color = Color::Rgb(45, 45, 55);
-const BTN_ACTIVE_BG: Color = Color::Rgb(30, 90, 160);
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.layout = Default::default();
@@ -137,6 +119,7 @@ fn buttons_right(f: &mut Frame, app: &mut App, area: Rect, buttons: &[(&str, But
                 + 3
         })
         .sum();
+    let p = palette();
     let mut x = area.x + area.width.saturating_sub(total);
     for (label, id, active) in buttons {
         let w: u16 = label
@@ -152,11 +135,11 @@ fn buttons_right(f: &mut Frame, app: &mut App, area: Rect, buttons: &[(&str, But
         };
         let style = if *active {
             Style::default()
-                .bg(BTN_ACTIVE_BG)
-                .fg(Color::White)
+                .bg(p.btn_active_bg)
+                .fg(p.btn_active_fg)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(BTN_BG).fg(Color::Gray)
+            Style::default().bg(p.btn_bg).fg(p.btn_fg)
         };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(format!(" {label} "), style))),
@@ -181,18 +164,22 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 // ------------------------------------------------------------------ top bars
 
 fn draw_topbar_prlist(f: &mut Frame, app: &mut App, area: Rect) {
+    let p = palette();
     let repo = app.repo.clone().unwrap_or_else(|| "…".into());
     let title = Line::from(vec![
         Span::styled(
             " 🔍 loupe ",
             Style::default()
-                .bg(Color::Rgb(90, 50, 140))
-                .fg(Color::White)
+                .bg(p.badge_pr)
+                .fg(p.badge_fg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(repo, Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("  — open pull requests", Style::default().fg(Color::Gray)),
+        Span::styled(
+            repo,
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  — open pull requests", Style::default().fg(p.dim)),
     ]);
     f.render_widget(Paragraph::new(title), area);
     buttons_right(
@@ -211,6 +198,7 @@ fn draw_topbar_prlist(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
     // Badge + title: "PR #N — <title>" for a PR review, "LOCAL — <branch>,
     // uncommitted changes" when reviewing the working tree.
+    let p = palette();
     let (badge, badge_bg, title, note) = if app.local {
         let branch = app
             .local_branch
@@ -218,7 +206,7 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
             .unwrap_or_else(|| "detached HEAD".into());
         (
             " ⎇ LOCAL ".to_string(),
-            Color::Rgb(20, 95, 55),
+            p.badge_local,
             branch,
             "  — uncommitted changes vs HEAD",
         )
@@ -228,22 +216,22 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
             .as_ref()
             .map(|p| (p.number, p.title.clone()))
             .unwrap_or((0, String::new()));
-        (format!(" PR #{num} "), Color::Rgb(90, 50, 140), title, "")
+        (format!(" PR #{num} "), p.badge_pr, title, "")
     };
     let left = Line::from(vec![
         Span::styled(
             badge,
             Style::default()
                 .bg(badge_bg)
-                .fg(Color::White)
+                .fg(p.badge_fg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::styled(
             tail_truncate(&title, (area.width / 3) as usize),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(note, Style::default().fg(Color::Gray)),
+        Span::styled(note, Style::default().fg(p.dim)),
     ]);
     f.render_widget(Paragraph::new(left), area);
 
@@ -291,6 +279,7 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
 // ------------------------------------------------------------------ PR list
 
 fn draw_pr_list(f: &mut Frame, app: &mut App, area: Rect) {
+    let p = palette();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Click a pull request to review it ");
@@ -305,7 +294,7 @@ fn draw_pr_list(f: &mut Frame, app: &mut App, area: Rect) {
             "No open pull requests — press r to refresh"
         };
         f.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::Gray)),
+            Paragraph::new(text).style(Style::default().fg(p.dim)),
             inner,
         );
         return;
@@ -330,15 +319,13 @@ fn draw_pr_list(f: &mut Frame, app: &mut App, area: Rect) {
             pr.author.login, pr.head_ref_name, pr.additions, pr.deletions
         );
         let base = if selected {
-            Style::default()
-                .bg(Color::Rgb(40, 40, 60))
-                .add_modifier(Modifier::BOLD)
+            Style::default().bg(p.row).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
         lines.push(Line::from(vec![
-            Span::styled(text, base.fg(Color::White)),
-            Span::styled(meta, base.fg(Color::Gray)),
+            Span::styled(text, base.fg(p.text)),
+            Span::styled(meta, base.fg(p.dim)),
         ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -385,10 +372,11 @@ fn draw_divider_grip(f: &mut Frame, app: &App) {
     if d.width == 0 || d.height < 3 {
         return;
     }
+    let p = palette();
     let style = Style::default().fg(if app.resizing() {
-        FG_DIVIDER_ACTIVE
+        p.divider_active
     } else {
-        FG_DIVIDER
+        p.divider
     });
     let (top, height) = if app.resizing() {
         (d.y, d.height)
@@ -409,6 +397,7 @@ fn draw_divider_grip(f: &mut Frame, app: &App) {
 }
 
 fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
+    let p = palette();
     // Local review counts staged files; PR review counts viewed ones.
     let viewed_n = if app.local {
         app.staged_count()
@@ -473,7 +462,7 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                 let text = format!("{}{arrow} {label}", " ".repeat(*depth as usize));
                 lines.push(Line::from(Span::styled(
                     truncate_pad(&text, inner.width as usize),
-                    Style::default().fg(FG_DIR),
+                    Style::default().fg(p.dir),
                 )));
             }
             FileEntry::File { idx, depth } => {
@@ -489,37 +478,33 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                 };
                 let sc = file.status_char();
                 let sc_color = match sc {
-                    'A' => Color::Green,
-                    'D' => Color::Red,
-                    'R' | 'C' => Color::Yellow,
-                    _ => Color::Cyan,
+                    'A' => p.st_added,
+                    'D' => p.st_removed,
+                    'R' | 'C' => p.st_renamed,
+                    _ => p.st_other,
                 };
                 let (cb, cb_style) = if app.local {
                     match staged {
                         StageState::Staged => (
                             "[✓]",
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(p.st_added).add_modifier(Modifier::BOLD),
                         ),
                         // Staged, then edited again (or `git add -p`).
                         StageState::Partial => (
                             "[±]",
                             Style::default()
-                                .fg(FG_STAGE_PARTIAL)
+                                .fg(p.stage_partial)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        StageState::Unstaged => ("[+]", Style::default().fg(FG_STAGE_ADD)),
+                        StageState::Unstaged => ("[+]", Style::default().fg(p.stage_add)),
                     }
                 } else if done {
                     (
                         "[✓]",
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(p.st_added).add_modifier(Modifier::BOLD),
                     )
                 } else {
-                    ("[ ]", Style::default().fg(Color::Rgb(200, 200, 210)))
+                    ("[ ]", Style::default().fg(p.checkbox))
                 };
                 let name = if app.tree_view {
                     file.path.rsplit('/').next().unwrap_or(&file.path)
@@ -533,19 +518,17 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                 let name_t = tail_truncate(name, name_w);
                 let pad = name_w.saturating_sub(disp_width(&name_t));
                 let base = if selected {
-                    Style::default()
-                        .bg(Color::Rgb(40, 40, 60))
-                        .add_modifier(Modifier::BOLD)
+                    Style::default().bg(p.row).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
-                let name_fg = if done { FG_VIEWED } else { Color::White };
+                let name_fg = if done { p.viewed } else { p.text };
                 lines.push(Line::from(vec![
                     Span::styled(" ".repeat(indent), base),
                     Span::styled(format!("{cb} "), base.patch(cb_style)),
                     Span::styled(format!("{sc} "), base.fg(sc_color)),
                     Span::styled(format!("{name_t}{}", " ".repeat(pad)), base.fg(name_fg)),
-                    Span::styled(counts, base.fg(Color::Gray)),
+                    Span::styled(counts, base.fg(p.dim)),
                 ]));
             }
         }
@@ -556,11 +539,12 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
 // ------------------------------------------------------------------ diff
 
 fn diff_bg(kind: RowKind, side: Side) -> Option<Color> {
+    let p = palette();
     match (kind, side) {
-        (RowKind::Added, Side::Right) => Some(BG_ADDED),
-        (RowKind::Removed, Side::Left) => Some(BG_REMOVED),
-        (RowKind::Modified, Side::Left) => Some(BG_REMOVED),
-        (RowKind::Modified, Side::Right) => Some(BG_ADDED),
+        (RowKind::Added, Side::Right) => Some(p.added),
+        (RowKind::Removed, Side::Left) => Some(p.removed),
+        (RowKind::Modified, Side::Left) => Some(p.removed),
+        (RowKind::Modified, Side::Right) => Some(p.added),
         _ => None,
     }
 }
@@ -647,6 +631,7 @@ fn cell<'a>(
     cursor: bool,
     hl: Option<&HlLine>,
 ) -> Vec<Span<'a>> {
+    let p = palette();
     let (ln, text) = match side {
         Side::Left => (row.old_ln, row.old_text.as_deref()),
         Side::Right => (row.new_ln, row.new_text.as_deref()),
@@ -660,7 +645,7 @@ fn cell<'a>(
         None => {
             // This side has no line here (pure add/remove): hatched filler.
             let filler = truncate_pad("", width);
-            let mut style = Style::default().bg(BG_EMPTY);
+            let mut style = Style::default().bg(p.empty);
             if cursor {
                 style = style.add_modifier(Modifier::UNDERLINED);
             }
@@ -668,11 +653,11 @@ fn cell<'a>(
         }
         Some(t) => {
             let bg = if selected {
-                Some(BG_SELECTED)
+                Some(p.selected)
             } else {
-                diff_bg(row.kind, side).or(if cursor { Some(BG_CURSOR) } else { None })
+                diff_bg(row.kind, side).or(if cursor { Some(p.cursor) } else { None })
             };
-            let mut ln_style = Style::default().fg(FG_LN);
+            let mut ln_style = Style::default().fg(p.line_no);
             let mut base = Style::default();
             if let Some(bg) = bg {
                 ln_style = ln_style.bg(bg);
@@ -686,19 +671,20 @@ fn cell<'a>(
                 base = base.add_modifier(Modifier::UNDERLINED);
             }
             let mut spans = vec![Span::styled(ln_str, ln_style)];
-            spans.extend(hl_body(t, hl, skip, body_w, base, Color::White));
+            spans.extend(hl_body(t, hl, skip, body_w, base, p.text));
             spans
         }
     }
 }
 
 fn banner_line<'a>(width: usize, label: String, fg: Color, cursor: bool) -> Line<'a> {
+    let p = palette();
     let lw = disp_width(&label);
     let left = width.saturating_sub(lw) / 2;
     let right = width.saturating_sub(lw + left);
-    let mut style = Style::default().bg(BG_EMPTY).fg(fg);
+    let mut style = Style::default().bg(p.empty).fg(fg);
     if cursor {
-        style = style.add_modifier(Modifier::UNDERLINED).fg(Color::White);
+        style = style.add_modifier(Modifier::UNDERLINED).fg(p.text);
     }
     Line::from(vec![
         Span::styled(" ".repeat(left), style),
@@ -711,7 +697,7 @@ fn fold_line<'a>(width: usize, count: usize, cursor: bool) -> Line<'a> {
     banner_line(
         width,
         format!("···  {count} unchanged lines — click to expand  ···"),
-        FG_FOLD,
+        palette().fold,
         cursor,
     )
 }
@@ -721,12 +707,13 @@ fn unfold_line<'a>(width: usize, count: usize, cursor: bool) -> Line<'a> {
     banner_line(
         width,
         format!("⌃⌃⌃  {count} unchanged lines — click to fold  ⌃⌃⌃"),
-        FG_FOLD,
+        palette().fold,
         cursor,
     )
 }
 
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
+    let p = palette();
     let file = app.files.get(app.file_cursor);
     // Sideways offset is easy to lose track of — say so in the title.
     let hoff = if app.diff_hscroll > 0 {
@@ -751,7 +738,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
 
     let Some(diff) = &app.diff else {
         f.render_widget(
-            Paragraph::new("Select a file on the left.").style(Style::default().fg(Color::Gray)),
+            Paragraph::new("Select a file on the left.").style(Style::default().fg(p.dim)),
             inner,
         );
         return;
@@ -799,7 +786,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                 let lhl = row.old_ln.and_then(|n| app.old_hl.get(n - 1));
                 let rhl = row.new_ln.and_then(|n| app.new_hl.get(n - 1));
                 let mut spans = cell(row, Side::Left, hskip, lw, lsel, cur, lhl);
-                spans.push(Span::styled("│", Style::default().fg(FG_DIVIDER)));
+                spans.push(Span::styled("│", Style::default().fg(p.divider)));
                 spans.extend(cell(row, Side::Right, hskip, rw, rsel, cur, rhl));
                 lines.push(Line::from(spans));
             }
@@ -833,12 +820,12 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                     Side::Right => row.new_ln.and_then(|n| app.new_hl.get(n - 1)),
                 };
                 let bg = if sel {
-                    Some(BG_SELECTED)
+                    Some(p.selected)
                 } else {
                     match mark {
-                        '+' => Some(BG_ADDED),
-                        '-' => Some(BG_REMOVED),
-                        _ if cur => Some(BG_CURSOR),
+                        '+' => Some(p.added),
+                        '-' => Some(p.removed),
+                        _ if cur => Some(p.cursor),
                         _ => None,
                     }
                 };
@@ -854,7 +841,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                     },
                 );
                 let body_w = w.saturating_sub(gutter.chars().count());
-                let mut gs = Style::default().fg(FG_LN);
+                let mut gs = Style::default().fg(p.line_no);
                 let mut base = Style::default();
                 if let Some(bg) = bg {
                     gs = gs.bg(bg);
@@ -868,14 +855,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                     base = base.add_modifier(Modifier::UNDERLINED);
                 }
                 let mut spans = vec![Span::styled(gutter, gs)];
-                spans.extend(hl_body(
-                    text.unwrap_or(""),
-                    hl,
-                    hskip,
-                    body_w,
-                    base,
-                    Color::White,
-                ));
+                spans.extend(hl_body(text.unwrap_or(""), hl, hskip, body_w, base, p.text));
                 lines.push(Line::from(spans));
             }
         }
@@ -886,28 +866,33 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
 // ------------------------------------------------------------------ overlays
 
 fn draw_checkout_prompt(f: &mut Frame, app: &mut App, area: Rect, number: u64) {
+    let p = palette();
     let rect = centered(area, 64, 9);
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().fg(p.text))
         .title(format!(" Open PR #{number} "));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
     let text = vec![
-        Line::from("Check out the PR branch locally?"),
+        Line::from(Span::styled(
+            "Check out the PR branch locally?",
+            Style::default().fg(p.text),
+        )),
         Line::from(Span::styled(
             "Checkout & review — switches your working tree to the PR branch",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(p.dim),
         )),
         Line::from(Span::styled(
             "and lets you edit files directly in the diff view.",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(p.dim),
         )),
         Line::from(Span::styled(
             "Review only — no checkout; commenting works, editing is off.",
-            Style::default().fg(Color::Gray),
+            Style::default().fg(p.dim),
         )),
     ];
     f.render_widget(Paragraph::new(text), inner);
@@ -948,7 +933,7 @@ fn draw_comment_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(palette().accent))
         .title(format!(" 💬 Comment · {}:{} ({side}) ", draft.path, range));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -959,6 +944,25 @@ fn draw_comment_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         width: inner.width,
         height: inner.height.saturating_sub(1),
     };
+    // tui-textarea's own defaults are named ANSI colors chosen for a dark
+    // terminal (a bright-black placeholder, a light-blue selection). This
+    // is the one widget loupe renders rather than draws, so its styles are
+    // set from the palette here — every frame, so the theme picker's
+    // light/dark switch reaches it too.
+    let p = palette();
+    draft.textarea.set_style(Style::default().fg(p.text));
+    draft
+        .textarea
+        .set_placeholder_style(Style::default().fg(p.dim));
+    draft
+        .textarea
+        .set_selection_style(Style::default().bg(p.editor_sel).fg(p.text));
+    draft
+        .textarea
+        .set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    draft
+        .textarea
+        .set_cursor_line_style(Style::default().fg(p.text));
     f.render_widget(&draft.textarea, ta_area);
 
     let btn_area = Rect {
@@ -979,17 +983,24 @@ fn draw_comment_overlay(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_theme_picker(f: &mut Frame, app: &mut App, area: Rect) {
+    let p = palette();
     let rect = centered(area, 84, area.height.min(28));
     f.render_widget(Clear, rect);
     let Overlay::ThemePicker(tp) = &mut app.overlay else {
         return;
     };
     let name = crate::highlight::THEMES[tp.sel].0;
+    // Which half of the config the pick will be saved into.
+    let slot = if crate::theme::appearance().is_light() {
+        "light terminals"
+    } else {
+        "dark terminals"
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" 🎨 Theme — the preview is live ")
-        .title_bottom(" j/k or click to try · Enter to keep · Esc to cancel ");
+        .border_style(Style::default().fg(p.accent))
+        .title(format!(" 🎨 Theme for {slot} — the preview is live "))
+        .title_bottom(" j/k or click to try · a light/dark · Enter to keep · Esc to cancel ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -1027,11 +1038,11 @@ fn draw_theme_picker(f: &mut Frame, app: &mut App, area: Rect) {
         let selected = idx == tp.sel;
         let style = if selected {
             Style::default()
-                .bg(BG_SELECTED)
-                .fg(Color::White)
+                .bg(p.selected)
+                .fg(p.text)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(p.dim)
         };
         let marker = if selected { "▸ " } else { "  " };
         f.render_widget(
@@ -1042,7 +1053,10 @@ fn draw_theme_picker(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // The sample, with one removed + one added row so the diff backgrounds
-    // are previewed against the theme too.
+    // are previewed against the theme too. The panel is filled with the
+    // theme's *own* background, which is what makes a light theme look
+    // light here instead of only once you've committed to it.
+    let sample_bg = crate::highlight::theme_background(crate::highlight::THEMES[tp.sel].1);
     let sample_lines: Vec<&str> = crate::wizard::SAMPLE.lines().collect();
     let mut lines: Vec<Line> = Vec::new();
     for (i, text) in sample_lines
@@ -1051,9 +1065,9 @@ fn draw_theme_picker(f: &mut Frame, app: &mut App, area: Rect) {
         .take(sample_area.height as usize)
     {
         let bg = match i {
-            11 => Some(BG_REMOVED),
-            12 => Some(BG_ADDED),
-            _ => None,
+            11 => Some(p.removed),
+            12 => Some(p.added),
+            _ => sample_bg,
         };
         let spans: Vec<Span> = match tp.preview.get(i) {
             Some(segs) if !segs.is_empty() => segs
@@ -1066,7 +1080,7 @@ fn draw_theme_picker(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::styled(s.clone(), st)
                 })
                 .collect(),
-            _ => vec![Span::raw(*text)],
+            _ => vec![Span::styled(*text, Style::default().fg(p.text))],
         };
         let mut line = Line::from(spans);
         if let Some(b) = bg {
@@ -1074,7 +1088,11 @@ fn draw_theme_picker(f: &mut Frame, app: &mut App, area: Rect) {
         }
         lines.push(line);
     }
-    f.render_widget(Paragraph::new(lines), sample_area);
+    let mut sample = Paragraph::new(lines);
+    if let Some(b) = sample_bg {
+        sample = sample.style(Style::default().bg(b));
+    }
+    f.render_widget(sample, sample_area);
 
     app.layout.buttons.extend(rows);
     let btn_area = Rect {
@@ -1083,11 +1101,17 @@ fn draw_theme_picker(f: &mut Frame, app: &mut App, area: Rect) {
         width: inner.width,
         height: 1,
     };
+    let flip = if crate::theme::appearance().is_light() {
+        "🌙 Dark (a)"
+    } else {
+        "☀ Light (a)"
+    };
     buttons_right(
         f,
         app,
         btn_area,
         &[
+            (flip, ButtonId::AppearanceToggle, false),
             (&format!("Use {name} (Enter)"), ButtonId::ThemeApply, true),
             ("Cancel (Esc)", ButtonId::ThemeCancel, false),
         ],
@@ -1095,18 +1119,19 @@ fn draw_theme_picker(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
+    let p = palette();
     let rect = centered(area, 84, 27);
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(p.accent))
         .title(" Help — loupe ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let head = Style::default().add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Color::Gray);
-    let key = Style::default().fg(Color::Rgb(150, 200, 255));
+    let head = Style::default().fg(p.text).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(p.dim);
+    let key = Style::default().fg(p.key);
 
     // Two columns of "keys — what they do", so the whole reference fits on
     // one screen.
@@ -1189,9 +1214,12 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ),
         row(
             ("t", "theme picker (live preview)"),
+            ("t then a", "switch light / dark"),
+        ),
+        row(
+            ("b / q", "back to the PR list / quit"),
             ("Esc", "clear selection, then back"),
         ),
-        row(("b / q", "back to the PR list / quit"), ("", "")),
         Line::from(""),
         Line::from(Span::styled(
             "  Editor: Ctrl+S save · Esc close (twice to discard) · Ctrl+Z undo · Ctrl+Y redo",
@@ -1204,6 +1232,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
 // ------------------------------------------------------------------ status
 
 fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
+    let p = palette();
     if let Some((frame, label, cancellable)) = app.spinner() {
         let cancel = if cancellable {
             "  ·  press c to cancel"
@@ -1213,23 +1242,18 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
         let line = Line::from(vec![
             Span::styled(
                 format!(" {frame} "),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!("{label}…"),
-                Style::default().fg(Color::Rgb(150, 200, 255)),
-            ),
-            Span::styled(cancel, Style::default().fg(Color::Rgb(100, 100, 110))),
+            Span::styled(format!("{label}…"), Style::default().fg(p.key)),
+            Span::styled(cancel, Style::default().fg(p.faint)),
         ]);
         f.render_widget(Paragraph::new(line), area);
         return;
     }
     let style = if app.status_err {
-        Style::default().fg(Color::Rgb(255, 140, 140))
+        Style::default().fg(p.err)
     } else {
-        Style::default().fg(Color::Rgb(140, 200, 140))
+        Style::default().fg(p.ok)
     };
     let hints = match app.screen {
         Screen::PrList => "l local changes · r refresh · ? help · q quit",
@@ -1250,14 +1274,14 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
     let msg: Span = match app.quiet_spinner() {
         Some((frame, label)) => Span::styled(
             truncate_pad(&format!("{frame} {label}…"), msg_w),
-            Style::default().fg(Color::Rgb(150, 200, 255)),
+            Style::default().fg(p.key),
         ),
         None => Span::styled(truncate_pad(&app.status, msg_w), style),
     };
     let line = Line::from(vec![
         msg,
         Span::raw(" "),
-        Span::styled(hints, Style::default().fg(Color::Rgb(100, 100, 110))),
+        Span::styled(hints, Style::default().fg(p.faint)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -1278,6 +1302,7 @@ mod tests {
     /// foreground colors (beyond the UI's own line-number/divider colors).
     #[test]
     fn diff_renders_syntax_colors() {
+        let _guard = highlight::test_theme_lock();
         let mut app = App::new(crate::app::LaunchMode::Auto, None);
         app.screen = Screen::Review;
         app.files = vec![ChangedFile {
@@ -1308,8 +1333,9 @@ mod tests {
         for y in 1..buf.area.height - 1 {
             for x in 41..buf.area.width {
                 let fg = buf[(x, y)].fg;
+                let p = palette();
                 if let Color::Rgb(..) = fg {
-                    if fg != FG_LN && fg != Color::Rgb(60, 60, 70) {
+                    if fg != p.line_no && fg != p.divider {
                         colors.insert(format!("{fg:?}"));
                     }
                 }
@@ -1331,6 +1357,222 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         term.backend().buffer().clone()
+    }
+
+    /// The bug this whole feature exists for: on a light terminal the diff
+    /// backgrounds used to stay near-black, so added and removed lines were
+    /// dark slabs with dark syntax text on them. Render the same diff under
+    /// both appearances and assert the tints actually follow.
+    #[test]
+    fn diff_backgrounds_follow_the_appearance() {
+        let _guard = crate::theme::test_lock();
+        let before = crate::theme::appearance();
+
+        // The backgrounds present in the diff pane, ignoring the terminal
+        // default (context rows paint no background of their own).
+        let backgrounds = |app: &mut App| -> std::collections::HashSet<String> {
+            let buf = render(app);
+            let mut out = std::collections::HashSet::new();
+            for y in 1..buf.area.height - 1 {
+                for x in (app.file_panel_w + 1)..buf.area.width {
+                    if let Color::Rgb(..) = buf[(x, y)].bg {
+                        out.insert(format!("{:?}", buf[(x, y)].bg));
+                    }
+                }
+            }
+            out
+        };
+
+        let mut app = wide_app();
+        app.diff = Some(FileDiff::compute(Some("a\nb\nc\n"), Some("a\nB\nc\n")));
+        app.rebuild_display();
+
+        crate::theme::set_appearance(crate::theme::Appearance::Dark);
+        let dark = backgrounds(&mut app);
+        crate::theme::set_appearance(crate::theme::Appearance::Light);
+        let light = backgrounds(&mut app);
+        crate::theme::set_appearance(before);
+
+        for (label, want, got) in [
+            ("dark", &crate::theme::DARK, &dark),
+            ("light", &crate::theme::LIGHT, &light),
+        ] {
+            for (what, color) in [("added", want.added), ("removed", want.removed)] {
+                assert!(
+                    got.contains(&format!("{color:?}")),
+                    "{label} render is missing the {what} background {color:?}; saw {got:?}"
+                );
+            }
+        }
+        assert!(
+            dark.is_disjoint(&light),
+            "the two appearances must not share any background: {dark:?} vs {light:?}"
+        );
+    }
+
+    /// WCAG relative luminance, for the contrast audit below.
+    fn rel_lum(c: Color) -> f64 {
+        let (r, g, b) = match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => panic!("expected an explicit RGB color, got {c:?}"),
+        };
+        let ch = |v: u8| {
+            let v = v as f64 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+    }
+
+    fn contrast(fg: Color, bg: Color) -> f64 {
+        let (a, b) = (rel_lum(fg), rel_lum(bg));
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// Sweep every screen in light mode and check that no drawn glyph
+    /// disappears into its background. This is the audit that catches a
+    /// color someone forgot to route through the palette — a stray
+    /// `Color::White` foreground reads fine on black and vanishes on white.
+    #[test]
+    fn light_mode_text_stays_readable() {
+        let _guard = crate::theme::test_lock();
+        let before_appearance = crate::theme::appearance();
+        let before_theme = highlight::current_theme();
+        crate::theme::set_appearance(crate::theme::Appearance::Light);
+        highlight::set_theme(highlight::DEFAULT_LIGHT_THEME);
+
+        // What the terminal itself paints where loupe sets no background.
+        let terminal_bg = Color::Rgb(255, 255, 255);
+
+        let mut app = wide_app();
+        app.local = false;
+        app.diff = Some(FileDiff::compute(
+            Some("fn main() {\n    let x = 1;\n}\n"),
+            Some("fn main() {\n    let x = 42;\n    let s = \"hi\";\n}\n"),
+        ));
+        app.old_hl = highlight::highlight("t.rs", "fn main() {\n    let x = 1;\n}\n");
+        app.new_hl = highlight::highlight(
+            "t.rs",
+            "fn main() {\n    let x = 42;\n    let s = \"hi\";\n}\n",
+        );
+        app.rebuild_display();
+
+        // Colors the syntax theme produces are the theme author's call, not
+        // loupe's — this audit is about the chrome, so collect them and
+        // step over them.
+        let mut syntax: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for source in [app.old_hl.clone(), app.new_hl.clone()] {
+            for line in source {
+                for (c, _) in line {
+                    syntax.insert(format!("{c:?}"));
+                }
+            }
+        }
+        for theme in crate::highlight::THEMES {
+            highlight::set_theme(theme.1);
+            for line in highlight::highlight("sample.rs", crate::wizard::SAMPLE) {
+                for (c, _) in line {
+                    syntax.insert(format!("{c:?}"));
+                }
+            }
+        }
+        highlight::set_theme(highlight::DEFAULT_LIGHT_THEME);
+
+        type Case = (&'static str, Box<dyn Fn(&mut App)>);
+        let screens: Vec<Case> = vec![
+            ("review", Box::new(|_: &mut App| {})),
+            ("help", Box::new(|a: &mut App| a.overlay = Overlay::Help)),
+            (
+                "theme picker",
+                Box::new(|a: &mut App| {
+                    a.overlay = Overlay::None;
+                    a.open_theme_picker();
+                }),
+            ),
+            (
+                "checkout prompt",
+                Box::new(|a: &mut App| a.overlay = Overlay::CheckoutPrompt(7)),
+            ),
+            (
+                "comment overlay",
+                Box::new(|a: &mut App| {
+                    a.overlay = Overlay::None;
+                    a.local = false;
+                    a.diff_cursor = 1;
+                    a.open_comment();
+                    assert!(
+                        matches!(a.overlay, Overlay::Comment(_)),
+                        "the comment overlay must actually open: {}",
+                        a.status
+                    );
+                }),
+            ),
+            (
+                "pr list",
+                Box::new(|a: &mut App| {
+                    a.overlay = Overlay::None;
+                    a.screen = Screen::PrList;
+                }),
+            ),
+        ];
+
+        let mut worst: Vec<String> = Vec::new();
+        for (name, setup) in &screens {
+            setup(&mut app);
+            let buf = render(&mut app);
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    let cell = &buf[(x, y)];
+                    let sym = cell.symbol();
+                    if sym.trim().is_empty() {
+                        continue; // blanks carry no glyph to read
+                    }
+                    // Box drawing: structural rules, deliberately faint on
+                    // both appearances.
+                    if sym.chars().all(|c| ('\u{2500}'..='\u{257f}').contains(&c)) {
+                        continue;
+                    }
+                    let fg = match cell.fg {
+                        Color::Reset => continue, // the terminal's own default
+                        other => other,
+                    };
+                    let bg = match cell.bg {
+                        Color::Reset => terminal_bg,
+                        other => other,
+                    };
+                    // Palette colors are all explicit RGB; the named ones
+                    // that survive here would be the bug.
+                    if !matches!(fg, Color::Rgb(..)) || !matches!(bg, Color::Rgb(..)) {
+                        worst.push(format!(
+                            "{name} ({x},{y}) {sym:?}: named color {fg:?} on {bg:?}"
+                        ));
+                        continue;
+                    }
+                    if syntax.contains(&format!("{fg:?}")) {
+                        continue;
+                    }
+                    let ratio = contrast(fg, bg);
+                    if ratio < 2.5 {
+                        worst.push(format!(
+                            "{name} ({x},{y}) {sym:?}: {fg:?} on {bg:?} is {ratio:.2}:1"
+                        ));
+                    }
+                }
+            }
+        }
+
+        crate::theme::set_appearance(before_appearance);
+        highlight::set_theme(before_theme);
+        worst.dedup();
+        assert!(
+            worst.is_empty(),
+            "unreadable cells in light mode:\n  {}",
+            worst.join("\n  ")
+        );
     }
 
     fn wide_app() -> App {

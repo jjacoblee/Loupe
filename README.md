@@ -53,6 +53,12 @@ leaving your terminal or touching a browser.
 - **Fast and non-blocking** — every fetch runs in the background with a
   cancellable spinner; idle CPU is ~zero; PR content is treated as
   untrusted input throughout.
+- **Light and dark, without being told** — Loupe asks your terminal for
+  its background color at startup and tunes everything to it: diff
+  greens and reds that read on white, gutters and chrome that don't
+  vanish, and a syntax theme from the matching half of the set. Override
+  it with `--light` / `--dark`, the `appearance` config key, or `a` in
+  the theme picker.
 - **Zero-config start** — the first launch opens a setup wizard: pick a
   theme from a live preview, pick a default mode, and it writes your
   config for you. Press `t` any time for the in-app theme picker — 32
@@ -124,7 +130,8 @@ help, `q` to quit — the full keyboard and mouse reference is in
 Configuration lives in `~/.config/loupe/config.toml` plus an optional
 per-repo `.loupe.toml` (see
 [`config.example.toml`](config.example.toml)) — upstream `org` for fork
-workflows, default mode, syntax theme, and panel width. You'll rarely
+workflows, default mode, light/dark `appearance`, syntax themes, and
+panel width. You'll rarely
 edit it by hand: the setup wizard and theme picker write it for you, and
 `loupe setup` re-runs the wizard whenever you want.
 

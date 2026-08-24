@@ -19,9 +19,22 @@
 #   "local" — always review local changes
 #mode = "auto"
 
-# Syntax-highlighting theme. `loupe --themes` prints every valid name;
-# press t inside loupe for a live-preview picker. Default: catppuccin-mocha.
+# Light or dark colors. On "auto" (the default) loupe asks the terminal
+# for its background color at startup and tunes the diff greens and reds,
+# the gutters, and the chrome to match. Set this to skip detection, or
+# pass --light / --dark for one session. `loupe appearance` reports what
+# your terminal actually said.
+#appearance = "auto"
+
+# Syntax-highlighting themes, one per appearance — a theme is only
+# readable on the background it was designed for. `loupe --themes` prints
+# every valid name; press t inside loupe for a live-preview picker, and a
+# to switch light/dark. Setting only one is fine: the other slot borrows
+# from it, staying in the same family where there is a counterpart
+# (gruvbox-dark <-> gruvbox-light). Defaults: catppuccin-mocha and
+# catppuccin-latte.
 #theme = "catppuccin-mocha"
+#light_theme = "catppuccin-latte"
 
 # Starting width of the file panel, in columns. Drag the divider between the
 # panels (or press < / >) to change it while running; double-click the

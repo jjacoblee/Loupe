@@ -8,6 +8,7 @@
 //! positions.
 
 use crate::highlight::EditorHighlight;
+use crate::theme::palette;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -15,10 +16,6 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthChar;
-
-const FG_CODE: Color = Color::Rgb(220, 223, 228);
-const FG_GUTTER: Color = Color::DarkGray;
-const SEL_BG: Color = Color::Rgb(38, 79, 120);
 
 pub struct Editor {
     pub textarea: TextArea<'static>,
@@ -105,10 +102,11 @@ impl Editor {
             self.path,
             if self.dirty { " [+]" } else { "" }
         );
+        let p = palette();
         let border_style = if focused {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(p.accent)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(p.faint)
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -149,6 +147,7 @@ impl Editor {
     /// One visible row: gutter + syntax-colored text with selection, cursor
     /// line underline, and a reversed cursor cell, clipped to the viewport.
     fn render_row(&self, row: usize, cur_row: usize, cur_col: usize) -> Line<'static> {
+        let p = palette();
         let text = &self.textarea.lines()[row];
         let sel = self.textarea.selection_range();
         let tab = (self.textarea.tab_length() as usize).max(1);
@@ -178,14 +177,14 @@ impl Editor {
             w = (self.lnum_width() as usize).saturating_sub(1)
         );
         for ch in gutter.chars() {
-            cells.push((ch, Style::default().fg(FG_GUTTER)));
+            cells.push((ch, Style::default().fg(p.gutter)));
         }
         let mut disp = 0usize;
         for (ci, ch) in text.chars().enumerate() {
-            let fg = char_colors.get(ci).copied().unwrap_or(FG_CODE);
+            let fg = char_colors.get(ci).copied().unwrap_or(p.code);
             let mut st = Style::default().fg(fg);
             if selected(ci) {
-                st = st.bg(SEL_BG);
+                st = st.bg(p.editor_sel);
             }
             if is_cursor_line {
                 st = st.add_modifier(Modifier::UNDERLINED);
@@ -354,6 +353,9 @@ mod tests {
     /// The custom editor renderer must paint syntax colors and the cursor.
     #[test]
     fn editor_renders_syntax_colors_and_cursor() {
+        // Both the syntax colors and `palette().code` below are process
+        // globals now — pin them for the duration.
+        let _guard = crate::highlight::test_theme_lock();
         let src = "fn main() {\n    let s = \"text\"; // note\n    let n = 42;\n}\n";
         let mut ed = Editor::new("test.rs", std::path::PathBuf::from("/tmp/x.rs"), src);
         let backend = TestBackend::new(80, 12);
@@ -364,7 +366,7 @@ mod tests {
         for y in 1..buf.area.height - 1 {
             for x in 1..buf.area.width - 1 {
                 let fg = buf[(x, y)].fg;
-                if matches!(fg, Color::Rgb(..)) && fg != FG_CODE {
+                if matches!(fg, Color::Rgb(..)) && fg != palette().code {
                     colors.insert(format!("{fg:?}"));
                 }
             }

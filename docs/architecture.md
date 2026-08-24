@@ -16,10 +16,33 @@ threading model, and the invariants that are easy to break by accident.
 | `gitops.rs` | Everything that shells out to `git`: local scans, staging, refs, file content |
 | `github.rs` | Everything that shells out to `gh`: PR lists, details, comments, viewed sync |
 | `highlight.rs` | Syntax highlighting via syntect + two-face: themes, caching, incremental editor highlighting |
+| `theme.rs` | Light/dark appearance: terminal background detection and the two UI color palettes |
 | `config.rs` | TOML config discovery, parsing, and merging (global + per-repo) |
 
 There is no shell anywhere: `git` and `gh` are always invoked with
 argv-style `Command` arguments, never through `sh -c`.
+
+## Color
+
+Two sources of color meet in the diff, and they have to agree about the
+background they are drawn on:
+
+- **`theme.rs`** owns everything Loupe paints itself — diff backgrounds,
+  gutters, buttons, borders, status text — as two `Palette` constants,
+  `DARK` and `LIGHT`. `ui.rs`, `editor.rs`, and `wizard.rs` hold no color
+  literals; they call `palette()`, which reads one atomic and hands back
+  a `&'static Palette`, cheap enough to call per rendered row.
+- **`highlight.rs`** owns the syntax colors, which come from the syntect
+  theme. Themes classify themselves as light or dark by their own
+  background color, and `for_appearance` maps one to its counterpart.
+
+`main.rs` settles the appearance once, immediately after
+`ratatui::init()` — raw mode is on, and nothing is reading events yet, so
+that is the only safe window to write an OSC 11 query to `/dev/tty` and
+read the reply without it being mistaken for a keystroke. A
+device-attributes request is sent right behind the query as a sentinel:
+its reply arriving first means the terminal will never answer OSC 11, so
+detection gives up immediately instead of waiting out its 120 ms budget.
 
 ## The event loop and the dirty flag
 

@@ -19,6 +19,7 @@
 //! Atom/VS Code-style editor colors — stock syntect only has muted base16
 //! themes, which read as near-white in a terminal.
 
+use crate::theme::Appearance;
 use ratatui::style::Color;
 use std::sync::{OnceLock, RwLock};
 use syntect::easy::HighlightLines;
@@ -39,8 +40,20 @@ const MAX_EDITOR_HL_LINES: usize = 8_000;
 /// highlights keep their colors until their owner re-highlights.
 static CURRENT_THEME: RwLock<EmbeddedThemeName> = RwLock::new(DEFAULT_THEME);
 
-/// What new installs get, and the fallback when nothing is configured.
+/// What new installs get on a dark terminal, and the fallback when nothing
+/// is configured.
 pub const DEFAULT_THEME: EmbeddedThemeName = EmbeddedThemeName::CatppuccinMocha;
+
+/// The same, for a light terminal — the light sibling of [`DEFAULT_THEME`].
+pub const DEFAULT_LIGHT_THEME: EmbeddedThemeName = EmbeddedThemeName::CatppuccinLatte;
+
+/// The default theme for an appearance.
+pub fn default_theme(appearance: Appearance) -> EmbeddedThemeName {
+    match appearance {
+        Appearance::Dark => DEFAULT_THEME,
+        Appearance::Light => DEFAULT_LIGHT_THEME,
+    }
+}
 
 /// Select the syntax theme for all highlighting from this call on. Cheap:
 /// themes are lazily deserialized once each and cached by the theme set.
@@ -54,11 +67,11 @@ pub fn current_theme() -> EmbeddedThemeName {
 }
 
 /// Serializes tests (in any module) that mutate or depend on the
-/// process-global current theme, so they can't race each other.
+/// process-global current theme, so they can't race each other. Shared with
+/// the appearance, which is the other half of the same look.
 #[cfg(test)]
 pub fn test_theme_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    crate::theme::test_lock()
 }
 
 /// The config-file name of a theme (reverse of [`theme_by_name`]).
@@ -128,6 +141,106 @@ pub fn theme_by_name(name: &str) -> Option<EmbeddedThemeName> {
     THEMES.iter().find(|(k, _)| *k == key).map(|(_, t)| *t)
 }
 
+/// Themes that come as a matched pair — same palette, opposite background.
+/// Switching appearance moves between the two halves, so someone who likes
+/// Gruvbox on a dark terminal gets Gruvbox on a light one, not a stranger.
+const PAIRS: &[(EmbeddedThemeName, EmbeddedThemeName)] = &[
+    (
+        EmbeddedThemeName::CatppuccinMocha,
+        EmbeddedThemeName::CatppuccinLatte,
+    ),
+    (
+        EmbeddedThemeName::CatppuccinMacchiato,
+        EmbeddedThemeName::CatppuccinLatte,
+    ),
+    (
+        EmbeddedThemeName::CatppuccinFrappe,
+        EmbeddedThemeName::CatppuccinLatte,
+    ),
+    (
+        EmbeddedThemeName::OneHalfDark,
+        EmbeddedThemeName::OneHalfLight,
+    ),
+    (EmbeddedThemeName::TwoDark, EmbeddedThemeName::OneHalfLight),
+    (
+        EmbeddedThemeName::GruvboxDark,
+        EmbeddedThemeName::GruvboxLight,
+    ),
+    (
+        EmbeddedThemeName::SolarizedDark,
+        EmbeddedThemeName::SolarizedLight,
+    ),
+    (
+        EmbeddedThemeName::Base16OceanDark,
+        EmbeddedThemeName::Base16OceanLight,
+    ),
+    (
+        EmbeddedThemeName::Base16MochaDark,
+        EmbeddedThemeName::Base16OceanLight,
+    ),
+    (
+        EmbeddedThemeName::Base16EightiesDark,
+        EmbeddedThemeName::Base16OceanLight,
+    ),
+    (
+        EmbeddedThemeName::ColdarkDark,
+        EmbeddedThemeName::ColdarkCold,
+    ),
+    (
+        EmbeddedThemeName::MonokaiExtended,
+        EmbeddedThemeName::MonokaiExtendedLight,
+    ),
+    (
+        EmbeddedThemeName::MonokaiExtendedBright,
+        EmbeddedThemeName::MonokaiExtendedLight,
+    ),
+    (
+        EmbeddedThemeName::MonokaiExtendedOrigin,
+        EmbeddedThemeName::MonokaiExtendedLight,
+    ),
+    (EmbeddedThemeName::Zenburn, EmbeddedThemeName::Github),
+    (EmbeddedThemeName::Nord, EmbeddedThemeName::InspiredGithub),
+];
+
+/// Whether a theme is meant for a light background, read from the theme's
+/// own background color rather than a hand-kept list — a theme set that
+/// grows a new entry classifies itself. Themes that leave the background
+/// unset (`ansi`, which defers to the terminal's own palette) count as dark.
+///
+/// Deserializing one theme is cheap and the theme set caches it, so this is
+/// fine to call on the startup path.
+pub fn theme_is_light(theme: EmbeddedThemeName) -> bool {
+    theme_set()
+        .get(theme)
+        .settings
+        .background
+        .map(|c| Appearance::of_background(c.r, c.g, c.b).is_light())
+        .unwrap_or(false)
+}
+
+/// The theme to use for `appearance`, starting from `theme`.
+///
+/// A theme that already suits the appearance is returned untouched. One that
+/// doesn't is swapped for its counterpart from [`PAIRS`], or — when it has
+/// none — for the appearance's default.
+pub fn for_appearance(theme: EmbeddedThemeName, appearance: Appearance) -> EmbeddedThemeName {
+    if theme_is_light(theme) == appearance.is_light() {
+        return theme;
+    }
+    let paired = PAIRS.iter().find_map(|(dark, light)| {
+        if *dark == theme {
+            Some(*light)
+        } else if *light == theme {
+            Some(*dark)
+        } else {
+            None
+        }
+    });
+    paired
+        .filter(|t| theme_is_light(*t) == appearance.is_light())
+        .unwrap_or_else(|| default_theme(appearance))
+}
+
 fn syntaxes() -> &'static SyntaxSet {
     static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
     SYNTAXES.get_or_init(two_face::syntax::extra_newlines)
@@ -141,6 +254,16 @@ fn theme_set() -> &'static EmbeddedLazyThemeSet {
 /// The active theme, deserialized on first use (per theme) and cached.
 fn theme() -> &'static Theme {
     theme_set().get(current_theme())
+}
+
+/// A theme's own background color, for previewing it honestly. `None` for
+/// themes that defer to the terminal's palette.
+pub fn theme_background(theme: EmbeddedThemeName) -> Option<Color> {
+    theme_set()
+        .get(theme)
+        .settings
+        .background
+        .map(|c| Color::Rgb(c.r, c.g, c.b))
 }
 
 /// Kick off asset loading on a background thread. The `OnceLock`s make this
@@ -395,6 +518,7 @@ mod tests {
 
     #[test]
     fn rust_gets_multiple_colors() {
+        let _guard = test_theme_lock();
         let src = "fn main() {\n    let x: u32 = 42; // answer\n    println!(\"hi {x}\");\n}\n";
         let hl = highlight("test.rs", src);
         assert_eq!(hl.len(), 4);
@@ -407,6 +531,7 @@ mod tests {
     /// Stock syntect has no TypeScript syntax — the two-face set must.
     #[test]
     fn typescript_gets_multiple_colors() {
+        let _guard = test_theme_lock();
         let src = "export const f = (n: number): string => `v${n}`;\n";
         let hl = highlight("test.ts", src);
         assert!(
@@ -417,6 +542,7 @@ mod tests {
 
     #[test]
     fn unknown_type_falls_back_to_plain() {
+        let _guard = test_theme_lock();
         let hl = highlight("data.xyzunknown", "just words\n");
         assert_eq!(hl.len(), 1);
         // Plain text still produces the theme's default foreground.
@@ -473,5 +599,82 @@ mod tests {
         let mut h = EditorHighlight::new("notes.xyzunknown", "hello\nworld");
         h.update(&["hello".into(), "world".into()]);
         assert!(h.line(0).is_none());
+    }
+
+    /// Themes classify themselves from their own background color, so the
+    /// obviously-light ones must come out light and vice versa.
+    #[test]
+    fn themes_know_which_background_they_want() {
+        for name in [
+            "catppuccin-latte",
+            "github",
+            "gruvbox-light",
+            "inspired-github",
+            "one-half-light",
+            "solarized-light",
+            "monokai-extended-light",
+            "base16-ocean-light",
+            "coldark-cold",
+        ] {
+            let t = theme_by_name(name).unwrap_or_else(|| panic!("{name} exists"));
+            assert!(theme_is_light(t), "{name} should be a light theme");
+        }
+        for name in [
+            "catppuccin-mocha",
+            "dracula",
+            "nord",
+            "gruvbox-dark",
+            "one-half-dark",
+            "solarized-dark",
+            "zenburn",
+            "two-dark",
+        ] {
+            let t = theme_by_name(name).unwrap_or_else(|| panic!("{name} exists"));
+            assert!(!theme_is_light(t), "{name} should be a dark theme");
+        }
+        // The two defaults have to be a matched pair, or a fresh install on
+        // a light terminal gets dark syntax colors.
+        assert!(!theme_is_light(DEFAULT_THEME));
+        assert!(theme_is_light(DEFAULT_LIGHT_THEME));
+    }
+
+    /// Switching appearance keeps the theme family where one exists, and
+    /// falls back to the default otherwise — never to a mismatched theme.
+    #[test]
+    fn appearance_pairs_stay_in_the_family() {
+        let pair = |name: &str, appearance| {
+            theme_key(for_appearance(theme_by_name(name).unwrap(), appearance))
+        };
+        assert_eq!(
+            pair("gruvbox-dark", Appearance::Light),
+            "gruvbox-light",
+            "same family"
+        );
+        assert_eq!(pair("gruvbox-light", Appearance::Dark), "gruvbox-dark");
+        assert_eq!(pair("one-half-dark", Appearance::Light), "one-half-light");
+        assert_eq!(pair("solarized-light", Appearance::Dark), "solarized-dark");
+        assert_eq!(
+            pair("catppuccin-mocha", Appearance::Light),
+            "catppuccin-latte"
+        );
+        // Already suitable: returned untouched, no surprise substitutions.
+        assert_eq!(pair("nord", Appearance::Dark), "nord");
+        assert_eq!(pair("github", Appearance::Light), "github");
+        // No counterpart in the set — fall back to the default, which is
+        // guaranteed to suit the appearance.
+        assert_eq!(pair("dracula", Appearance::Light), "catppuccin-latte");
+        // Whatever comes out must always match the requested appearance.
+        for (_, t) in THEMES {
+            for appearance in [Appearance::Dark, Appearance::Light] {
+                let out = for_appearance(*t, appearance);
+                assert_eq!(
+                    theme_is_light(out),
+                    appearance.is_light(),
+                    "{} -> {} is the wrong appearance",
+                    theme_key(*t),
+                    theme_key(out)
+                );
+            }
+        }
     }
 }

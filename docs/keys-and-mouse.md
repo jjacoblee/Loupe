@@ -16,7 +16,7 @@ for the built-in help overlay.
 | `r` | Reload the current file (or the PR list) |
 | `b` | Open the PR list (from an auto-opened PR) |
 | `l` | Switch to local-changes review (from the PR list) |
-| `t` or `🎨 Theme` | Open the theme picker — live preview; Enter keeps & saves, Esc reverts |
+| `t` or `🎨 Theme` | Open the theme picker — live preview; Enter keeps & saves, Esc reverts; `a` switches light ⇄ dark |
 | `c` | Cancel a cancellable background load |
 
 ## File panel
@@ -85,8 +85,9 @@ cursor.
 | --- | --- |
 | `j` / `k`, wheel, or click a name | Preview that theme live |
 | `PgUp` / `PgDn`, `Home` / `End` | Move through the list faster |
+| `a` or the `☀ Light` / `🌙 Dark` button | Switch light ⇄ dark, carrying the selection to the counterpart theme |
 | `Enter` or `Use … ` button | Keep the theme and save it to your config |
-| `Esc` or `Cancel` | Put the previous theme back |
+| `Esc` or `Cancel` | Put the previous theme (and appearance) back |
 
 ## Command line
 
@@ -96,7 +97,9 @@ cursor.
 | `--local`, `-l` | Review local changes, even when clean |
 | `--auto` | Local changes if any, else PRs (overrides config) |
 | `--theme <name>` | Use a theme for this session, unsaved |
+| `--light` / `--dark` | Force light or dark colors for this session |
 | `--themes` | List syntax themes and exit |
 | `--help`, `-h` | Usage and config reference |
-| `set-theme <name>` | Save a theme to the global config |
+| `set-theme [--light] <name>` | Save a theme to the global config, in the dark (or light) slot |
+| `appearance` | Report what your terminal says its background is |
 | `setup` | Re-run the first-launch setup wizard |

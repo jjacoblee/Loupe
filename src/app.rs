@@ -12,6 +12,7 @@ use crate::editor::Editor;
 use crate::github::{self, ChangedFile, CommentSide, PrDetail, PrSummary};
 use crate::gitops::{self, StageState};
 use crate::highlight::{self, HlLine};
+use crate::theme::Appearance;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -66,10 +67,21 @@ pub enum Overlay {
 /// a row switches the process-wide theme immediately — the sample in the
 /// overlay previews it — and Enter persists the choice to the config file;
 /// Esc restores `prev`.
+///
+/// The picker also owns the light/dark switch (`a`), since the two choices
+/// belong together: the syntax theme and loupe's own colors have to agree
+/// or the diff ends up unreadable, which is the whole reason this exists.
 pub struct ThemePicker {
     pub sel: usize,
     pub scroll: usize,
     prev: two_face::theme::EmbeddedThemeName,
+    prev_appearance: Appearance,
+    /// The row that was selected the last time each appearance was active,
+    /// as `[dark, light]`. Without this, `a` twice would not come back:
+    /// theme pairing is many-to-one (three Catppuccin flavors share Latte),
+    /// so mapping out and back lands on a different theme — which Enter
+    /// would then write over the user's actual choice.
+    remembered: [Option<usize>; 2],
     /// `wizard::SAMPLE` highlighted with the selected theme.
     pub preview: Vec<HlLine>,
 }
@@ -84,6 +96,8 @@ impl ThemePicker {
                 .unwrap_or(0),
             scroll: 0,
             prev: current,
+            prev_appearance: crate::theme::appearance(),
+            remembered: [None, None],
             preview: highlight::highlight("sample.rs", crate::wizard::SAMPLE),
         }
     }
@@ -92,6 +106,31 @@ impl ThemePicker {
         self.sel = idx.min(highlight::THEMES.len() - 1);
         highlight::set_theme(highlight::THEMES[self.sel].1);
         self.preview = highlight::highlight("sample.rs", crate::wizard::SAMPLE);
+    }
+
+    /// Flip light ⇄ dark, moving the selection to the counterpart of the
+    /// current theme so the preview stays coherent — or back to whatever
+    /// was selected the last time this appearance was active.
+    fn toggle_appearance(&mut self) {
+        let current = crate::theme::appearance();
+        let next = current.other();
+        self.remembered[usize::from(current.is_light())] = Some(self.sel);
+        crate::theme::set_appearance(next);
+        let idx = self.remembered[usize::from(next.is_light())].unwrap_or_else(|| {
+            let paired = highlight::for_appearance(highlight::THEMES[self.sel].1, next);
+            highlight::THEMES
+                .iter()
+                .position(|(_, t)| *t == paired)
+                .unwrap_or(self.sel)
+        });
+        self.select(idx);
+    }
+
+    /// Whether the user actually moved off the appearance loupe started
+    /// with. Toggling twice is not an override, so it must not pin
+    /// `appearance` in the config and disable detection everywhere else.
+    fn appearance_changed(&self) -> bool {
+        crate::theme::appearance() != self.prev_appearance
     }
 }
 
@@ -119,6 +158,8 @@ pub enum ButtonId {
     ThemeApply,
     ThemeCancel,
     ThemeRow(usize),
+    /// The ☀/🌙 light-dark switch in the theme picker.
+    AppearanceToggle,
     /// The PR ⇄ local toggle in the review top bar (also the ` key).
     SwapView,
 }
@@ -1244,13 +1285,26 @@ impl App {
             return;
         };
         let name = highlight::theme_key(highlight::THEMES[tp.sel].1);
+        let appearance = crate::theme::appearance();
+        // The two appearances have their own theme slot, so saving a light
+        // theme never clobbers the dark one (or the other way round).
+        let mut pairs = vec![(crate::config::theme_key_for(appearance), name)];
+        let pinned = tp.appearance_changed();
+        if pinned {
+            pairs.push(("appearance", appearance.key()));
+        }
         self.overlay = Overlay::None;
         // Re-highlighting the open file replaces the status message when it
         // lands, so route the confirmation through the prepended note.
         let reload = self.screen == Screen::Review && self.diff.is_some();
-        match crate::config::save_global(&[("theme", name)]) {
+        match crate::config::save_global(&pairs) {
             Ok(path) => {
-                let msg = format!("✔ Theme “{name}” — saved to {}", path.display());
+                let note = if pinned {
+                    format!(" ({} colors pinned)", appearance.key())
+                } else {
+                    String::new()
+                };
+                let msg = format!("✔ Theme “{name}”{note} — saved to {}", path.display());
                 if reload {
                     self.auto_open_note = Some(msg);
                 } else {
@@ -1270,6 +1324,7 @@ impl App {
     fn cancel_theme_pick(&mut self) {
         if let Overlay::ThemePicker(tp) = &self.overlay {
             highlight::set_theme(tp.prev);
+            crate::theme::set_appearance(tp.prev_appearance);
             self.overlay = Overlay::None;
             self.ok("Theme unchanged.");
         }
@@ -1388,6 +1443,7 @@ impl App {
                     KeyCode::PageDown => tp.select(tp.sel + 8),
                     KeyCode::Home => tp.select(0),
                     KeyCode::End => tp.select(usize::MAX),
+                    KeyCode::Char('a') => tp.toggle_appearance(),
                     KeyCode::Enter => self.apply_theme_pick(),
                     KeyCode::Esc | KeyCode::Char('q') => self.cancel_theme_pick(),
                     _ => {}
@@ -1608,6 +1664,11 @@ impl App {
                         Some(ButtonId::ThemeRow(i)) => {
                             if let Overlay::ThemePicker(tp) = &mut self.overlay {
                                 tp.select(i);
+                            }
+                        }
+                        Some(ButtonId::AppearanceToggle) => {
+                            if let Overlay::ThemePicker(tp) = &mut self.overlay {
+                                tp.toggle_appearance();
                             }
                         }
                         Some(ButtonId::ThemeApply) => self.apply_theme_pick(),
@@ -2954,6 +3015,10 @@ mod tests {
     #[test]
     fn theme_picker_enter_saves_to_config() {
         let _guard = highlight::test_theme_lock();
+        // Which key the pick lands under depends on the appearance, so pin
+        // it rather than inheriting whatever the terminal detected.
+        let before_appearance = crate::theme::appearance();
+        crate::theme::set_appearance(Appearance::Dark);
         let dir = std::env::temp_dir().join(format!("loupe-theme-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("config.toml");
@@ -2979,8 +3044,129 @@ mod tests {
         );
         assert!(!app.status_err, "{}", app.status);
 
-        // Leave the process-global theme as we found it for other tests.
+        // Leave the process-global look as we found it for other tests.
         highlight::set_theme(before);
+        crate::theme::set_appearance(before_appearance);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `a` in the picker flips light ⇄ dark, drags the theme selection to
+    /// the counterpart so the two never disagree, and — because the user
+    /// overrode detection — pins `appearance` in the config alongside the
+    /// theme, under the *light* key.
+    #[test]
+    fn theme_picker_toggles_appearance() {
+        let _guard = highlight::test_theme_lock();
+        let before_theme = highlight::current_theme();
+        let before_appearance = crate::theme::appearance();
+        let dir = std::env::temp_dir().join(format!("loupe-appearance-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, "mode = \"local\"\n").unwrap();
+        std::env::set_var("LOUPE_CONFIG", &cfg);
+
+        crate::theme::set_appearance(Appearance::Dark);
+        highlight::set_theme(highlight::theme_by_name("gruvbox-dark").unwrap());
+
+        let mut app = App::new(LaunchMode::Auto, None);
+        app.open_theme_picker();
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(crate::theme::appearance(), Appearance::Light);
+        assert_eq!(
+            highlight::theme_key(highlight::current_theme()),
+            "gruvbox-light",
+            "the selection follows the appearance into the same family"
+        );
+
+        app.handle_key(key(KeyCode::Enter));
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        std::env::remove_var("LOUPE_CONFIG");
+        assert!(
+            text.contains("light_theme = \"gruvbox-light\""),
+            "a light pick goes in the light slot: {text}"
+        );
+        assert!(
+            !text.contains("\ntheme = "),
+            "and must not clobber the dark slot: {text}"
+        );
+        assert!(
+            text.contains("appearance = \"light\""),
+            "an overridden appearance is pinned: {text}"
+        );
+        assert!(text.contains("mode = \"local\""), "{text}");
+
+        // Esc, by contrast, puts both halves back.
+        crate::theme::set_appearance(Appearance::Dark);
+        highlight::set_theme(highlight::theme_by_name("nord").unwrap());
+        app.open_theme_picker();
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(crate::theme::appearance(), Appearance::Dark);
+        assert_eq!(highlight::theme_key(highlight::current_theme()), "nord");
+
+        highlight::set_theme(before_theme);
+        crate::theme::set_appearance(before_appearance);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Toggling `a` twice must land back on the theme you started from,
+    /// and must not pin `appearance` in the config. Theme pairing is
+    /// many-to-one — three Catppuccin flavors share Latte — so a naive
+    /// out-and-back mapping quietly replaces the user's theme, and Enter
+    /// then writes the replacement over it.
+    #[test]
+    fn appearance_round_trip_keeps_the_theme() {
+        let _guard = highlight::test_theme_lock();
+        let before_theme = highlight::current_theme();
+        let before_appearance = crate::theme::appearance();
+        let dir = std::env::temp_dir().join(format!("loupe-roundtrip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        std::env::set_var("LOUPE_CONFIG", &cfg);
+
+        // Every theme, including the many-to-one and unpaired ones.
+        for (name, theme) in highlight::THEMES {
+            let start = if highlight::theme_is_light(*theme) {
+                Appearance::Light
+            } else {
+                Appearance::Dark
+            };
+            crate::theme::set_appearance(start);
+            highlight::set_theme(*theme);
+            let mut app = App::new(LaunchMode::Auto, None);
+            app.open_theme_picker();
+            app.handle_key(key(KeyCode::Char('a')));
+            assert_eq!(crate::theme::appearance(), start.other(), "{name}");
+            app.handle_key(key(KeyCode::Char('a')));
+            assert_eq!(crate::theme::appearance(), start, "{name}");
+            assert_eq!(
+                highlight::theme_key(highlight::current_theme()),
+                *name,
+                "toggling twice must come back to {name}"
+            );
+            app.handle_key(key(KeyCode::Esc));
+        }
+
+        // …and Enter after a round trip writes the theme without pinning
+        // the appearance, so detection still works on other terminals.
+        std::fs::write(&cfg, "").unwrap();
+        crate::theme::set_appearance(Appearance::Dark);
+        highlight::set_theme(highlight::theme_by_name("dracula").unwrap());
+        let mut app = App::new(LaunchMode::Auto, None);
+        app.open_theme_picker();
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_key(key(KeyCode::Enter));
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        std::env::remove_var("LOUPE_CONFIG");
+        assert!(text.contains("theme = \"dracula\""), "{text}");
+        assert!(
+            !text.contains("appearance ="),
+            "a no-op round trip must not pin the appearance: {text}"
+        );
+
+        highlight::set_theme(before_theme);
+        crate::theme::set_appearance(before_appearance);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

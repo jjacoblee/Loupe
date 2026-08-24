@@ -12,6 +12,7 @@
 //! worse than one that complains.
 
 use crate::app::LaunchMode;
+use crate::theme::Appearance;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -25,9 +26,14 @@ pub struct Config {
     pub org: Option<String>,
     /// Startup mode. Command-line flags (`--pr` / `--local`) still win.
     pub mode: Option<ConfigMode>,
-    /// Syntax-highlighting theme, by name (e.g. "one-half-dark").
-    /// `loupe --themes` lists every valid name.
+    /// Syntax-highlighting theme for a dark terminal, by name (e.g.
+    /// "one-half-dark"). `loupe --themes` lists every valid name.
     pub theme: Option<String>,
+    /// The same, for a light terminal. Unset means "the light counterpart
+    /// of `theme`" — so Gruvbox stays Gruvbox either way.
+    pub light_theme: Option<String>,
+    /// Light or dark colors. Unset (or "auto") asks the terminal.
+    pub appearance: Option<ConfigAppearance>,
     /// Starting width of the file panel, in columns. Clamped to what the
     /// terminal can actually give; the divider can still be dragged.
     pub file_panel_width: Option<u16>,
@@ -39,6 +45,36 @@ pub enum ConfigMode {
     Auto,
     Pr,
     Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigAppearance {
+    /// Ask the terminal what its background is (the default).
+    Auto,
+    Light,
+    Dark,
+}
+
+impl ConfigAppearance {
+    /// `None` for "auto" — the caller then runs detection.
+    pub fn resolved(self) -> Option<Appearance> {
+        match self {
+            ConfigAppearance::Auto => None,
+            ConfigAppearance::Light => Some(Appearance::Light),
+            ConfigAppearance::Dark => Some(Appearance::Dark),
+        }
+    }
+}
+
+/// Which config key holds the theme for an appearance. The two slots are
+/// independent so moving between a light and a dark terminal doesn't
+/// overwrite the choice made on the other one.
+pub fn theme_key_for(appearance: Appearance) -> &'static str {
+    match appearance {
+        Appearance::Dark => "theme",
+        Appearance::Light => "light_theme",
+    }
 }
 
 impl From<ConfigMode> for LaunchMode {
@@ -58,6 +94,8 @@ impl Config {
             org: over.org.or(self.org),
             mode: over.mode.or(self.mode),
             theme: over.theme.or(self.theme),
+            light_theme: over.light_theme.or(self.light_theme),
+            appearance: over.appearance.or(self.appearance),
             file_panel_width: over.file_panel_width.or(self.file_panel_width),
         }
     }
@@ -162,17 +200,42 @@ mod tests {
 
     #[test]
     fn parses_all_keys() {
-        let cfg = parse("org = \"acme\"\nmode = \"pr\"\ntheme = \"nord\"\nfile_panel_width = 40\n")
-            .unwrap();
+        let cfg = parse(concat!(
+            "org = \"acme\"\n",
+            "mode = \"pr\"\n",
+            "theme = \"nord\"\n",
+            "light_theme = \"github\"\n",
+            "appearance = \"light\"\n",
+            "file_panel_width = 40\n",
+        ))
+        .unwrap();
         assert_eq!(
             cfg,
             Config {
                 org: Some("acme".into()),
                 mode: Some(ConfigMode::Pr),
                 theme: Some("nord".into()),
+                light_theme: Some("github".into()),
+                appearance: Some(ConfigAppearance::Light),
                 file_panel_width: Some(40),
             }
         );
+    }
+
+    #[test]
+    fn appearance_values() {
+        assert_eq!(
+            parse("appearance = \"dark\"\n").unwrap().appearance,
+            Some(ConfigAppearance::Dark)
+        );
+        // "auto" parses, and means "ask the terminal".
+        let auto = parse("appearance = \"auto\"\n").unwrap().appearance;
+        assert_eq!(auto, Some(ConfigAppearance::Auto));
+        assert_eq!(auto.unwrap().resolved(), None);
+        assert_eq!(ConfigAppearance::Light.resolved(), Some(Appearance::Light));
+        assert!(parse("appearance = \"beige\"\n").is_err());
+        assert_eq!(theme_key_for(Appearance::Dark), "theme");
+        assert_eq!(theme_key_for(Appearance::Light), "light_theme");
     }
 
     #[test]

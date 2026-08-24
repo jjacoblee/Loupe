@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Light-terminal support**: Loupe now asks the terminal for its
+  background color at startup (OSC 11, with a `COLORFGBG` fallback and a
+  device-attributes sentinel so a terminal that ignores the query costs
+  a millisecond rather than a timeout) and switches its whole palette to
+  match. The diff backgrounds were the worst of it — near-black green
+  and red slabs on a white terminal — but gutters, fold banners,
+  buttons, badges, the divider, and every status color are tuned per
+  appearance now too.
+- **Two theme slots**: `theme` (dark terminals) and `light_theme` (light
+  ones), so switching terminals doesn't overwrite the other choice. An
+  unset slot borrows from the one that is set and stays in the same
+  family where a counterpart exists — `gruvbox-dark` implies
+  `gruvbox-light`.
+- **Appearance overrides**: `appearance = "auto" | "light" | "dark"` in
+  the config, `--light` / `--dark` for one session, and `a` in the theme
+  picker (and in the wizard) to flip live — which carries the theme
+  selection to its counterpart and saves both.
+- **`loupe appearance`**: prints the background color your terminal
+  reported and what Loupe would do with it, for when the guess is wrong.
+- **`loupe set-theme --light <name>`**: save the light-terminal theme
+  from the shell.
 - **First-launch setup wizard**: a welcome screen, a theme choice with a
   live-highlighted preview, and a default-mode choice, saved to the
   config file automatically. Runs once (skippable), and on demand via
@@ -23,8 +44,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Default theme is now **catppuccin-mocha** (was one-half-dark; still
-  available by name).
+- Default theme is now **catppuccin-mocha** on a dark terminal and
+  **catppuccin-latte** on a light one (was one-half-dark unconditionally;
+  both still available by name).
+- The theme picker's sample panel is painted in the previewed theme's own
+  background, so a light theme looks light before you commit to it.
 - Themes switch at runtime — the syntax theme is no longer baked in at
   startup.
 

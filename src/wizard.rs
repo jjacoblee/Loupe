@@ -8,6 +8,7 @@
 
 use crate::config;
 use crate::highlight::{self, HlLine};
+use crate::theme::{self, palette, Appearance};
 use anyhow::Result;
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
@@ -38,8 +39,9 @@ pub const LOGO: [&str; 6] = [
     "╚══════╝ ╚═════╝  ╚═════╝ ╚═╝     ╚══════╝",
 ];
 
-/// One color per logo row — a Catppuccin-flavored gradient that reads well
-/// on any terminal background.
+/// One color per logo row — a Catppuccin-flavored gradient. The pastels
+/// only hold up against a dark background; on a light one the same hues are
+/// used at Latte's darker weights so the logo doesn't wash out.
 pub const LOGO_COLORS: [Color; 6] = [
     Color::Rgb(245, 194, 231), // pink
     Color::Rgb(203, 166, 247), // mauve
@@ -48,6 +50,24 @@ pub const LOGO_COLORS: [Color; 6] = [
     Color::Rgb(116, 199, 236), // sapphire
     Color::Rgb(148, 226, 213), // teal
 ];
+
+pub const LOGO_COLORS_LIGHT: [Color; 6] = [
+    Color::Rgb(234, 118, 203), // pink
+    Color::Rgb(136, 57, 239),  // mauve
+    Color::Rgb(114, 135, 253), // lavender
+    Color::Rgb(30, 102, 245),  // blue
+    Color::Rgb(32, 159, 181),  // sapphire
+    Color::Rgb(23, 146, 153),  // teal
+];
+
+/// The gradient for the active appearance.
+pub fn logo_colors() -> [Color; 6] {
+    if theme::appearance().is_light() {
+        LOGO_COLORS_LIGHT
+    } else {
+        LOGO_COLORS
+    }
+}
 
 /// Rust sample the theme step previews — small enough to re-highlight on
 /// every selection change, varied enough to show keyword/type/string/number/
@@ -74,13 +94,6 @@ impl Catalog {
 }
 "#;
 
-const BTN_BG: Color = Color::Rgb(45, 45, 55);
-const BTN_ACTIVE_BG: Color = Color::Rgb(30, 90, 160);
-const DIM: Color = Color::Gray;
-const SEL_BG: Color = Color::Rgb(28, 66, 120);
-const BG_ADDED: Color = Color::Rgb(16, 50, 26);
-const BG_REMOVED: Color = Color::Rgb(58, 22, 22);
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Step {
     Welcome,
@@ -93,6 +106,8 @@ enum Btn {
     Continue,
     Back,
     Skip,
+    /// The ☀/🌙 light-dark switch on the theme step.
+    Appearance,
     ThemeRow(usize),
     ModeRow(usize),
 }
@@ -114,6 +129,12 @@ struct Wizard {
     mode_sel: usize,
     /// Theme active before the wizard started, restored on skip/quit.
     prev_theme: two_face::theme::EmbeddedThemeName,
+    /// Appearance before the wizard started, restored on skip/quit.
+    prev_appearance: Appearance,
+    /// The row selected the last time each appearance was active, as
+    /// `[dark, light]` — theme pairing is many-to-one, so without this a
+    /// round trip through `a` would not come back to the same theme.
+    remembered: [Option<usize>; 2],
     /// Sample highlighted with the currently selected theme.
     preview: Vec<HlLine>,
     /// Clickable regions recorded during the last draw.
@@ -133,6 +154,8 @@ impl Wizard {
             theme_scroll: 0,
             mode_sel: 0,
             prev_theme: current,
+            prev_appearance: theme::appearance(),
+            remembered: [None, None],
             preview: Vec::new(),
             hits: Vec::new(),
         };
@@ -156,15 +179,44 @@ impl Wizard {
         self.rehighlight();
     }
 
+    /// Flip light ⇄ dark. The selection follows to the counterpart of the
+    /// current theme, so the preview stays a coherent whole rather than a
+    /// dark theme sitting in a light frame — or back to whatever was
+    /// selected the last time this appearance was active.
+    fn toggle_appearance(&mut self) {
+        let current = theme::appearance();
+        let next = current.other();
+        self.remembered[usize::from(current.is_light())] = Some(self.theme_sel);
+        theme::set_appearance(next);
+        self.theme_sel = self.remembered[usize::from(next.is_light())].unwrap_or_else(|| {
+            let paired = highlight::for_appearance(self.selected_theme(), next);
+            highlight::THEMES
+                .iter()
+                .position(|(_, t)| *t == paired)
+                .unwrap_or(self.theme_sel)
+        });
+        self.rehighlight();
+    }
+
     fn finish(&self) -> Result<()> {
-        let theme = highlight::theme_key(self.selected_theme());
-        let mode = MODES[self.mode_sel].0;
-        config::save_global(&[("theme", theme), ("mode", mode)])?;
+        let name = highlight::theme_key(self.selected_theme());
+        let appearance = theme::appearance();
+        let mut pairs = vec![
+            (config::theme_key_for(appearance), name),
+            ("mode", MODES[self.mode_sel].0),
+        ];
+        // Toggling twice is not an override — pinning `appearance` then
+        // would turn detection off on every other terminal for nothing.
+        if appearance != self.prev_appearance {
+            pairs.push(("appearance", appearance.key()));
+        }
+        config::save_global(&pairs)?;
         Ok(())
     }
 
     fn skip(&self) -> Result<()> {
         highlight::set_theme(self.prev_theme);
+        theme::set_appearance(self.prev_appearance);
         // Mark setup as done so the wizard doesn't nag on every launch.
         config::ensure_global_exists()?;
         Ok(())
@@ -203,6 +255,7 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<WizardEnd> {
                     (Step::Theme, KeyCode::PageDown) => w.select_theme(w.theme_sel + 8),
                     (Step::Theme, KeyCode::Home) => w.select_theme(0),
                     (Step::Theme, KeyCode::End) => w.select_theme(usize::MAX),
+                    (Step::Theme, KeyCode::Char('a')) => w.toggle_appearance(),
                     (Step::Theme, KeyCode::Enter) => w.step = Step::Mode,
                     (Step::Theme, KeyCode::Esc) => w.step = Step::Welcome,
                     // ---- mode list
@@ -260,6 +313,7 @@ fn handle_mouse(w: &mut Wizard, m: MouseEvent) -> Result<Option<WizardEnd>> {
                 w.skip()?;
                 return Ok(Some(WizardEnd::Skipped));
             }
+            Some(Btn::Appearance) => w.toggle_appearance(),
             Some(Btn::ThemeRow(i)) => w.select_theme(i),
             Some(Btn::ModeRow(i)) => w.mode_sel = i,
             None => {}
@@ -298,9 +352,10 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 /// The logo (or a plain fallback on very narrow terminals) as colored lines.
 pub fn logo_lines(max_width: u16) -> Vec<Line<'static>> {
+    let colors = logo_colors();
     if max_width >= 44 {
         LOGO.iter()
-            .zip(LOGO_COLORS)
+            .zip(colors)
             .map(|(row, color)| {
                 Line::from(Span::styled(
                     *row,
@@ -312,22 +367,25 @@ pub fn logo_lines(max_width: u16) -> Vec<Line<'static>> {
     } else {
         vec![Line::from(Span::styled(
             "🔍 L O U P E",
-            Style::default()
-                .fg(LOGO_COLORS[1])
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(colors[1]).add_modifier(Modifier::BOLD),
         ))
         .centered()]
     }
 }
 
 fn buttons(f: &mut Frame, w: &mut Wizard, area: Rect, defs: &[(&str, Btn, bool)]) {
-    let total: u16 = defs
-        .iter()
-        .map(|(l, _, _)| l.chars().count() as u16 + 3)
-        .sum();
+    // Display width, not character count: the ☀/🌙 labels are wide, and a
+    // count would centre the row a column off and clip the last pad cell.
+    let width_of = |s: &str| -> u16 {
+        s.chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16)
+            .sum()
+    };
+    let total: u16 = defs.iter().map(|(l, _, _)| width_of(l) + 3).sum();
+    let p = palette();
     let mut x = area.x + (area.width.saturating_sub(total)) / 2;
     for (label, btn, active) in defs {
-        let wdt = label.chars().count() as u16 + 2;
+        let wdt = width_of(label) + 2;
         let rect = Rect {
             x,
             y: area.y,
@@ -336,11 +394,11 @@ fn buttons(f: &mut Frame, w: &mut Wizard, area: Rect, defs: &[(&str, Btn, bool)]
         };
         let style = if *active {
             Style::default()
-                .bg(BTN_ACTIVE_BG)
-                .fg(Color::White)
+                .bg(p.btn_active_bg)
+                .fg(p.btn_active_fg)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().bg(BTN_BG).fg(Color::Gray)
+            Style::default().bg(p.btn_bg).fg(p.btn_fg)
         };
         f.render_widget(
             Paragraph::new(Span::styled(format!(" {label} "), style)),
@@ -352,6 +410,7 @@ fn buttons(f: &mut Frame, w: &mut Wizard, area: Rect, defs: &[(&str, Btn, bool)]
 }
 
 fn draw_welcome(f: &mut Frame, w: &mut Wizard) {
+    let p = palette();
     let area = f.area();
     let rect = centered(area, 58, 15);
     let logo = logo_lines(rect.width);
@@ -361,7 +420,7 @@ fn draw_welcome(f: &mut Frame, w: &mut Wizard) {
     lines.push(
         Line::from(Span::styled(
             "mouse-first PR review in the terminal",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))
         .centered(),
     );
@@ -369,14 +428,14 @@ fn draw_welcome(f: &mut Frame, w: &mut Wizard) {
     lines.push(
         Line::from(Span::styled(
             "Let's set loupe up — a theme and a default mode,",
-            Style::default().fg(DIM),
+            Style::default().fg(p.dim),
         ))
         .centered(),
     );
     lines.push(
         Line::from(Span::styled(
             "saved to your config so this only happens once.",
-            Style::default().fg(DIM),
+            Style::default().fg(p.dim),
         ))
         .centered(),
     );
@@ -400,13 +459,23 @@ fn draw_welcome(f: &mut Frame, w: &mut Wizard) {
 }
 
 fn draw_theme(f: &mut Frame, w: &mut Wizard) {
+    let p = palette();
     let area = f.area();
     let rect = centered(area, 88.min(area.width), area.height.min(30));
+    // Say which background loupe thinks it is on: the detection is usually
+    // right, and when it isn't, `a` is the fix and it is right there.
+    let kind = if theme::appearance().is_light() {
+        "light terminal"
+    } else {
+        "dark terminal"
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" Pick a theme — the preview is live ")
-        .title_bottom(" j/k or click to try · Enter to keep · Esc back ");
+        .border_style(Style::default().fg(p.accent))
+        .title(format!(
+            " Pick a theme for your {kind} — the preview is live "
+        ))
+        .title_bottom(" j/k or click to try · a light/dark · Enter to keep · Esc back ");
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -443,11 +512,11 @@ fn draw_theme(f: &mut Frame, w: &mut Wizard) {
         let selected = idx == w.theme_sel;
         let style = if selected {
             Style::default()
-                .bg(SEL_BG)
-                .fg(Color::White)
+                .bg(p.selected)
+                .fg(p.text)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(DIM)
+            Style::default().fg(p.dim)
         };
         let marker = if selected { "▸ " } else { "  " };
         f.render_widget(
@@ -457,7 +526,7 @@ fn draw_theme(f: &mut Frame, w: &mut Wizard) {
         w.hits.push((rect, Btn::ThemeRow(idx)));
     }
 
-    draw_sample(f, preview, &w.preview);
+    draw_sample(f, preview, &w.preview, w.selected_theme());
 
     let btn_area = Rect {
         x: inner.x,
@@ -466,12 +535,18 @@ fn draw_theme(f: &mut Frame, w: &mut Wizard) {
         height: 1,
     };
     let name = highlight::theme_key(w.selected_theme());
+    let flip = if theme::appearance().is_light() {
+        "🌙 Dark (a)"
+    } else {
+        "☀ Light (a)"
+    };
     buttons(
         f,
         w,
         btn_area,
         &[
             (&format!("Use {name} (Enter)"), Btn::Continue, true),
+            (flip, Btn::Appearance, false),
             ("Back (Esc)", Btn::Back, false),
             ("Skip setup", Btn::Skip, false),
         ],
@@ -480,14 +555,23 @@ fn draw_theme(f: &mut Frame, w: &mut Wizard) {
 
 /// Render the highlighted sample, with one added and one removed row so the
 /// diff backgrounds are previewed against the theme too.
-fn draw_sample(f: &mut Frame, area: Rect, preview: &[HlLine]) {
+fn draw_sample(
+    f: &mut Frame,
+    area: Rect,
+    preview: &[HlLine],
+    theme: two_face::theme::EmbeddedThemeName,
+) {
+    let p = palette();
+    // Fill the panel with the theme's own background, so a light theme
+    // looks light here rather than only after you commit to it.
+    let sample_bg = highlight::theme_background(theme);
     let sample_lines: Vec<&str> = SAMPLE.lines().collect();
     let mut lines: Vec<Line> = Vec::new();
     for (i, text) in sample_lines.iter().enumerate().take(area.height as usize) {
         let bg = match i {
-            11 => Some(BG_REMOVED), // the `let (ra, rp)` line reads as removed
-            12 => Some(BG_ADDED),   // and its successor as added
-            _ => None,
+            11 => Some(p.removed), // the `let (ra, rp)` line reads as removed
+            12 => Some(p.added),   // and its successor as added
+            _ => sample_bg,
         };
         let spans: Vec<Span> = match preview.get(i) {
             Some(segs) if !segs.is_empty() => segs
@@ -500,7 +584,7 @@ fn draw_sample(f: &mut Frame, area: Rect, preview: &[HlLine]) {
                     Span::styled(s.clone(), st)
                 })
                 .collect(),
-            _ => vec![Span::raw(*text)],
+            _ => vec![Span::styled(*text, Style::default().fg(p.text))],
         };
         let mut line = Line::from(spans);
         if let Some(b) = bg {
@@ -508,15 +592,20 @@ fn draw_sample(f: &mut Frame, area: Rect, preview: &[HlLine]) {
         }
         lines.push(line);
     }
-    f.render_widget(Paragraph::new(lines), area);
+    let mut sample = Paragraph::new(lines);
+    if let Some(b) = sample_bg {
+        sample = sample.style(Style::default().bg(b));
+    }
+    f.render_widget(sample, area);
 }
 
 fn draw_mode(f: &mut Frame, w: &mut Wizard) {
+    let p = palette();
     let area = f.area();
     let rect = centered(area, 66, 13);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(p.accent))
         .title(" What should `loupe` open by default? ")
         .title_bottom(" j/k or click · Enter to finish · Esc back ");
     let inner = block.inner(rect);
@@ -534,17 +623,17 @@ fn draw_mode(f: &mut Frame, w: &mut Wizard) {
         let marker = if selected { "▸ " } else { "  " };
         let head = if selected {
             Style::default()
-                .bg(SEL_BG)
-                .fg(Color::White)
+                .bg(p.selected)
+                .fg(p.text)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().add_modifier(Modifier::BOLD)
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD)
         };
         let lines = vec![
             Line::from(Span::styled(format!("{marker}{title}"), head)),
             Line::from(Span::styled(
                 format!("    {desc}"),
-                Style::default().fg(DIM),
+                Style::default().fg(p.dim),
             )),
         ];
         f.render_widget(Paragraph::new(lines), row);
@@ -590,6 +679,7 @@ mod tests {
     fn sample_highlights_and_fits() {
         // The preview must produce real colors for the sample, and the
         // sample must fit the preview pane the theme step allocates.
+        let _guard = highlight::test_theme_lock();
         let hl = highlight::highlight("sample.rs", SAMPLE);
         assert_eq!(hl.len(), SAMPLE.lines().count());
         assert!(SAMPLE.lines().count() <= 28);
@@ -600,8 +690,13 @@ mod tests {
 
     #[test]
     fn wizard_starts_on_the_current_theme() {
+        // `Wizard::new` previews immediately, so it *writes* the global
+        // theme as well as reading it — hold the lock and put it back.
+        let _guard = highlight::test_theme_lock();
+        let before = highlight::current_theme();
         let w = Wizard::new();
         assert_eq!(w.selected_theme(), highlight::current_theme());
         assert_eq!(w.mode_sel, 0, "auto is the default mode");
+        highlight::set_theme(before);
     }
 }
