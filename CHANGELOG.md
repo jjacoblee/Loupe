@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-25
+
+Two fixes for 0.2.0, both for bugs that only showed up on a machine the
+release was not built on. The seven commits behind 0.2.0 were pushed
+together at the tag, so the first time CI ran them on Windows and macOS
+was after the binaries had shipped.
+
+### Fixed
+
+- **Dropping a file on the window did nothing on Windows.** A dropped
+  path arrives written in as if typed, and loupe reads it the way a
+  shell would: a backslash escapes the character after it. On Windows
+  the backslash is the path separator, so `C:\Users\me\notes.md` was
+  read as `C:Usersmenotes.md` — not an absolute path, not a file that
+  exists, and the drop was refused. Every drop, every time; the tab row
+  could only be filled with `Ctrl+O`. Backslash is now a separator
+  rather than an escape there, and quoting — which is how a Windows
+  terminal spells a path with a space in it — is unchanged.
+
+- **rust-analyzer was *still* reported as installed when it was not.**
+  0.2.0 fixed the half of this that reads the stand-in rustup keeps in
+  `~/.cargo/bin` for every tool it could provide, but only recognised a
+  *symlink* to rustup. A normal install **hard-links** them instead: the
+  link is the same file, so resolving it gives back the stand-in's own
+  name and the check said "a real tool". Loupe then offered `gd`, `gr`
+  and `K` and failed at the first request with rustup's "Unknown binary"
+  error — the exact bug 0.2.0's notes say was fixed. A hard link shares
+  the original's inode, so that is what is compared now, against the
+  `rustup` binary sitting in the same directory. The test is exact: a
+  real tool that `cargo install` put in `~/.cargo/bin` is a different
+  file and is still taken at face value.
+
+  The other half of the same bug: `Client::start` asked `which` whether
+  the server was installed — which resolves a stand-in to the real
+  binary — and then started the *bare name*, which goes back through the
+  stand-in. It starts the path `which` resolved now, so the answer to
+  "is it installed?" and what actually runs are the same thing.
+
+  The inode comparison is Unix-only. A Windows machine whose rustup
+  stand-ins are hard links or copies is not covered by it.
+
 ## [0.2.0] - 2026-08-25
 
 ### Added
@@ -449,6 +490,7 @@ Initial public release.
 - **Hardening**: PR-controlled paths, oids, and refs validated before
   reaching `git`; no shell execution anywhere; symlink-safe editing.
 
-[Unreleased]: https://github.com/jjacoblee/Loupe/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jjacoblee/Loupe/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/jjacoblee/Loupe/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jjacoblee/Loupe/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jjacoblee/Loupe/releases/tag/v0.1.0
