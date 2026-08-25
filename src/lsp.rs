@@ -194,14 +194,53 @@ pub fn which(cmd: &str) -> Option<PathBuf> {
     Some(found)
 }
 
-/// True when `path` is one of rustup's stand-ins rather than a real tool:
-/// it resolves to `rustup` itself.
+/// True when `path` is one of rustup's stand-ins rather than a real tool.
+///
+/// rustup installs a stand-in for every tool it *could* provide, whether
+/// the component is there or not, so the file existing proves nothing. It
+/// makes them three ways, and only the first is a symlink:
+///
+/// 1. A **symlink** to `rustup` — `canonicalize` lands on the name.
+/// 2. A **hard link** to it, which is what a normal install makes. The
+///    link *is* the same file, so `canonicalize` gives back the
+///    stand-in's own name and tells us nothing; the inode is the thing
+///    that matches.
+///
+/// Case 2 is why this cannot just read the resolved name: on a
+/// hard-linked install loupe called the stand-in "installed" and then
+/// failed at the first request with rustup's "Unknown binary" error.
+///
+/// The inode test is anchored to the `rustup` binary in the same
+/// directory, and is exact — a real tool that happens to live in
+/// `~/.cargo/bin`, one `cargo install` put there, is a different file
+/// and is taken at face value.
 fn is_rustup_proxy(path: &Path) -> bool {
-    let Ok(real) = std::fs::canonicalize(path) else {
-        return false;
-    };
-    real.file_stem()
-        .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("rustup"))
+    if let Ok(real) = std::fs::canonicalize(path) {
+        if real
+            .file_stem()
+            .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("rustup"))
+        {
+            return true;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Some(dir) = path.parent() else {
+            return false;
+        };
+        let Some(rustup) = ["rustup", "rustup.exe"]
+            .iter()
+            .map(|n| dir.join(n))
+            .find(|p| p.is_file())
+        else {
+            return false;
+        };
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(path), std::fs::metadata(&rustup)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    false
 }
 
 /// What `rustup which <cmd>` says, or `None` when rustup does not have it.
@@ -1527,6 +1566,21 @@ mod tests {
         let real = dir.join("real-server");
         std::fs::write(&real, "#!/bin/sh\nexit 0\n").unwrap();
         assert!(!is_rustup_proxy(&real));
+
+        // The shape a normal install actually has: rustup hard-links its
+        // stand-ins rather than symlinking them, so the resolved name is
+        // the stand-in's own and only the inode gives it away. Reading
+        // the name alone called this one a real tool, and loupe then
+        // offered gd/gr/K and failed at the first request.
+        #[cfg(unix)]
+        {
+            let linked = dir.join("hardlinked-analyzer");
+            std::fs::hard_link(&rustup, &linked).unwrap();
+            assert!(
+                is_rustup_proxy(&linked),
+                "a hard link to rustup is a stand-in too"
+            );
+        }
 
         // Windows keeps a copy rather than a link, and it is still rustup.
         let copied = dir.join("rustup.exe");

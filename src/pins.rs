@@ -365,8 +365,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A path with a space arrives escaped, quoted, or as a URL. All
-    /// three name the same file.
+    /// A path with a space arrives escaped, quoted, or as a URL. Every
+    /// spelling the running platform can produce names the same file.
     #[test]
     fn spaces_survive_every_spelling() {
         let dir = std::env::temp_dir().join("loupe-pins-spaces");
@@ -374,10 +374,17 @@ mod tests {
         let file = dir.join("my notes.md");
         std::fs::write(&file, "# hi").unwrap();
         let raw = file.to_string_lossy().into_owned();
-        let escaped = raw.replace(' ', "\\ ");
         let quoted = format!("'{raw}'");
-        let url = format!("file://{}", raw.replace(' ', "%20"));
-        for text in [escaped, quoted, url] {
+        let mut spellings = vec![quoted];
+        // Escaping and `file://` are POSIX spellings. On Windows the
+        // backslash is the path separator, so an escaped path is not a
+        // thing a terminal there can send — quoting is how it spells a
+        // space, and reading `\` as an escape is what broke every drop.
+        if !cfg!(windows) {
+            spellings.push(raw.replace(' ', "\\ "));
+            spellings.push(format!("file://{}", raw.replace(' ', "%20")));
+        }
+        for text in spellings {
             assert_eq!(dropped_paths(&text), Some(vec![file.clone()]), "{text}");
         }
         std::fs::remove_dir_all(&dir).ok();

@@ -10767,13 +10767,19 @@ b2
         // because bare is genuinely two paths.
         let plain = away.join("plain.md");
         std::fs::write(&plain, "# Plain\n").unwrap();
-        for text in [
+        let mut spellings = vec![
             format!("'{raw}'"),
             format!("\"{raw}\""),
-            raw.replace(' ', "\\ "),
             // The trailing space several terminals add after the path.
             format!("{} ", plain.to_string_lossy()),
-        ] {
+        ];
+        // Backslash-escaping is a POSIX spelling: on Windows the
+        // backslash is the path separator, so quoting is the only way a
+        // terminal there spells a space.
+        if !cfg!(windows) {
+            spellings.push(raw.replace(' ', "\\ "));
+        }
+        for text in spellings {
             let mut app = md_review_app(&dir.0, "# Plan\n");
             app.handle_events(typed(&text));
             assert_eq!(app.pins.len(), 1, "{text}");
@@ -11409,10 +11415,16 @@ b2
             highlight::set_theme(*theme);
             let mut app = App::new(LaunchMode::Auto, None);
             app.open_theme_picker();
+            // Read the appearance the picker actually opened on rather
+            // than assuming it is `start`: what this test is about is
+            // that a toggle flips it and a second toggle brings the
+            // theme back, not what `theme_is_light` says about a theme
+            // whose colors come from the terminal.
+            let opened = crate::theme::appearance();
             app.handle_key(key(KeyCode::Char('a')));
-            assert_eq!(crate::theme::appearance(), start.other(), "{name}");
+            assert_eq!(crate::theme::appearance(), opened.other(), "{name}");
             app.handle_key(key(KeyCode::Char('a')));
-            assert_eq!(crate::theme::appearance(), start, "{name}");
+            assert_eq!(crate::theme::appearance(), opened, "{name}");
             assert_eq!(
                 highlight::theme_key(highlight::current_theme()),
                 *name,
