@@ -138,6 +138,29 @@ pub struct Palette {
     pub gutter: Color,
     /// Editor: selected text.
     pub editor_sel: Color,
+
+    /// Blame pane: the age ramp, newest first. Six steps — under a day,
+    /// a week, a month, three months, a year, older. The scale is
+    /// absolute, so a color means the same age in every file.
+    ///
+    /// One hue, lightness only: the same neutral the borders and line
+    /// numbers already use, running from the primary text color down to
+    /// the divider. Keeping the ramp colorless is what lets the two
+    /// classes above it — uncommitted, and part of this change — be the
+    /// only *colored* things in the column, so the question the pane
+    /// exists to answer is the one that catches the eye.
+    pub blame_heat: [Color; 6],
+    /// Blame pane: a line that is not committed yet — your working tree.
+    /// Brighter than the top of the ramp, because it is newer than any
+    /// commit can be.
+    pub blame_uncommitted: Color,
+    /// Blame pane: a line from a commit that belongs to the change under
+    /// review. This is the color that answers "is this mine, now?".
+    pub blame_change: Color,
+    /// Blame pane: an author name matching your own `git config
+    /// user.email`. Kept apart from the ramp so "mine" and "recent" stay
+    /// two signals rather than one.
+    pub blame_mine: Color,
 }
 
 /// For a dark terminal background. These are the colors loupe shipped with.
@@ -183,6 +206,20 @@ pub const DARK: Palette = Palette {
     code: Color::Rgb(220, 223, 228),
     gutter: Color::DarkGray,
     editor_sel: Color::Rgb(38, 79, 120),
+
+    // Text grey down to divider grey — the chrome's own neutral, which
+    // leans very slightly blue the way the rest of the dark palette does.
+    blame_heat: [
+        Color::Rgb(222, 222, 232),
+        Color::Rgb(186, 186, 196),
+        Color::Rgb(152, 152, 162),
+        Color::Rgb(120, 120, 130),
+        Color::Rgb(90, 90, 100),
+        Color::Rgb(64, 64, 74),
+    ],
+    blame_uncommitted: Color::Rgb(120, 230, 150),
+    blame_change: Color::Rgb(120, 170, 240),
+    blame_mine: Color::Rgb(190, 210, 255),
 };
 
 /// For a light terminal background. The diff tints are close to what GitHub
@@ -231,6 +268,20 @@ pub const LIGHT: Palette = Palette {
     code: Color::Rgb(30, 33, 38),
     gutter: Color::Rgb(118, 125, 135),
     editor_sel: Color::Rgb(198, 219, 246),
+
+    // The same ramp inverted: on a light background "recent" is the dark
+    // end, and history fades out past the divider grey into the page.
+    blame_heat: [
+        Color::Rgb(28, 30, 36),
+        Color::Rgb(66, 70, 80),
+        Color::Rgb(104, 109, 120),
+        Color::Rgb(138, 144, 155),
+        Color::Rgb(170, 176, 186),
+        Color::Rgb(196, 201, 210),
+    ],
+    blame_uncommitted: Color::Rgb(20, 130, 70),
+    blame_change: Color::Rgb(28, 100, 188),
+    blame_mine: Color::Rgb(38, 68, 140),
 };
 
 // ------------------------------------------------------------- global state
@@ -653,6 +704,76 @@ mod tests {
                     "light palette {name} ({c:?}) is too pale to read on white"
                 ),
                 other => panic!("light palette {name} must be explicit RGB, got {other:?}"),
+            }
+        }
+    }
+
+    /// The age ramp is one hue with lightness doing all the work. That is
+    /// what keeps the two classes above it — uncommitted, and part of
+    /// this change — the only *colored* things in the blame column, so
+    /// the question the pane exists to answer is the one that catches the
+    /// eye. A ramp that drifted into color would drown them out.
+    #[test]
+    fn the_blame_ramp_is_one_hue() {
+        for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
+            for (i, c) in p.blame_heat.iter().enumerate() {
+                let Color::Rgb(r, g, b) = *c else {
+                    panic!("{name} step {i} must be an explicit RGB step");
+                };
+                // A grey with the palette's own slight blue lean. A real
+                // hue would spread three or four times this far.
+                let spread = r.max(g).max(b) - r.min(g).min(b);
+                assert!(
+                    spread <= 20,
+                    "{name} step {i} is {r},{g},{b} — a spread of {spread} is a hue, not a grey"
+                );
+                assert!(
+                    r <= g && g <= b,
+                    "{name} step {i} is {r},{g},{b} — every step must lean the same way"
+                );
+            }
+        }
+    }
+
+    /// …and the lightness runs one way, so "brighter is newer" holds at
+    /// every step rather than only at the ends.
+    #[test]
+    fn the_blame_ramp_fades_in_one_direction() {
+        let lum = |c: &Color| match c {
+            Color::Rgb(r, g, b) => *r as i32 + *g as i32 + *b as i32,
+            other => panic!("expected an RGB step, got {other:?}"),
+        };
+        // Dark terminal: newest is brightest, and every step recedes.
+        for w in DARK.blame_heat.windows(2) {
+            assert!(lum(&w[0]) > lum(&w[1]), "dark ramp must fall: {w:?}");
+        }
+        // Light terminal: the same ramp inverted — newest is darkest.
+        for w in LIGHT.blame_heat.windows(2) {
+            assert!(lum(&w[0]) < lum(&w[1]), "light ramp must rise: {w:?}");
+        }
+        // The oldest step still has to be visible against the pane, not
+        // painted out of existence.
+        assert_ne!(DARK.blame_heat[5], DARK.empty);
+        assert_ne!(LIGHT.blame_heat[5], LIGHT.empty);
+    }
+
+    /// The two classes that outrank the ramp have to read as colored
+    /// against it, or the pane's whole signal is lost.
+    #[test]
+    fn the_blame_badges_are_colored_where_the_ramp_is_not() {
+        for (name, p) in [("dark", &DARK), ("light", &LIGHT)] {
+            for (what, c) in [
+                ("uncommitted", p.blame_uncommitted),
+                ("in this change", p.blame_change),
+            ] {
+                let Color::Rgb(r, g, b) = c else {
+                    panic!("{name} {what} must be an explicit RGB color");
+                };
+                let spread = r.max(g).max(b) - r.min(g).min(b);
+                assert!(
+                    spread > 40,
+                    "{name} {what} is {r},{g},{b} — too grey to stand out from the ramp"
+                );
             }
         }
     }

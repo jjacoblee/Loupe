@@ -44,6 +44,15 @@ leaving your terminal or touching a browser.
   its own. Click the section marker to put just those lines back
   (working tree only — what you staged stays staged), or the file marker
   to take the whole file back to where it started. Both ask first.
+- **Blame beside the diff** — `B` opens a pane between the file panel
+  and the diff: who last touched each line, how long ago, and the pull
+  request it landed in. An age heat map — one hue, lightness only — means
+  you read the shape of the file's history before you read a word, and
+  two colors sit above it —
+  one for your uncommitted lines, one for lines the change under review
+  moved — so *"is this related to what I am doing now?"* is answered at a
+  glance. Click a row for the commit itself, and `o` opens its pull
+  request. Works in a PR review, in local review, and beside the editor.
 - **Keeps up with an agent** — local review re-scans the working tree
   whenever you pause, so files a coding agent rewrites under an open
   review appear without a key press. It never interrupts (no re-scan
@@ -146,7 +155,7 @@ for the list.
 The first launch runs a quick setup wizard (theme + default mode, saved
 for you). Then: click files, read diffs (`v` toggles split/inline, `z`
 folds), select lines (click, drag, or `V` + motions) and `c` to comment,
-`e` to edit, `x` to mark viewed or stage, `r` to refresh, `m` (or `☰`)
+`e` to edit, `x` to mark viewed or stage, `B` for blame, `r` to refresh, `m` (or `☰`)
 for the menu, `?` for help, `q` to quit — the full keyboard and mouse
 reference is in
 [docs/keys-and-mouse.md](docs/keys-and-mouse.md).

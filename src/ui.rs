@@ -2,8 +2,9 @@
 //! `app.layout` so the mouse handlers can hit-test against it.
 
 use crate::app::{
-    App, ButtonId, FileEntry, FinderMode, MenuRow, Overlay, Screen, ViewMode, FINDER_ROWS,
+    App, ButtonId, Dragging, FileEntry, FinderMode, MenuRow, Overlay, Screen, ViewMode, FINDER_ROWS,
 };
+use crate::blame::{self, Heat};
 use crate::diff::{DisplayEntry, Row, RowKind, Selection, Side, TAB_WIDTH};
 use crate::gitops::StageState;
 use crate::highlight::HlLine;
@@ -13,6 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
 
 /// Width of the Tree/Flat toggle drawn on the file panel's top border.
@@ -59,6 +61,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Finder(_) => draw_finder(f, app, area),
         Overlay::Hover(_) => draw_hover(f, app, area),
         Overlay::PathMenu(_) => draw_path_menu(f, app, area),
+        Overlay::BlameMenu(_) => draw_blame_menu(f, app, area),
         Overlay::Menu(_) => draw_menu(f, app, area),
     }
 }
@@ -389,14 +392,21 @@ fn draw_pr_list(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
     app.layout.review = area;
-    // The panel width is user-set; re-clamp here so a terminal resize can
-    // never leave the diff pane starved.
+    // Both panel widths are user-set; re-clamp here so a terminal resize
+    // can never leave the diff pane starved. `blame_gutter` is zero when
+    // the pane is off, and also when three panes will not fit — a narrow
+    // terminal shows two rather than a diff too thin to read.
+    let bw = app.blame_gutter();
     let fw = app.clamp_panel_w(app.file_panel_w);
     app.file_panel_w = fw;
+    if bw > 0 {
+        app.blame_w = bw;
+    }
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(fw),
+            Constraint::Length(bw),
             Constraint::Min(crate::app::DIFF_MIN_W),
         ])
         .split(area);
@@ -410,29 +420,73 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
     };
     draw_file_list(f, app, cols[0]);
 
-    if let Some(editor) = &mut app.editor {
-        editor.render(f, cols[1], true);
-    } else {
-        draw_diff(f, app, cols[1]);
+    if bw > 0 {
+        let seam = fw + bw;
+        app.layout.blame_divider = Rect {
+            x: area.x + seam.saturating_sub(1),
+            y: area.y,
+            width: 2.min(area.width.saturating_sub(seam.saturating_sub(1))),
+            height: area.height,
+        };
+        let h = cols[1].height.saturating_sub(2) as usize;
+        // The editor keeps its own pane, aligned to its scroll: a buffer
+        // has no folds, so one file line is one row there.
+        let (rows, cursor, note) = match &app.editor {
+            Some(ed) => {
+                let top = ed.scroll_top();
+                let n_lines = ed.textarea.lines().len();
+                let cursor = ed.textarea.cursor().0.checked_sub(top).filter(|n| *n < h);
+                // Typing moves the text out from under the blame, and
+                // there is no honest way to re-anchor it without a fresh
+                // read — so say so instead of drawing a lie in full color.
+                let note = if ed.dirty {
+                    " · stale"
+                } else if app.blame_loading() {
+                    " · loading…"
+                } else {
+                    ""
+                };
+                (blame_rows_editor(app, h, top, n_lines), cursor, note)
+            }
+            None => {
+                let cursor = app
+                    .diff_cursor
+                    .checked_sub(app.diff_scroll)
+                    .filter(|n| *n < h);
+                let note = if app.blame_loading() {
+                    " · loading…"
+                } else {
+                    ""
+                };
+                (blame_rows_diff(app, h), cursor, note)
+            }
+        };
+        draw_blame(f, app, cols[1], rows, cursor, note);
     }
-    draw_divider_grip(f, app);
+
+    if let Some(editor) = &mut app.editor {
+        editor.render(f, cols[2], true);
+    } else {
+        draw_diff(f, app, cols[2]);
+    }
+    draw_divider_grip(f, app.layout.divider, app.dragging() == Dragging::FilePanel);
+    draw_divider_grip(
+        f,
+        app.layout.blame_divider,
+        app.dragging() == Dragging::BlamePane,
+    );
 }
 
 /// A grip on the divider so it reads as draggable: a few heavy border
 /// cells at mid-height, and the whole seam accented while it is being
 /// dragged.
-fn draw_divider_grip(f: &mut Frame, app: &App) {
-    let d = app.layout.divider;
+fn draw_divider_grip(f: &mut Frame, d: Rect, active: bool) {
     if d.width == 0 || d.height < 3 {
         return;
     }
     let p = palette();
-    let style = Style::default().fg(if app.resizing() {
-        p.divider_active
-    } else {
-        p.divider
-    });
-    let (top, height) = if app.resizing() {
+    let style = Style::default().fg(if active { p.divider_active } else { p.divider });
+    let (top, height) = if active {
         (d.y, d.height)
     } else {
         (d.y + d.height / 2 - 1, 3)
@@ -839,6 +893,210 @@ fn unfold_line<'a>(width: usize, count: usize, cursor: bool) -> Line<'a> {
     )
 }
 
+// ------------------------------------------------------------------ blame
+
+/// The bar character for each step of the heat ramp. Color carries the
+/// age, but a shape ramp behind it keeps the pane readable on a terminal
+/// with a poor palette — and at a glance, without reading the color.
+fn heat_bar(h: Heat) -> char {
+    match h {
+        Heat::Uncommitted | Heat::InChange | Heat::Age(0) => '█',
+        Heat::Age(1) | Heat::Age(2) => '▓',
+        Heat::Age(3) => '▒',
+        _ => '░',
+    }
+}
+
+/// Columns the pull request number gets: `#` and six digits. A number
+/// wider than that is rare enough to be worth an ellipsis, and a
+/// *truncated* number would send the reader to a real but wrong pull
+/// request — the one failure this column must never have.
+const PR_W: usize = 7;
+
+fn pr_label(number: u64) -> String {
+    let text = format!("#{number}");
+    if text.chars().count() > PR_W {
+        return "#…".to_string();
+    }
+    text
+}
+
+fn heat_color(p: &crate::theme::Palette, h: Heat) -> Color {
+    match h {
+        Heat::Uncommitted => p.blame_uncommitted,
+        Heat::InChange => p.blame_change,
+        Heat::Age(i) => p.blame_heat[i.min(p.blame_heat.len() - 1)],
+    }
+}
+
+/// One row of the blame pane, already resolved against whatever is in the
+/// pane beside it.
+enum BlameRow {
+    /// A fold banner: it covers many lines from many commits, so a rule
+    /// says "nothing is claimed here" rather than blaming one of them.
+    Rule,
+    /// Past the end of the file, or a line nothing is blamed on.
+    Blank,
+    Commit(Arc<blame::Commit>),
+}
+
+/// The pane's rows for the diff: the same window `draw_diff` walks, so
+/// the two cannot drift.
+fn blame_rows_diff(app: &App, h: usize) -> Vec<BlameRow> {
+    (0..h)
+        .map(|n| {
+            let row = app.diff_scroll + n;
+            match app.display.get(row) {
+                None => BlameRow::Blank,
+                Some(DisplayEntry::Line(_)) => match app.blame_for_row(row) {
+                    Some(c) => BlameRow::Commit(c),
+                    None => BlameRow::Blank,
+                },
+                Some(_) => BlameRow::Rule,
+            }
+        })
+        .collect()
+}
+
+/// The pane's rows for the editor. A buffer has no folds, so one file
+/// line is one row and the only thing to follow is the scroll top.
+fn blame_rows_editor(app: &App, h: usize, top: usize, n_lines: usize) -> Vec<BlameRow> {
+    (0..h)
+        .map(|n| {
+            let line = top + n;
+            if line >= n_lines {
+                return BlameRow::Blank;
+            }
+            match app.blame_new.as_ref().and_then(|b| b.at(line + 1)) {
+                Some(c) => BlameRow::Commit(c.clone()),
+                None => BlameRow::Blank,
+            }
+        })
+        .collect()
+}
+
+/// Draw the blame pane over `area`.
+///
+/// A run of rows sharing one commit prints its author once, at the top of
+/// the run — repeating a name down twenty rows says nothing and hides
+/// where one commit ends and the next begins. The heat bar keeps drawing
+/// on every row, so the ramp stays continuous.
+///
+/// `cursor` is the row to mark, as an index into the visible window.
+/// `note` is appended to the title: what the pane is waiting for, or why
+/// what it shows may no longer line up.
+fn draw_blame(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    rows: Vec<BlameRow>,
+    cursor: Option<usize>,
+    note: &str,
+) {
+    let p = palette();
+    let now = blame::now();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Blame{note} "));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    app.layout.blame = inner;
+    let w = inner.width as usize;
+    if w == 0 || inner.height == 0 {
+        return;
+    }
+
+    // What fits: the bar and a name always; the age next; the pull
+    // request number last, because the popup carries that one too.
+    let show_pr = w >= 22;
+    let show_age = w >= 14;
+    let fixed = 2 + if show_age { 5 } else { 0 } + if show_pr { PR_W + 1 } else { 0 };
+    // Cap the name: a pane dragged wide should not float the age and the
+    // pull request number away from the name they belong to.
+    let name_w = w.saturating_sub(fixed).clamp(3, 22);
+    // A run of the same commit is drawn once. Dimmed while the pane is
+    // stale, so it never looks more certain than it is.
+    let dim = !note.is_empty();
+
+    let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
+    let mut prev_sha: Option<String> = None;
+    for (n, row) in rows.into_iter().enumerate() {
+        let commit = match row {
+            BlameRow::Blank => {
+                prev_sha = None;
+                lines.push(Line::default());
+                continue;
+            }
+            BlameRow::Rule => {
+                prev_sha = None;
+                lines.push(Line::from(Span::styled(
+                    "─".repeat(w),
+                    Style::default().fg(p.fold),
+                )));
+                continue;
+            }
+            BlameRow::Commit(c) => c,
+        };
+        let in_change = app.blame_change_set.contains(&commit.sha);
+        let h = blame::heat(&commit, now, in_change);
+        let mut base = Style::default();
+        if cursor == Some(n) {
+            base = base.bg(p.cursor).add_modifier(Modifier::UNDERLINED);
+        }
+        let mut spans = vec![
+            Span::styled(
+                heat_bar(h).to_string(),
+                base.fg(if dim { p.faint } else { heat_color(p, h) })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ", base),
+        ];
+        let repeat = n > 0 && prev_sha.as_deref() == Some(commit.sha.as_str());
+        prev_sha = Some(commit.sha.clone());
+        if repeat {
+            spans.push(Span::styled(" ".repeat(w.saturating_sub(2)), base));
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        let name = if commit.uncommitted() {
+            "uncommitted".to_string()
+        } else {
+            commit.author.clone()
+        };
+        let name_style = if dim {
+            base.fg(p.faint)
+        } else if commit.uncommitted() {
+            base.fg(p.blame_uncommitted)
+        } else if app.blame_is_mine(&commit) {
+            base.fg(p.blame_mine).add_modifier(Modifier::BOLD)
+        } else {
+            base.fg(p.text)
+        };
+        spans.push(Span::styled(truncate_pad(&name, name_w), name_style));
+        if show_age {
+            let age = if commit.uncommitted() {
+                "now".to_string()
+            } else {
+                blame::ago(commit.author_time, now)
+            };
+            spans.push(Span::styled(format!(" {age:>4}"), base.fg(p.dim)));
+        }
+        if show_pr {
+            let (text, style) = match app.blame_prs.get(&commit.sha) {
+                Some(pr) => (pr_label(pr.number), base.fg(p.key)),
+                None => (String::new(), base.fg(p.faint)),
+            };
+            spans.push(Span::styled(
+                format!(" {}", truncate_pad(&text, PR_W)),
+                style,
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let p = palette();
     let file = app.files.get(app.file_cursor);
@@ -1222,6 +1480,148 @@ fn draw_path_menu(f: &mut Frame, app: &mut App, area: Rect) {
         ]);
         f.render_widget(Paragraph::new(line).style(style), r);
         rows.push((r, ButtonId::PathMenuRow(i)));
+    }
+    app.layout.buttons.extend(rows);
+}
+
+/// The popup behind one blame row: the commit, and the ways to follow it.
+///
+/// The pane has room for a name, an age and a number. This is where the
+/// rest of the answer lives — the exact date, the subject, the pull
+/// request title, and whether the commit belongs to the change on screen.
+fn draw_blame_menu(f: &mut Frame, app: &mut App, area: Rect) {
+    let Overlay::BlameMenu(menu) = &app.overlay else {
+        return;
+    };
+    let p = palette();
+    let c = &menu.commit;
+
+    // The facts, then the actions. The facts are not selectable, so they
+    // are drawn as plain rows above the keyed ones.
+    let mut facts: Vec<Line> = Vec::new();
+    if c.uncommitted() {
+        facts.push(Line::from(Span::styled(
+            "Not committed yet — your working tree.",
+            Style::default().fg(p.blame_uncommitted),
+        )));
+    } else {
+        facts.push(Line::from(vec![
+            Span::styled(
+                c.short().to_string(),
+                Style::default().fg(p.key).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", blame::date(c.author_time)),
+                Style::default().fg(p.dim),
+            ),
+        ]));
+        facts.push(Line::from(vec![
+            Span::styled(
+                c.author.clone(),
+                Style::default().fg(if menu.mine { p.blame_mine } else { p.text }),
+            ),
+            Span::styled(
+                format!(
+                    " <{}>{}",
+                    c.author_email,
+                    if menu.mine { " · you" } else { "" }
+                ),
+                Style::default().fg(p.dim),
+            ),
+        ]));
+        facts.push(Line::from(Span::styled(
+            c.summary.clone(),
+            Style::default().fg(p.text),
+        )));
+    }
+    if menu.in_change {
+        facts.push(Line::from(Span::styled(
+            "▸ Part of the change you are reviewing.",
+            Style::default()
+                .fg(p.blame_change)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    if let Some(pr) = &menu.pr {
+        facts.push(Line::from(vec![
+            Span::styled(format!("#{} ", pr.number), Style::default().fg(p.key)),
+            Span::styled(pr.title.clone(), Style::default().fg(p.dim)),
+        ]));
+    }
+    if menu.items.is_empty() {
+        facts.push(Line::from(Span::styled(
+            "any key closes",
+            Style::default().fg(p.faint),
+        )));
+    }
+
+    let widest = facts
+        .iter()
+        .map(|l| disp_width(&l.to_string()))
+        .chain(menu.items.iter().map(|it| disp_width(&it.label) + 4))
+        .max()
+        .unwrap_or(20);
+    let w = (widest as u16 + 4).min(area.width);
+    let h = ((facts.len() + menu.items.len()) as u16 + 2).min(area.height);
+    let (ax, ay) = menu.anchor;
+    // Keep the whole popup on screen: it opens down and to the right of
+    // the pointer, and flips above it when there is no room below.
+    let x = ax.min(area.x + area.width.saturating_sub(w));
+    let y = if ay + h <= area.y + area.height {
+        ay
+    } else {
+        (ay + 1).saturating_sub(h).max(area.y)
+    };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().fg(p.text))
+        .title(" Blame ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let n_facts = facts.len().min(inner.height as usize);
+    f.render_widget(
+        Paragraph::new(facts),
+        Rect {
+            height: n_facts as u16,
+            ..inner
+        },
+    );
+
+    let mut rows: Vec<(Rect, ButtonId)> = Vec::new();
+    for (i, item) in menu.items.iter().enumerate() {
+        let top = n_facts + i;
+        if top as u16 >= inner.height {
+            break;
+        }
+        let r = Rect {
+            x: inner.x,
+            y: inner.y + top as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let style = if i == menu.sel {
+            Style::default()
+                .bg(p.row)
+                .fg(p.text)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.text)
+        };
+        let line = Line::from(vec![
+            Span::styled(item.label.clone(), style),
+            Span::styled(format!(" ({})", item.key), Style::default().fg(p.key)),
+        ]);
+        f.render_widget(Paragraph::new(line).style(style), r);
+        rows.push((r, ButtonId::BlameMenuRow(i)));
     }
     app.layout.buttons.extend(rows);
 }
@@ -3270,5 +3670,208 @@ mod tests {
             .filter(|x| buf[(*x, line2)].bg == bg)
             .count();
         assert_eq!(right_half, 0, "the new side is not selected");
+    }
+
+    // ------------------------------------------------------------ blame
+
+    /// A blame whose line *n* is claimed by `(author, sha, age_days)`.
+    fn fake_blame(lines: &[(&str, &str, i64)]) -> blame::Blame {
+        let now = blame::now();
+        blame::Blame {
+            lines: lines
+                .iter()
+                .map(|(author, sha, days)| blame::BlameLine {
+                    commit: Arc::new(blame::Commit {
+                        sha: (*sha).into(),
+                        author: (*author).into(),
+                        author_email: format!("{}@test", author.to_lowercase()),
+                        author_time: now - days * 60 * 60 * 24,
+                        summary: format!("work by {author}"),
+                        pr: None,
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    /// An app with the blame pane on and both sides blamed, over a
+    /// one-line modification: inline row 0 is the unchanged first line,
+    /// row 1 is the removed old line, row 2 is the added new one.
+    fn blame_app() -> App {
+        let mut app = wide_app();
+        app.view = ViewMode::Inline;
+        app.collapse_unchanged = false;
+        app.diff = Some(FileDiff::compute(Some("a\nb\n"), Some("a\nB\n")));
+        app.rebuild_display();
+        app.blame_on = true;
+        app.blame_new = Some(fake_blame(&[("Ann", "aaa", 400), ("Bob", "bbb", 0)]));
+        app.blame_old = Some(fake_blame(&[("Ann", "aaa", 400), ("Cid", "ccc", 40)]));
+        app
+    }
+
+    /// The pane sits between the file panel and the diff, and each row
+    /// names the commit behind the diff row beside it — the new side
+    /// where there is one, the old side for a removed line.
+    #[test]
+    fn the_blame_pane_lines_up_with_the_diff() {
+        let mut app = blame_app();
+        let buf = render(&mut app);
+
+        let (fl, bl, df) = (app.layout.file_list, app.layout.blame, app.layout.diff);
+        assert!(bl.width > 0, "the pane is drawn");
+        assert!(fl.x + fl.width <= bl.x, "it sits right of the file panel");
+        assert!(bl.x + bl.width <= df.x, "and left of the diff");
+
+        let pane_row = |y: u16| -> String {
+            (bl.x..bl.x + bl.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+        assert!(pane_row(bl.y).contains("Ann"), "row 0: the unchanged line");
+        assert!(
+            pane_row(bl.y + 1).contains("Cid"),
+            "row 1 is a removed line, so it is blamed on the old side"
+        );
+        assert!(pane_row(bl.y + 2).contains("Bob"), "row 2: the added line");
+
+        // The ages fit alongside the names.
+        assert!(pane_row(bl.y).contains("1y"), "Ann's commit is a year old");
+        assert!(pane_row(bl.y + 2).contains("now"), "Bob's is today");
+    }
+
+    /// Turning the pane off gives its columns back to the diff, and
+    /// leaves no hit target behind for a click to land on.
+    #[test]
+    fn hiding_the_blame_pane_gives_the_diff_its_columns_back() {
+        let mut app = blame_app();
+        render(&mut app);
+        let with = app.layout.diff.width;
+        assert!(app.layout.blame.width > 0);
+        assert!(app.layout.blame_divider.width > 0);
+
+        app.blame_on = false;
+        render(&mut app);
+        assert_eq!(app.layout.blame.width, 0, "no pane");
+        assert_eq!(app.layout.blame_divider.width, 0, "and no second seam");
+        assert_eq!(
+            app.layout.diff.width,
+            with + app.blame_w,
+            "every column the pane had goes back to the diff"
+        );
+    }
+
+    /// A run of rows sharing one commit names it once. Repeating a name
+    /// down a block says nothing and hides where the block ends.
+    #[test]
+    fn a_run_of_one_commit_is_named_once() {
+        let mut app = wide_app();
+        app.view = ViewMode::Inline;
+        app.collapse_unchanged = false;
+        app.diff = Some(FileDiff::compute(Some("a\nb\nc\n"), Some("a\nb\nc\n")));
+        app.rebuild_display();
+        app.blame_on = true;
+        app.blame_new = Some(fake_blame(&[
+            ("Ann", "aaa", 1),
+            ("Ann", "aaa", 1),
+            ("Bob", "bbb", 1),
+        ]));
+        let buf = render(&mut app);
+        let bl = app.layout.blame;
+        let names = (bl.y..bl.y + 3)
+            .map(|y| {
+                (bl.x..bl.x + bl.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(names[0].contains("Ann"));
+        assert!(!names[1].contains("Ann"), "the run is named once");
+        assert!(names[2].contains("Bob"), "a new commit is named again");
+        // The heat bar keeps drawing, so the ramp stays continuous.
+        assert!(names
+            .iter()
+            .all(|r| r.starts_with('█') || r.starts_with('▓')));
+    }
+
+    /// `layout.diff` is the rect *inside* the pane's borders, so the
+    /// floor the layout enforces shows up two columns narrower here.
+    fn diff_pane_w(app: &App) -> u16 {
+        app.layout.diff.width + 2
+    }
+
+    /// Whatever either divider is dragged to, three panes may never take
+    /// the diff below the width it needs to be readable.
+    #[test]
+    fn three_panes_never_starve_the_diff() {
+        for width in [80u16, 100, 140] {
+            let mut app = blame_app();
+            let backend = TestBackend::new(width, 20);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            // Both dividers dragged as far right as they go.
+            app.file_panel_w = app.clamp_panel_w(u16::MAX);
+            app.blame_w = app.clamp_blame_w(u16::MAX);
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            assert!(
+                diff_pane_w(&app) >= crate::app::DIFF_MIN_W,
+                "at {width} columns the diff pane kept {}",
+                diff_pane_w(&app)
+            );
+            // …and as far left.
+            app.file_panel_w = app.clamp_panel_w(0);
+            app.blame_w = app.clamp_blame_w(0);
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            assert!(diff_pane_w(&app) >= crate::app::DIFF_MIN_W);
+            assert!(app.file_panel_w >= crate::app::FILE_PANEL_MIN);
+            assert!(app.blame_w >= crate::app::BLAME_MIN);
+            assert!(app.layout.blame.width > 0, "all three still fit");
+        }
+    }
+
+    /// A terminal too narrow for three panes shows two, rather than a
+    /// diff too thin to read.
+    #[test]
+    fn a_narrow_terminal_drops_the_blame_pane_instead_of_the_diff() {
+        let mut app = blame_app();
+        let backend = TestBackend::new(50, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.layout.blame.width, 0, "the pane stands down");
+        assert!(app.blame_on, "but the switch stays where the reader put it");
+        assert!(diff_pane_w(&app) >= crate::app::DIFF_MIN_W);
+    }
+
+    /// A truncated pull request number is a link to the wrong pull
+    /// request, which is worse than no link at all.
+    #[test]
+    fn a_pull_request_number_is_never_truncated() {
+        assert_eq!(pr_label(7), "#7");
+        assert_eq!(pr_label(14260), "#14260");
+        assert_eq!(pr_label(999999), "#999999");
+        assert_eq!(pr_label(999999).chars().count(), PR_W);
+        assert_eq!(pr_label(1000000), "#…", "too wide to state honestly");
+    }
+
+    /// The pane shows real numbers in full at its default width.
+    #[test]
+    fn the_pane_shows_a_five_digit_number_in_full() {
+        let mut app = blame_app();
+        app.blame_prs.insert(
+            app.blame_new.as_ref().unwrap().at(1).unwrap().sha.clone(),
+            crate::github::PrRef {
+                number: 14260,
+                title: "Support the thing".into(),
+                url: "https://github.com/cli/cli/pull/14260".into(),
+            },
+        );
+        let buf = render(&mut app);
+        let bl = app.layout.blame;
+        let row: String = (bl.x..bl.x + bl.width)
+            .map(|x| buf[(x, bl.y)].symbol())
+            .collect();
+        assert!(row.contains("#14260"), "{row:?}");
     }
 }

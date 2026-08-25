@@ -1,4 +1,5 @@
 mod app;
+mod blame;
 mod clipboard;
 mod config;
 mod diff;
@@ -68,7 +69,12 @@ are optional:
                            # (drag the divider, or < / >, to change it)
   auto_refresh = true      # re-scan local changes while you sit idle, so
                            # an agent's edits appear on their own; a pull
-                           # request still refreshes on demand (r or ⟳)";
+                           # request still refreshes on demand (r or ⟳)
+  blame = false            # show the blame pane between the file panel
+                           # and the diff from the start (B toggles it)
+  blame_width = 30         # its starting width in columns
+  blame_pr_lookup = true   # ask GitHub which pull request a blamed commit
+                           # belongs to, when its subject does not say";
 
 enum CliCmd {
     /// Start the TUI. `mode`/`theme` override the configured defaults for
@@ -247,6 +253,13 @@ struct Startup {
     format_on_save: bool,
     /// `auto_refresh` — re-scan local changes while the reader is idle.
     auto_refresh: bool,
+    /// `blame` — show the blame pane from the start.
+    blame: bool,
+    /// `blame_width` — its starting width in columns.
+    blame_width: Option<u16>,
+    /// `blame_pr_lookup` — ask GitHub which pull request a blamed commit
+    /// belongs to when its subject does not say.
+    blame_pr_lookup: bool,
     wizard: bool,
     /// Forced by `--light`/`--dark` or the `appearance` config key; `None`
     /// means "ask the terminal".
@@ -400,6 +413,9 @@ fn main() -> Result<()> {
         language_servers: cfg.language_servers.unwrap_or(true),
         format_on_save: cfg.format_on_save.unwrap_or(false),
         auto_refresh: cfg.auto_refresh.unwrap_or(true),
+        blame: cfg.blame.unwrap_or(false),
+        blame_width: cfg.blame_width,
+        blame_pr_lookup: cfg.blame_pr_lookup.unwrap_or(true),
         // First launch (no global config yet) — or an explicit `loupe setup`
         // — runs the wizard before anything else.
         wizard: force_setup || !config::global_path().is_some_and(|p| p.is_file()),
@@ -436,15 +452,7 @@ fn run_tui(startup: Startup) -> Result<()> {
                 wizard::WizardEnd::Done | wizard::WizardEnd::Skipped => {}
             }
         }
-        run(
-            &mut terminal,
-            startup.mode,
-            startup.org,
-            startup.file_panel_width,
-            startup.language_servers,
-            startup.format_on_save,
-            startup.auto_refresh,
-        )
+        run(&mut terminal, startup)
     })();
 
     let _ = execute!(stdout(), DisableMouseCapture);
@@ -452,22 +460,19 @@ fn run_tui(startup: Startup) -> Result<()> {
     result
 }
 
-fn run(
-    terminal: &mut ratatui::DefaultTerminal,
-    mode: LaunchMode,
-    org: Option<String>,
-    file_panel_width: Option<u16>,
-    language_servers: bool,
-    format_on_save: bool,
-    auto_refresh: bool,
-) -> Result<()> {
-    let mut app = App::new(mode, org);
-    app.lsp_enabled = language_servers;
-    app.format_on_save = format_on_save;
-    app.auto_refresh = auto_refresh;
-    if let Some(w) = file_panel_width {
+fn run(terminal: &mut ratatui::DefaultTerminal, startup: Startup) -> Result<()> {
+    let mut app = App::new(startup.mode, startup.org);
+    app.lsp_enabled = startup.language_servers;
+    app.format_on_save = startup.format_on_save;
+    app.auto_refresh = startup.auto_refresh;
+    app.blame_on = startup.blame;
+    app.blame_pr_lookup = startup.blame_pr_lookup;
+    if let Some(w) = startup.file_panel_width {
         // The real clamp happens at draw time, once the area is known.
         app.file_panel_w = w.max(app::FILE_PANEL_MIN);
+    }
+    if let Some(w) = startup.blame_width {
+        app.blame_w = w.max(app::BLAME_MIN);
     }
     app.start();
     let mut dirty = true;
@@ -555,6 +560,9 @@ mod tests {
             language_servers: true,
             format_on_save: false,
             auto_refresh: true,
+            blame: false,
+            blame_width: None,
+            blame_pr_lookup: true,
             wizard: false,
             appearance: None,
             dark_theme: by(dark),

@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A blame pane between the file panel and the diff** (`B`, or
+  `☰ → View → Blame column`). Every visible diff row gets a blame row
+  beside it: who last touched the line, how long ago, and the pull
+  request the commit landed in.
+
+  - **An age heat map.** One hue — the palette's own neutral grey, with
+    lightness doing the work — on an absolute scale: under a day, a week,
+    a month, three months, a year, older. A shade means the same age in
+    every file, so it is learned once. Keeping the ramp colorless leaves
+    the two classes above it as the only *colored* things in the column,
+    and those are the whole point: lines your working tree owns, and
+    lines a commit in the change under review moved. That is what answers *"is this related to what I am doing
+    now?"* before you read a word. Your own commits are drawn apart from
+    everyone else's, so "mine" and "recent" stay two signals.
+  - **A link to the pull request.** The number comes from the commit
+    subject where there is one — a squash or merge commit names its own —
+    and from one batched GitHub lookup for the rest, cached by commit for
+    the session. Click any blame row for the commit behind it: hash,
+    date, author, subject, pull request title, and whether it is part of
+    the change on screen. `o` opens the pull request in your browser, `y`
+    copies its link, `c` copies the hash. Local review works too — the
+    repository comes from the `origin` remote, offline.
+  - **Everywhere the diff is.** Pull request review and local review;
+    split and inline layouts (a removed line is blamed on the old side,
+    the only side that can say what you are deleting); and beside the
+    editor, where a dirty buffer dims the column and says `stale` until
+    you save. Drag the second divider to resize it, double-click for 30
+    columns. A terminal too narrow for three panes shows two.
+  - **No slower to open a file.** Blame runs on its own background job
+    after the diff is on screen, not as part of the load.
+
+  Off by default. `blame = true` in your config makes it the default;
+  `blame_width` and `blame_pr_lookup` tune it.
+
 - **Right-click the `PR #123` badge to copy the link to the pull
   request**: the top-left badge is now a click target. The link goes to
   the clipboard through the same route as every other copy (`pbcopy` /

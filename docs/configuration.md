@@ -233,6 +233,34 @@ that moves a few times a day. `r` (or the `⟳` button) fetches it, and
 Set `false` to turn the idle re-scan off for good, or flip it for one
 session from `☰ → Refresh while idle`.
 
+### `blame` / `blame_width` / `blame_pr_lookup` — the blame pane
+
+```toml
+blame = false           # the default
+blame_width = 30
+blame_pr_lookup = true  # the default
+```
+
+`blame` opens the pane between the file panel and the diff from the
+start. It is off by default: it costs a `git blame` per file and about 30
+columns of width, and not every review wants it. `B` (or
+`☰ → Blame column`) turns it on for one session either way.
+
+`blame_width` is its starting width in columns. Drag the second divider
+to change it while running, or double-click that divider for 30. Below
+about 22 columns the pull request number drops out, then the age. A
+terminal too narrow for three panes shows two — the diff keeps its width.
+
+`blame_pr_lookup` decides whether Loupe asks GitHub which pull request a
+blamed commit belongs to. A squash or merge commit names its own number
+in its subject, which Loupe reads for free and offline; a rebase merge
+does not, and those are what the lookup is for — one batched `gh` call
+per file, cached by commit for the session. Set `false` to stay entirely
+offline and rely on the subject alone.
+
+See [The blame pane](keys-and-mouse.md#the-blame-pane) for what the
+colors mean and what a click on a row offers.
+
 ## Command line
 
 ```

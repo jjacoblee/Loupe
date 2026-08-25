@@ -54,6 +54,19 @@ pub struct Config {
     /// with the editor or an overlay open, and never for a pull request —
     /// that side is refreshed on demand with `r` or the ⟳ button.
     pub auto_refresh: Option<bool>,
+    /// Show the blame pane between the file panel and the diff from the
+    /// start. Default false: it costs a `git blame` per file and about
+    /// 30 columns of width, and not every review wants it. `B` (or the
+    /// ☰ menu) turns it on for one session either way.
+    pub blame: Option<bool>,
+    /// Starting width of the blame pane, in columns. Clamped to what the
+    /// terminal can give; the second divider can still be dragged.
+    pub blame_width: Option<u16>,
+    /// Ask GitHub which pull request a blamed commit belongs to, for the
+    /// commits whose subject does not already say. Default true. One
+    /// batched `gh` call per file, cached for the session; set false to
+    /// stay entirely offline and rely on the subject alone.
+    pub blame_pr_lookup: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -117,6 +130,9 @@ impl Config {
             language_servers: over.language_servers.or(self.language_servers),
             format_on_save: over.format_on_save.or(self.format_on_save),
             auto_refresh: over.auto_refresh.or(self.auto_refresh),
+            blame: over.blame.or(self.blame),
+            blame_width: over.blame_width.or(self.blame_width),
+            blame_pr_lookup: over.blame_pr_lookup.or(self.blame_pr_lookup),
         }
     }
 }
@@ -230,6 +246,9 @@ mod tests {
             "language_servers = false\n",
             "format_on_save = true\n",
             "auto_refresh = false\n",
+            "blame = true\n",
+            "blame_width = 26\n",
+            "blame_pr_lookup = false\n",
         ))
         .unwrap();
         assert_eq!(
@@ -244,6 +263,9 @@ mod tests {
                 language_servers: Some(false),
                 format_on_save: Some(true),
                 auto_refresh: Some(false),
+                blame: Some(true),
+                blame_width: Some(26),
+                blame_pr_lookup: Some(false),
             }
         );
     }

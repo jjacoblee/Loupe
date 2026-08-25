@@ -458,6 +458,13 @@ impl Editor {
         self.textarea.move_cursor(CursorMove::Jump(row, 0));
     }
 
+    /// The first buffer row on screen. The blame pane beside the editor
+    /// scrolls with this, and only this — a buffer has no folds, so one
+    /// file line is one row there.
+    pub fn scroll_top(&self) -> usize {
+        self.top.0 as usize
+    }
+
     /// Width of the line-number gutter, matching tui-textarea's rendering.
     fn lnum_width(&self) -> u16 {
         num_digits(self.textarea.lines().len()) + 2

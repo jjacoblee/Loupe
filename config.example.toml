@@ -60,3 +60,23 @@
 # open, and never touches GitHub — a pull request refreshes on demand with
 # `r` or the ⟳ button. Toggle it for one session from the ☰ menu.
 #auto_refresh = true
+
+# The blame pane, between the file panel and the diff: who last touched
+# each line, how long ago, and the pull request it landed in. Off by
+# default — it costs a `git blame` per file and about 30 columns of
+# width. Press B (or use the ☰ menu) to turn it on for one session.
+# Uncommitted lines and lines from the change under review get their own
+# colors, so "is this related to what I am doing now?" is answered before
+# you read a word.
+#blame = false
+
+# Its starting width in columns. Drag the second divider to change it
+# while running; double-click that divider to come back to 30. Below
+# about 22 columns the pull request number drops out, then the age.
+#blame_width = 30
+
+# Ask GitHub which pull request a blamed commit belongs to, for the
+# commits whose subject does not already say (a squash or merge commit
+# names it, a rebase merge does not). One batched `gh` call per file,
+# cached for the session. Set false to stay entirely offline.
+#blame_pr_lookup = true

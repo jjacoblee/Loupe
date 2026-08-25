@@ -17,6 +17,7 @@ for the built-in help overlay.
 | `m` or `☰` | Open the menu (see [The top bar and the ☰ menu](#the-top-bar-and-the--menu)) |
 | `b` | Open the PR list (from an auto-opened PR) |
 | `l` | Switch to local-changes review (from the PR list) |
+| `B` or `☰ → Blame column` | Show / hide the blame pane (see [The blame pane](#the-blame-pane)) |
 | `t` or `☰ → Theme` | Open the theme picker — live preview; Enter keeps & saves, Esc reverts; `a` switches light ⇄ dark |
 | `c` | Cancel a cancellable background load |
 
@@ -140,6 +141,7 @@ cursor.
 | Click `↺` in the change bar | Put that section of the diff back (asks first) |
 | `u` / `U` | Revert the change at the cursor / every change in the file |
 | `y`, `Ctrl+C`, or `⧉ Copy` | Copy the selected lines — or the cursor line — to the clipboard |
+| `B` | Show / hide the blame pane |
 
 ### Putting changes back
 
@@ -214,6 +216,95 @@ status line repeats the path that went to the clipboard.
 The menu works while the editor is open, because copying a path does not
 change which file is on screen. Right-clicking the *diff* still clears
 the selection.
+
+## The blame pane
+
+`B` (or `☰ → View → Blame column`) opens a third pane between the file
+panel and the diff. It answers the question the diff cannot: is the code
+around this change old and settled, or did it move recently — and was
+that you?
+
+```
+┌ Files ────────┐┌ Blame ───────────────────────┐┌ registry.go ─────────
+│▾ internal     ││░ tommaso-moro     4mo #13165 ││  32     DefaultAgentID
+│ [ ] M reg.go  ││█ tommaso-moro     26m #14260 ││  34     claudeConfigDi
+│ [ ] M reg_t.go││█                             ││
+```
+
+Each row carries four things about the line beside it:
+
+| Column | What it says |
+| --- | --- |
+| The bar | How old the line is, on a heat ramp |
+| The name | Who last touched it — **your own commits are drawn apart** |
+| The age | `2h`, `3d`, `5mo`, `2y` |
+| `#412` | The pull request the commit landed in |
+
+A run of lines from one commit names it once, at the top of the run, so a
+block of one change reads as one block. The bar keeps drawing on every
+row, so the ramp stays continuous. A fold banner draws a rule instead:
+it covers lines from many commits, and blaming one of them would be a
+guess.
+
+### The colors
+
+The heat ramp is **one hue** — the same neutral grey the borders and line
+numbers use, with lightness doing all the work. That is deliberate: it
+leaves the two classes above it as the only *colored* things in the
+column, so the question the pane exists to answer catches your eye before
+anything else does.
+
+It is also **absolute**, not relative to the file, so a shade means the
+same age everywhere and you learn the scale once. The two classes above
+the ramp mean something different from "recent":
+
+| Color | Meaning |
+| --- | --- |
+| Uncommitted (green) | `git blame` claims nothing — your working tree, right now |
+| In this change (blue) | The commit belongs to the change you are reviewing |
+| The ramp (grey) | Committed history: under a day, a week, a month, three months, a year, older |
+
+"In this change" is the commits a pull request adds (`base..head`). In
+local review there is no pull request to bound it, so it is the commits
+you have made and not pushed — the same question in the local shape.
+
+### The commit behind a row
+
+**Click a blame row** (either button) for the rest of the story: the
+commit hash, the exact date, the author and their email, the subject, the
+pull request title, and whether the commit is part of the change on
+screen. Three keys act on it:
+
+| Key | Action |
+| --- | --- |
+| `o` | Open the pull request in your browser |
+| `y` | Copy the pull request link |
+| `c` | Copy the commit hash |
+
+The pull request comes from the commit subject where there is one — a
+squash or merge commit names it — and from one batched GitHub lookup for
+the rest, cached for the session. `blame_pr_lookup = false` in your
+config skips the lookup and stays entirely offline.
+
+### Where the pane works
+
+- **Both review modes.** A pull request blames the head commit (or your
+  working tree when the branch is checked out); local review blames the
+  working tree, which is what marks your uncommitted lines.
+- **Both diff layouts.** An inline row is blamed on the side it shows.
+  A split row prefers the new side and falls back to the old one for a
+  removed line — the only side that can say what you are deleting.
+- **The editor.** The pane follows the buffer. Typing moves the text out
+  from under the blame, so a dirty buffer draws the column dimmed with
+  `stale` in its title; saving refreshes it.
+- **Resizing.** Drag the second divider, or double-click it for 30
+  columns. Below about 22 columns the pull request number drops out, then
+  the age. A terminal too narrow for three panes shows two — the diff
+  keeps its width.
+
+Blame is read on its own background job, *after* the diff is on screen,
+so opening a file is no slower than it was. The pane says `loading…`
+while it waits.
 
 ## Find
 

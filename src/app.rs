@@ -7,10 +7,11 @@
 //! cancellable) and `q` to quit. Viewed-state syncs to GitHub run as
 //! fire-and-forget background jobs with optimistic local state.
 
+use crate::blame::{self, Blame};
 use crate::clipboard;
 use crate::diff::{DisplayEntry, FileDiff, Pos, RowKind, Selection, Side};
 use crate::editor::Editor;
-use crate::github::{self, ChangedFile, CommentSide, PrDetail, PrSummary};
+use crate::github::{self, ChangedFile, CommentSide, PrDetail, PrRef, PrSummary};
 use crate::gitops::{self, StageState};
 use crate::highlight::{self, HlLine};
 use crate::lsp::{self, Lsp};
@@ -22,6 +23,7 @@ use ratatui::layout::Rect;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tui_textarea::TextArea;
@@ -72,6 +74,9 @@ pub enum Overlay {
     Revert(Box<RevertPrompt>),
     /// The right-click menu on a file-panel row.
     PathMenu(Box<PathMenu>),
+    /// The commit behind one blame row: who, when, and the pull request
+    /// it landed in.
+    BlameMenu(Box<BlameMenu>),
     /// The ☰ menu in the top bar — everything the toolbar no longer has
     /// room to show.
     Menu(Box<Menu>),
@@ -170,6 +175,55 @@ pub struct PathMenu {
     pub sel: usize,
     /// The cell that was clicked. The menu is drawn next to it.
     pub anchor: (u16, u16),
+}
+
+/// One line of the blame popup: what it does, and the key that does it
+/// without selecting the line first.
+pub struct BlameMenuItem {
+    pub key: char,
+    pub label: String,
+    pub action: BlameAction,
+}
+
+/// What a line of the blame popup does when it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlameAction {
+    /// Open the pull request in the reader's browser.
+    OpenPr(u64),
+    /// Put text on the clipboard — a pull request link, a commit hash.
+    Copy(String),
+}
+
+/// The popup behind one blame row: the commit that last touched the line,
+/// and the ways to follow it somewhere.
+///
+/// This is the half of the pane that answers "is this related to what I
+/// am doing?" — the pane itself only has room for a name, an age and a
+/// number, and the rest of the story is here.
+pub struct BlameMenu {
+    pub commit: Arc<blame::Commit>,
+    /// The pull request the commit landed in, once it is known.
+    pub pr: Option<PrRef>,
+    /// Whether this commit belongs to the change under review.
+    pub in_change: bool,
+    /// Whether the author is the reader.
+    pub mine: bool,
+    pub items: Vec<BlameMenuItem>,
+    pub sel: usize,
+    /// The cell that was clicked. The popup is drawn next to it.
+    pub anchor: (u16, u16),
+}
+
+/// Which divider is under the pointer during a drag. The two are never
+/// dragged at once, and naming the one in flight keeps the resize
+/// arithmetic from being applied to the wrong panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dragging {
+    None,
+    /// The seam between the file panel and whatever is to its right.
+    FilePanel,
+    /// The seam between the blame pane and the diff.
+    BlamePane,
 }
 
 /// What a revert is about to undo.
@@ -715,6 +769,10 @@ pub enum ButtonId {
     RevertCancel,
     /// A line of the file-panel right-click menu.
     PathMenuRow(usize),
+    /// A line of the blame popup.
+    BlameMenuRow(usize),
+    /// One row that shows or hides the blame pane.
+    BlameToggle,
 
     // --- the ☰ menu and the lines only it offers
     /// ☰ in the top bar.
@@ -754,6 +812,11 @@ pub struct HitAreas {
     pub review: Rect,
     /// The two border columns between the panels — drag to resize.
     pub divider: Rect,
+    /// The blame pane, when it is showing. Zero-sized when it is not.
+    pub blame: Rect,
+    /// The seam between the blame pane and the diff — the second drag
+    /// handle, and zero-sized for the same reason.
+    pub blame_divider: Rect,
 }
 
 impl HitAreas {
@@ -779,6 +842,11 @@ pub const FILE_PANEL_DEFAULT: u16 = 34;
 pub const FILE_PANEL_MIN: u16 = 16;
 /// Columns the diff pane must keep, whatever the file panel is dragged to.
 pub const DIFF_MIN_W: u16 = 24;
+/// Default width of the blame pane, and the floor a resize is clamped to.
+/// The floor still fits the heat bar and a short name; the age and the
+/// pull request number drop out above it (see `ui::draw_blame`).
+pub const BLAME_DEFAULT: u16 = 30;
+pub const BLAME_MIN: u16 = 12;
 /// Width of the change bar down the left of the diff — the ↺ marker on each
 /// changed section, and the click target that reverts it. Only reserved
 /// when reverting is possible at all (see [`App::revert_gutter`]), so a
@@ -917,6 +985,9 @@ enum BgKind {
     /// A plain re-read of the index after something changed the working
     /// tree under it. Nothing to roll back if it fails.
     Rescan,
+    /// `gh pr view --web` from the blame popup. Nothing to roll back —
+    /// it either opened a browser or it says why it could not.
+    OpenPr { number: u64 },
 }
 
 /// Everything that belongs to one side of the PR ⇄ local toggle. Swapping
@@ -1231,8 +1302,8 @@ pub struct App {
     /// Width of the file panel in columns; dragged by the divider, seeded
     /// from the `file_panel_width` config key.
     pub file_panel_w: u16,
-    /// True while the divider is being dragged.
-    resizing: bool,
+    /// Which divider is being dragged, if any.
+    dragging: Dragging,
 
     pub diff: Option<FileDiff>,
     /// Visible diff lines for the current view/fold state.
@@ -1322,7 +1393,93 @@ pub struct App {
     post_load_err: Option<String>,
     /// One-shot note prepended to the next file-loaded status message.
     auto_open_note: Option<String>,
+
+    // --- the blame pane (see [`crate::blame`])
+    /// Show the blame pane between the file panel and the diff. `blame`
+    /// in the config seeds it; `B` and the ☰ menu flip it.
+    pub blame_on: bool,
+    /// Its width in columns, dragged by the second divider and seeded
+    /// from the `blame_width` config key.
+    pub blame_w: u16,
+    /// Blame of the new side of the open file, and of the old side. Both
+    /// are None until the job lands, and for a file with no history.
+    pub blame_new: Option<Blame>,
+    pub blame_old: Option<Blame>,
+    /// What `blame_new` is the blame *of* — the file in the changeset,
+    /// or the standalone file the editor has open. An answer for
+    /// anything else is dropped.
+    blame_path: Option<String>,
+    /// In-flight blame read (see [`BlameJob`]).
+    blame_job: Option<BlameJob>,
+    /// In-flight GitHub lookup of the pull requests behind the commits
+    /// whose subject did not name one. Kept in its own slot so opening
+    /// another file cannot drop an answer that is already paid for.
+    blame_pr_job: Option<Receiver<Result<HashMap<String, PrRef>>>>,
+    /// Bumped whenever the pane's subject changes; an answer with a stale
+    /// generation is dropped rather than drawn over the wrong file.
+    blame_gen: u64,
+    /// Commit hash → pull request, for the whole session. Filled from
+    /// commit subjects first and from GitHub second, so a second file
+    /// sharing the same history costs nothing.
+    pub blame_prs: HashMap<String, PrRef>,
+    /// Hashes already asked about, so a commit GitHub knows nothing about
+    /// is not asked about once per file for the rest of the session.
+    blame_asked: HashSet<String>,
+    /// Commits belonging to the change under review — the lines this pull
+    /// request (or this unpushed branch) moved.
+    pub blame_change_set: HashSet<String>,
+    /// `git config user.email`, lowercased, so the pane can tell the
+    /// reader's own commits apart. None when git has none set.
+    pub blame_me: Option<String>,
+    /// `owner/name` read from the origin remote. Local review never
+    /// resolves a repository — it has no reason to talk to GitHub — so
+    /// without this the pane could never link a commit to its pull
+    /// request in exactly the review that most wants the link.
+    blame_origin: Option<String>,
+    /// True once the change set and the email have been read for this
+    /// review; they are per-review, not per-file.
+    blame_ctx: bool,
+    /// True once a blame job has answered for the open file. A file with
+    /// no history answers with nothing, so "no blame" and "not asked
+    /// yet" have to be two different states or a silent refresh would
+    /// re-blame it every few seconds forever.
+    blame_done: bool,
+    /// `blame_pr_lookup` in the config: may loupe ask GitHub which pull
+    /// request a blamed commit belongs to.
+    pub blame_pr_lookup: bool,
+
     pub layout: HitAreas,
+}
+
+/// An in-flight blame read. Blame is deliberately *not* part of the file
+/// load: a `git blame` on a long file can take a second, and paying that
+/// on every file open would undo the load latency the diff pipeline is
+/// built around. So the pane fills in a moment after the diff does.
+struct BlameJob {
+    rx: Receiver<Box<BlameData>>,
+    gen: u64,
+}
+
+pub struct BlameData {
+    /// The file this is the blame of, checked against the open one before
+    /// it is applied.
+    path: String,
+    new: Option<Blame>,
+    old: Option<Blame>,
+    /// Read on the first blame of a review, and None on every one after
+    /// it — this describes the review, not the file.
+    ctx: Option<BlameCtx>,
+}
+
+/// What the pane needs to know once per review rather than once per file.
+pub struct BlameCtx {
+    /// Commits belonging to the change under review.
+    change_set: HashSet<String>,
+    /// `git config user.email`, lowercased.
+    me: Option<String>,
+    /// `owner/name` from the origin remote, for a pull request link when
+    /// the review itself did not resolve a repository.
+    origin: Option<String>,
 }
 
 impl App {
@@ -1351,7 +1508,7 @@ impl App {
             collapsed_dirs: HashSet::new(),
             entries: Vec::new(),
             file_panel_w: FILE_PANEL_DEFAULT,
-            resizing: false,
+            dragging: Dragging::None,
             diff: None,
             display: Vec::new(),
             collapse_unchanged: true,
@@ -1397,6 +1554,22 @@ impl App {
             pending_jump: None,
             post_load_err: None,
             auto_open_note: None,
+            blame_on: false,
+            blame_w: BLAME_DEFAULT,
+            blame_new: None,
+            blame_old: None,
+            blame_path: None,
+            blame_job: None,
+            blame_pr_job: None,
+            blame_gen: 0,
+            blame_prs: HashMap::new(),
+            blame_asked: HashSet::new(),
+            blame_change_set: HashSet::new(),
+            blame_me: None,
+            blame_origin: None,
+            blame_ctx: false,
+            blame_done: false,
+            blame_pr_lookup: true,
             layout: HitAreas::default(),
         }
     }
@@ -1417,10 +1590,16 @@ impl App {
         self.job.is_some()
     }
 
-    /// True while the panel divider is being dragged (the renderer accents
-    /// the seam).
+    /// True while either divider is being dragged (the idle re-scan and
+    /// the status bar only care that a drag is in flight).
     pub fn resizing(&self) -> bool {
-        self.resizing
+        self.dragging != Dragging::None
+    }
+
+    /// Which divider is being dragged — the renderer accents that seam
+    /// and leaves the other one alone.
+    pub fn dragging(&self) -> Dragging {
+        self.dragging
     }
 
     /// Spinner frame + label + cancellability for the status bar.
@@ -1596,9 +1775,18 @@ impl App {
                         // A failed re-read leaves the icons as they were:
                         // cosmetic, and not worth a scary message.
                         (Err(_), BgKind::Rescan) => {}
+                        (Err(e), BgKind::OpenPr { number }) => {
+                            self.err(format!("Couldn't open PR #{number}: {e:#}"));
+                            changed = true;
+                        }
                     }
                 }
             }
+        }
+
+        // The blame pane fills in after the diff it sits beside.
+        if self.poll_blame() {
+            changed = true;
         }
 
         // Keep the language server's copy of the buffer current, and pick
@@ -1754,7 +1942,7 @@ impl App {
         if self.editor.is_some() || !matches!(self.overlay, Overlay::None) {
             return false;
         }
-        if self.selection.is_some() || self.drag_select || self.resizing {
+        if self.selection.is_some() || self.drag_select || self.resizing() {
             return false;
         }
         self.last_input.elapsed() >= IDLE_BEFORE_RESCAN
@@ -1787,6 +1975,7 @@ impl App {
                 // Old side of every diff: HEAD (empty in a commitless repo —
                 // show_file then yields None and files render as added).
                 self.merge_base = d.head.unwrap_or_default();
+                self.reset_blame_review();
                 self.files = d.files;
                 self.viewed.clear();
                 self.stage = d.stage;
@@ -1848,6 +2037,7 @@ impl App {
                 }
                 self.checked_out = d.checked_out;
                 self.merge_base = d.merge_base;
+                self.reset_blame_review();
                 self.files = d.files;
                 self.viewed = d.viewed;
                 if d.auto {
@@ -1908,6 +2098,8 @@ impl App {
                 self.editor = None;
                 self.recompute_matches();
                 self.reveal_current_file();
+                // The blame of the file that just landed, on its own job.
+                self.spawn_blame(self.file_cursor);
                 // Start this language's server in the background, so the
                 // first gd / gr / K doesn't pay for the handshake.
                 if self.lsp_enabled {
@@ -1996,6 +2188,9 @@ impl App {
             editor.jump_to_line(line);
         }
         self.editor = Some(editor);
+        // The pane follows the editor: a file outside the changeset has
+        // no old side, so only the one blame is read.
+        self.spawn_blame_external(d.path.clone(), d.read_only);
         let where_ = match d.line {
             Some(line) => format!(" at line {line}"),
             None => String::new(),
@@ -2162,6 +2357,295 @@ impl App {
         self.spawn(format!("Loading {}", file.path), true, false, move || {
             load_file_data(idx, file, ctx).map(|d| Outcome::FileLoaded(Box::new(d)))
         });
+    }
+
+    // -------------------------------------------------------- blame pane
+
+    /// Start the blame of file `idx`, throwing away whatever the pane was
+    /// showing.
+    ///
+    /// Blame is its own job rather than part of `load_file_data` on
+    /// purpose: `git blame` on a long file costs about as much as the
+    /// whole rest of the load, and paying that on every file open would
+    /// undo the open latency the diff pipeline is built around. The pane
+    /// fills in a moment after the diff, and says so while it waits.
+    fn spawn_blame(&mut self, idx: usize) {
+        let Some(file) = self.files.get(idx).cloned() else {
+            self.clear_blame();
+            return;
+        };
+        // New side: the working tree when that is what is under review —
+        // which is what marks uncommitted lines as uncommitted — and the
+        // head commit otherwise, because the file on disk then belongs to
+        // some other branch.
+        let rev = if self.checked_out {
+            None
+        } else {
+            Some(
+                self.pr
+                    .as_ref()
+                    .map(|p| p.head_ref_oid.clone())
+                    .unwrap_or_default(),
+            )
+        };
+        let old_path = (file.status != "added" && !self.merge_base.is_empty())
+            .then(|| file.old_path().to_string());
+        let new_path = (file.status != "removed").then(|| file.path.clone());
+        self.start_blame(file.path, new_path, rev, old_path);
+    }
+
+    /// Blame a file the change never touches — one the editor opened from
+    /// a search result or a jump to a definition. There is no old side to
+    /// compare it against, so only one blame is read.
+    fn spawn_blame_external(&mut self, path: String, read_only: bool) {
+        // A read-only editor is showing the commit, not the working tree
+        // (the tree belongs to another branch), so blame the same place.
+        let rev = read_only.then(|| self.merge_base.clone());
+        self.start_blame(path.clone(), Some(path), rev, None);
+    }
+
+    /// Throw away what the pane is showing, with nothing on the way to
+    /// replace it.
+    fn clear_blame(&mut self) {
+        // Bumping the generation is what makes the answer already in
+        // flight land on the floor instead of on the wrong file.
+        self.blame_gen = self.blame_gen.wrapping_add(1);
+        self.blame_job = None;
+        self.blame_new = None;
+        self.blame_old = None;
+        self.blame_path = None;
+        self.blame_done = false;
+    }
+
+    /// The one worker behind every blame read. `new_path` and `old_path`
+    /// are None when that side does not exist — a file this change added
+    /// has no old side, one it removed has no new one.
+    fn start_blame(
+        &mut self,
+        subject: String,
+        new_path: Option<String>,
+        rev: Option<String>,
+        old_path: Option<String>,
+    ) {
+        self.clear_blame();
+        if !self.blame_on || self.screen != Screen::Review {
+            return;
+        }
+        self.blame_path = Some(subject.clone());
+        let gen = self.blame_gen;
+        let root = self.repo_root.clone();
+        let merge_base = self.merge_base.clone();
+        let head = self
+            .pr
+            .as_ref()
+            .map(|p| p.head_ref_oid.clone())
+            .unwrap_or_default();
+        let local = self.local;
+        // The change set and the reader's email describe the review, not
+        // the file, so they are read once and carried on the first answer.
+        let want_ctx = !self.blame_ctx;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            // The two sides are independent `git blame` calls and each
+            // costs about as much as the other; run them together, the
+            // way the load job already runs the two highlights.
+            let (new, old) = thread::scope(|s| {
+                let old_side = s.spawn(|| {
+                    let path = old_path?;
+                    blame::blame_file(&root, Some(&merge_base), &path)
+                });
+                let new = new_path
+                    .as_deref()
+                    .and_then(|path| blame::blame_file(&root, rev.as_deref(), path));
+                (new, old_side.join().unwrap_or(None))
+            });
+            let ctx = want_ctx.then(|| BlameCtx {
+                change_set: blame::change_set(&root, &merge_base, &head, local),
+                me: blame::my_email(&root),
+                origin: gitops::origin_repo(),
+            });
+            let _ = tx.send(Box::new(BlameData {
+                path: subject,
+                new,
+                old,
+                ctx,
+            }));
+        });
+        self.blame_job = Some(BlameJob { rx, gen });
+    }
+
+    /// Apply a finished blame read, and a finished pull request lookup.
+    /// Returns true when the pane changed and a redraw is needed.
+    fn poll_blame(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(job) = &self.blame_job {
+            match job.rx.try_recv() {
+                Ok(data) => {
+                    let stale = job.gen != self.blame_gen;
+                    self.blame_job = None;
+                    if !stale {
+                        changed |= self.apply_blame(*data);
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.blame_job = None,
+            }
+        }
+        if let Some(rx) = &self.blame_pr_job {
+            match rx.try_recv() {
+                Ok(res) => {
+                    self.blame_pr_job = None;
+                    // A failed lookup is not worth a message: the pane
+                    // still shows the author, the age and any number the
+                    // commit subject named.
+                    if let Ok(map) = res {
+                        changed |= !map.is_empty();
+                        self.blame_prs.extend(map);
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.blame_pr_job = None,
+            }
+        }
+        changed
+    }
+
+    fn apply_blame(&mut self, data: BlameData) -> bool {
+        // The generation guard already covers a file switch; this catches
+        // the case where the same generation names a different file
+        // because the changed-file list moved under a refresh.
+        if self.blame_path.as_deref() != Some(data.path.as_str()) {
+            return false;
+        }
+        if let Some(ctx) = data.ctx {
+            self.blame_change_set = ctx.change_set;
+            self.blame_me = ctx.me;
+            self.blame_origin = ctx.origin;
+            self.blame_ctx = true;
+        }
+        self.blame_new = data.new;
+        self.blame_old = data.old;
+        self.blame_done = true;
+        self.seed_blame_prs();
+        self.spawn_blame_pulls();
+        true
+    }
+
+    /// Every distinct commit the open file is blamed on, both sides.
+    fn blame_commits(&self) -> Vec<Arc<blame::Commit>> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for side in [self.blame_new.as_ref(), self.blame_old.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            for c in side.commits() {
+                if seen.insert(c.sha.clone()) {
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    /// Fill the session's hash → pull request map from what the commit
+    /// subjects already say. Free, offline, and right for a squash or a
+    /// merge commit, which is most of a GitHub repository's history.
+    fn seed_blame_prs(&mut self) {
+        let found: Vec<(String, u64, String)> = self
+            .blame_commits()
+            .iter()
+            .filter(|c| !self.blame_prs.contains_key(&c.sha))
+            .filter_map(|c| c.pr.map(|n| (c.sha.clone(), n, c.summary.clone())))
+            .collect();
+        for (sha, number, title) in found {
+            let url = self.pr_link(number);
+            self.blame_prs.insert(sha, PrRef { number, title, url });
+        }
+    }
+
+    /// Ask GitHub about the commits whose subject named no pull request.
+    ///
+    /// One batched GraphQL call, and only for hashes never asked about
+    /// before — a commit GitHub says nothing about must not be asked
+    /// again once per file for the rest of the session. A lookup already
+    /// in flight is left to finish; the next file open picks up the rest.
+    fn spawn_blame_pulls(&mut self) {
+        if !self.blame_pr_lookup || self.blame_pr_job.is_some() {
+            return;
+        }
+        let Some(repo) = self.blame_repo() else {
+            return;
+        };
+        let shas: Vec<String> = self
+            .blame_commits()
+            .iter()
+            .filter(|c| {
+                !c.uncommitted()
+                    && !self.blame_prs.contains_key(&c.sha)
+                    && !self.blame_asked.contains(&c.sha)
+            })
+            .map(|c| c.sha.clone())
+            .collect();
+        if shas.is_empty() {
+            return;
+        }
+        self.blame_asked.extend(shas.iter().cloned());
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(github::pulls_for_commits(&repo, &shas));
+        });
+        self.blame_pr_job = Some(rx);
+    }
+
+    /// A web link for pull request `n` in the repository under review.
+    ///
+    /// The open pull request's own url is the template when there is one,
+    /// so a GitHub Enterprise host stays right; github.com is the
+    /// fallback, the same one [`App::pr_url`] already falls back to.
+    fn pr_link(&self, n: u64) -> String {
+        let from_pr = self
+            .pr
+            .as_ref()
+            .map(|p| p.url.as_str())
+            .filter(|u| !u.is_empty())
+            .and_then(|url| {
+                url.rfind("/pull/")
+                    .map(|cut| format!("{}/pull/{n}", &url[..cut]))
+            });
+        from_pr.unwrap_or_else(|| match self.blame_repo() {
+            Some(r) => format!("https://github.com/{r}/pull/{n}"),
+            None => String::new(),
+        })
+    }
+
+    /// Forget everything blame knows that belongs to *this review* rather
+    /// than to this file: the change set, the reader's email, and the
+    /// lines on screen. Called whenever the review itself changes — a
+    /// different pull request, a swap to local changes, a refetch — so
+    /// the pane can never colour a commit "in this change" against the
+    /// wrong change.
+    fn reset_blame_review(&mut self) {
+        self.blame_change_set.clear();
+        self.blame_me = None;
+        self.blame_origin = None;
+        self.blame_ctx = false;
+        self.clear_blame();
+    }
+
+    /// Show or hide the pane. Turning it on blames the open file at once,
+    /// so the answer is on its way before the reader looks for it.
+    pub fn toggle_blame(&mut self) {
+        self.blame_on = !self.blame_on;
+        if self.blame_on {
+            self.blame_w = self.clamp_blame_w(self.blame_w);
+            self.file_panel_w = self.clamp_panel_w(self.file_panel_w);
+            self.spawn_blame(self.file_cursor);
+            self.ok("Blame on — click a row for the commit behind it. B hides it again.");
+        } else {
+            self.clear_blame();
+            self.ok("Blame off.");
+        }
     }
 
     fn spawn_post_comment(&mut self) {
@@ -2860,6 +3344,35 @@ impl App {
                 }
                 return;
             }
+            Overlay::BlameMenu(menu) => {
+                let last = menu.items.len().saturating_sub(1);
+                let mut close = false;
+                let hit = match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        menu.sel = menu.sel.saturating_sub(1);
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        menu.sel = (menu.sel + 1).min(last);
+                        None
+                    }
+                    KeyCode::Enter => Some(menu.sel),
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        close = true;
+                        None
+                    }
+                    // Each line has its own letter, so following a commit
+                    // is one key press rather than move-then-confirm.
+                    KeyCode::Char(c) => menu.items.iter().position(|it| it.key == c),
+                    _ => None,
+                };
+                if close {
+                    self.overlay = Overlay::None;
+                } else if let Some(i) = hit {
+                    self.blame_menu_run(i);
+                }
+                return;
+            }
             Overlay::Menu(menu) => {
                 let mut close = false;
                 let hit = match key.code {
@@ -3227,6 +3740,7 @@ impl App {
                     KeyCode::Esc | KeyCode::Char('b') => self.back_to_pr_list(),
                     KeyCode::Char('v') => self.toggle_view(),
                     KeyCode::Char('z') => self.toggle_fold(),
+                    KeyCode::Char('B') => self.toggle_blame(),
                     KeyCode::Char('x') => self.toggle_file_mark(self.file_cursor),
                     // Put changes back: the section at the cursor, or (with
                     // shift) the whole file. Both ask first.
@@ -3365,6 +3879,15 @@ impl App {
                 if matches!(m.kind, MouseEventKind::Down(_)) {
                     match self.layout.button_at(x, y) {
                         Some(ButtonId::PathMenuRow(i)) => self.path_menu_copy(i),
+                        _ => self.overlay = Overlay::None,
+                    }
+                }
+                return;
+            }
+            Overlay::BlameMenu(_) => {
+                if matches!(m.kind, MouseEventKind::Down(_)) {
+                    match self.layout.button_at(x, y) {
+                        Some(ButtonId::BlameMenuRow(i)) => self.blame_menu_run(i),
                         _ => self.overlay = Overlay::None,
                     }
                 }
@@ -3517,6 +4040,10 @@ impl App {
                     self.file_list_click(x, y);
                     return;
                 }
+                if contains(self.layout.blame, x, y) {
+                    self.open_blame_menu(x, y);
+                    return;
+                }
                 let dr = self.layout.diff;
                 if contains(dr, x, y) {
                     self.diff_click(x, y);
@@ -3537,6 +4064,8 @@ impl App {
                     self.copy_pr_link();
                 } else if contains(self.layout.file_list, x, y) {
                     self.open_path_menu(x, y);
+                } else if contains(self.layout.blame, x, y) {
+                    self.open_blame_menu(x, y);
                 } else {
                     self.clear_selection();
                 }
@@ -3651,36 +4180,94 @@ impl App {
         }
     }
 
+    /// Both panel dividers. They behave identically — press to start a
+    /// drag, double-click to reset — so one handler drives both and
+    /// [`Dragging`] names which one is in flight.
     fn divider_mouse(&mut self, m: MouseEvent, x: u16, y: u16) -> bool {
+        let which = if contains(self.layout.divider, x, y) {
+            Dragging::FilePanel
+        } else if contains(self.layout.blame_divider, x, y) {
+            Dragging::BlamePane
+        } else {
+            Dragging::None
+        };
         match m.kind {
-            MouseEventKind::Down(MouseButton::Left) if contains(self.layout.divider, x, y) => {
+            MouseEventKind::Down(MouseButton::Left) if which != Dragging::None => {
+                let name = self.panel_name(which);
                 // Double-click puts it back to the default width.
                 if self.double_click(x, y) {
-                    self.resizing = false;
-                    self.file_panel_w = self.clamp_panel_w(FILE_PANEL_DEFAULT);
-                    self.ok(format!(
-                        "File panel reset to {} columns.",
-                        self.file_panel_w
-                    ));
+                    self.dragging = Dragging::None;
+                    let w = self.reset_panel(which);
+                    self.ok(format!("{name} reset to {w} columns."));
                 } else {
-                    self.resizing = true;
-                    self.ok("Drag to resize the file panel — double-click the divider to reset.");
+                    self.dragging = which;
+                    self.ok(format!(
+                        "Drag to resize the {} — double-click the divider to reset.",
+                        name.to_lowercase()
+                    ));
                 }
                 true
             }
-            MouseEventKind::Drag(MouseButton::Left) if self.resizing => {
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging != Dragging::None => {
+                self.drag_panel_to(x);
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.dragging != Dragging::None => {
+                let which = self.dragging;
+                self.dragging = Dragging::None;
+                let (name, w) = (self.panel_name(which), self.panel_width(which));
+                self.ok(format!("{name} {w} columns."));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn panel_name(&self, which: Dragging) -> &'static str {
+        match which {
+            Dragging::BlamePane => "Blame pane",
+            _ => "File panel",
+        }
+    }
+
+    fn panel_width(&self, which: Dragging) -> u16 {
+        match which {
+            Dragging::BlamePane => self.blame_w,
+            _ => self.file_panel_w,
+        }
+    }
+
+    fn reset_panel(&mut self, which: Dragging) -> u16 {
+        match which {
+            Dragging::BlamePane => {
+                self.blame_w = self.clamp_blame_w(BLAME_DEFAULT);
+                self.blame_w
+            }
+            _ => {
+                self.file_panel_w = self.clamp_panel_w(FILE_PANEL_DEFAULT);
+                self.file_panel_w
+            }
+        }
+    }
+
+    /// Put the divider being dragged under column `x`. Each panel's width
+    /// is measured from the left edge of whatever sits before it, so the
+    /// seam lands where the pointer is rather than where the arithmetic
+    /// of a fixed layout would put it.
+    fn drag_panel_to(&mut self, x: u16) {
+        match self.dragging {
+            Dragging::FilePanel => {
                 let left = self.layout.review.x;
                 // The divider's left column is the panel's last column.
                 let w = x.saturating_sub(left).saturating_add(1);
                 self.file_panel_w = self.clamp_panel_w(w);
-                true
             }
-            MouseEventKind::Up(MouseButton::Left) if self.resizing => {
-                self.resizing = false;
-                self.ok(format!("File panel {} columns.", self.file_panel_w));
-                true
+            Dragging::BlamePane => {
+                let left = self.layout.review.x + self.file_panel_w;
+                let w = x.saturating_sub(left).saturating_add(1);
+                self.blame_w = self.clamp_blame_w(w);
             }
-            _ => false,
+            Dragging::None => {}
         }
     }
 
@@ -3772,6 +4359,145 @@ impl App {
             sel: 0,
             anchor: (x, y),
         }));
+    }
+
+    /// The commit the blame pane shows on display row `row`.
+    ///
+    /// Which side is blamed follows what the row shows. An inline row
+    /// names its own side. A split row prefers the new side and falls
+    /// back to the old one, which is the only side a purely removed row
+    /// has — and the side that answers "what am I deleting?".
+    pub fn blame_for_row(&self, row: usize) -> Option<Arc<blame::Commit>> {
+        let DisplayEntry::Line(i) = *self.display.get(row)? else {
+            return None;
+        };
+        let diff = self.diff.as_ref()?;
+        let (side, ln) = match self.view {
+            ViewMode::Inline => {
+                let entry = diff.inline.get(i)?;
+                let row = diff.rows.get(entry.row)?;
+                let ln = match entry.side {
+                    Side::Left => row.old_ln,
+                    Side::Right => row.new_ln,
+                };
+                (entry.side, ln)
+            }
+            ViewMode::SideBySide => {
+                let row = diff.rows.get(i)?;
+                match row.new_ln {
+                    Some(n) => (Side::Right, Some(n)),
+                    None => (Side::Left, row.old_ln),
+                }
+            }
+        };
+        let blame = match side {
+            Side::Right => self.blame_new.as_ref(),
+            Side::Left => self.blame_old.as_ref(),
+        }?;
+        blame.at(ln?).cloned()
+    }
+
+    /// The repository the pane links pull requests in: the one under
+    /// review when there is one, and the origin remote otherwise.
+    pub fn blame_repo(&self) -> Option<String> {
+        self.repo.clone().or_else(|| self.blame_origin.clone())
+    }
+
+    /// True while the blame pane is waiting for its job — the pane says
+    /// so rather than looking like a file with no history.
+    pub fn blame_loading(&self) -> bool {
+        self.blame_job.is_some()
+    }
+
+    /// True when `commit` was written by the reader.
+    pub fn blame_is_mine(&self, commit: &blame::Commit) -> bool {
+        self.blame_me
+            .as_deref()
+            .is_some_and(|me| me == commit.author_email.to_lowercase())
+    }
+
+    /// Open the popup for the blame row at screen position (x, y).
+    fn open_blame_menu(&mut self, x: u16, y: u16) {
+        let r = self.layout.blame;
+        let row = self.diff_scroll + y.saturating_sub(r.y) as usize;
+        let Some(commit) = self.blame_for_row(row) else {
+            self.err(if self.blame_job.is_some() {
+                "Blame is still loading."
+            } else {
+                "Nothing is blamed on that row."
+            });
+            return;
+        };
+        let pr = self.blame_prs.get(&commit.sha).cloned();
+        let mut items = Vec::new();
+        if let Some(pr) = &pr {
+            items.push(BlameMenuItem {
+                key: 'o',
+                label: format!("Open pull request #{} in the browser", pr.number),
+                action: BlameAction::OpenPr(pr.number),
+            });
+            if !pr.url.is_empty() {
+                items.push(BlameMenuItem {
+                    key: 'y',
+                    label: "Copy the pull request link".into(),
+                    action: BlameAction::Copy(pr.url.clone()),
+                });
+            }
+        }
+        // There is no hash to copy for a line that is not committed yet.
+        if !commit.uncommitted() {
+            items.push(BlameMenuItem {
+                key: 'c',
+                label: "Copy the commit hash".into(),
+                action: BlameAction::Copy(commit.sha.clone()),
+            });
+        }
+        let in_change = self.blame_change_set.contains(&commit.sha);
+        let mine = self.blame_is_mine(&commit);
+        self.overlay = Overlay::BlameMenu(Box::new(BlameMenu {
+            commit,
+            pr,
+            in_change,
+            mine,
+            items,
+            sel: 0,
+            anchor: (x, y),
+        }));
+    }
+
+    /// Run line `i` of the blame popup and close it.
+    fn blame_menu_run(&mut self, i: usize) {
+        let Overlay::BlameMenu(menu) = &self.overlay else {
+            return;
+        };
+        let Some(item) = menu.items.get(i) else {
+            return;
+        };
+        let action = item.action.clone();
+        self.overlay = Overlay::None;
+        match action {
+            BlameAction::Copy(text) => match clipboard::copy(&text) {
+                Ok(via) => self.ok(format!("⧉ Copied {text} to the clipboard via {via}.")),
+                Err(e) => self.err(format!("Couldn't copy: {e:#}")),
+            },
+            BlameAction::OpenPr(number) => {
+                let Some(repo) = self.blame_repo() else {
+                    self.err("No GitHub repository for this review — nothing to open.");
+                    return;
+                };
+                // `gh` blocks while it starts a browser; fire and forget,
+                // so the review stays responsive either way.
+                let (tx, rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let _ = tx.send(github::open_pr_web(&repo, number).map(|()| None));
+                });
+                self.bg_jobs.push(BgJob {
+                    rx,
+                    kind: BgKind::OpenPr { number },
+                });
+                self.ok(format!("Opening PR #{number} in your browser…"));
+            }
+        }
     }
 
     /// Copy line `i` of the right-click menu and close it.
@@ -3879,6 +4605,12 @@ impl App {
             "",
             ButtonId::TreeToggle,
             self.tree_view,
+        ));
+        rows.push(switch(
+            "👤 Blame column".into(),
+            "B",
+            ButtonId::BlameToggle,
+            self.blame_on,
         ));
 
         rows.push(MenuRow::Heading("FIND"));
@@ -4010,6 +4742,7 @@ impl App {
             ButtonId::ViewFlat => self.set_tree_view(false),
             ButtonId::TreeToggle => self.set_tree_view(!self.tree_view),
             ButtonId::FoldToggle => self.toggle_fold(),
+            ButtonId::BlameToggle => self.toggle_blame(),
             ButtonId::Find => self.open_finder(FinderMode::Files),
             ButtonId::FindGrep => self.open_finder(FinderMode::Grep),
             ButtonId::FindSymbols => self.open_finder(FinderMode::Symbols),
@@ -4553,11 +5286,44 @@ impl App {
         ));
     }
 
+    /// Columns the blame pane takes right now — zero when it is off, and
+    /// zero when the terminal is too narrow to carry three panes. The
+    /// layout, the resize clamps and the mouse arithmetic all measure
+    /// from this, so they cannot disagree about whether it is there.
+    pub fn blame_gutter(&self) -> u16 {
+        if !self.blame_on || self.screen != Screen::Review {
+            return 0;
+        }
+        let need = FILE_PANEL_MIN + BLAME_MIN + DIFF_MIN_W;
+        if self.layout.review.width < need {
+            return 0;
+        }
+        self.clamp_blame_w(self.blame_w)
+    }
+
     /// Keep the panel wide enough to be useful and the diff pane alive.
+    /// The blame pane, when it is showing, is not available to either.
     pub fn clamp_panel_w(&self, w: u16) -> u16 {
-        let avail = self.layout.review.width;
+        let taken = if self.blame_on {
+            self.blame_w.max(BLAME_MIN)
+        } else {
+            0
+        };
+        let avail = self.layout.review.width.saturating_sub(taken);
         let hi = avail.saturating_sub(DIFF_MIN_W).max(FILE_PANEL_MIN);
         w.clamp(FILE_PANEL_MIN, hi)
+    }
+
+    /// The same, for the blame pane: it may not take the file panel's
+    /// floor, and it may not take the diff's.
+    pub fn clamp_blame_w(&self, w: u16) -> u16 {
+        let avail = self
+            .layout
+            .review
+            .width
+            .saturating_sub(self.file_panel_w.max(FILE_PANEL_MIN));
+        let hi = avail.saturating_sub(DIFF_MIN_W).max(BLAME_MIN);
+        w.clamp(BLAME_MIN, hi)
     }
 
     /// Expand any collapsed dirs hiding the open file, then scroll to it.
@@ -5875,7 +6641,9 @@ impl App {
         self.editor = None;
         if standalone {
             // The review was never disturbed — there is nothing to reload,
-            // and reloading would throw away the reader's place.
+            // and reloading would throw away the reader's place. The pane
+            // does have to go back to the file under review, though.
+            self.spawn_blame(self.file_cursor);
             self.ok("Back to the diff.");
             return;
         }
@@ -5967,6 +6735,7 @@ impl App {
         self.pr = ws.pr;
         self.checked_out = ws.checked_out;
         self.merge_base = ws.merge_base;
+        self.reset_blame_review();
         self.files = ws.files;
         self.viewed = ws.viewed;
         self.stage = ws.stage;
@@ -6130,6 +6899,12 @@ impl App {
                 let cur = self.files.get(self.file_cursor).map(|f| f.path.clone());
                 self.pr = Some(d.detail);
                 self.merge_base = d.merge_base;
+                // A refresh that found nothing must leave the pane alone;
+                // resetting here would blank it with nothing on the way
+                // to fill it back in.
+                if changed {
+                    self.reset_blame_review();
+                }
                 self.files = d.files;
                 self.viewed = d.viewed;
                 self.retarget_file_cursor(cur);
@@ -6170,6 +6945,7 @@ impl App {
 
                 let cur = self.files.get(self.file_cursor).map(|f| f.path.clone());
                 self.merge_base = head;
+                self.reset_blame_review();
                 self.files = d.files;
                 // The local viewed marks are a session-local reading aid;
                 // keep them for files that still exist.
@@ -6218,6 +6994,13 @@ impl App {
                 self.diff_cursor = self.diff_cursor.min(last);
                 self.diff_scroll = self.diff_scroll.min(last);
                 self.diff_hscroll = self.diff_hscroll.min(self.max_hscroll());
+                // Content that moved invalidates the blame with it: the
+                // line numbers the pane is indexed by have shifted. A
+                // refresh that moved only the head still needs one,
+                // because the change set the pane colours against moved.
+                if !same || (self.blame_on && !self.blame_done && self.blame_job.is_none()) {
+                    self.spawn_blame(self.file_cursor);
+                }
                 if !same {
                     self.ok(format!("⟳ {} updated with the latest changes.", d.path));
                 } else if !auto {
@@ -6742,7 +7525,10 @@ mod tests {
                 Box::new(|a: &mut App| a.selection = Some(Selection::lines(Side::Right, 1, 1))),
             ),
             ("a drag", Box::new(|a: &mut App| a.drag_select = true)),
-            ("a resize", Box::new(|a: &mut App| a.resizing = true)),
+            (
+                "a resize",
+                Box::new(|a: &mut App| a.dragging = Dragging::FilePanel),
+            ),
         ];
         for (what, setup) in cases {
             let mut app = idle_local_app();
@@ -8350,5 +9136,185 @@ mod tests {
         app.diff = None;
         app.open_hit("test.rs".into(), Some(7));
         assert_eq!(app.pending_jump, Some(7));
+    }
+
+    // ------------------------------------------------------------ blame
+
+    fn commit(sha: &str, author: &str) -> Arc<blame::Commit> {
+        Arc::new(blame::Commit {
+            sha: sha.into(),
+            author: author.into(),
+            author_email: format!("{}@test", author.to_lowercase()),
+            author_time: blame::now() - 60 * 60 * 24,
+            summary: format!("subject (#{})", sha.len()),
+            pr: None,
+        })
+    }
+
+    fn blame_of(commits: &[Arc<blame::Commit>]) -> Blame {
+        Blame {
+            lines: commits
+                .iter()
+                .map(|c| blame::BlameLine { commit: c.clone() })
+                .collect(),
+        }
+    }
+
+    /// A review of one modified line, with both sides blamed.
+    fn blamed_app() -> App {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.checked_out = true;
+        app.files = vec![cf("f.txt")];
+        app.rebuild_entries();
+        app.collapse_unchanged = false;
+        app.diff = Some(FileDiff::compute(Some("a\nb\n"), Some("a\nB\n")));
+        app.rebuild_display();
+        app.blame_on = true;
+        app.blame_new = Some(blame_of(&[commit("new1", "Ann"), commit("new2", "Bob")]));
+        app.blame_old = Some(blame_of(&[commit("old1", "Ann"), commit("old2", "Cid")]));
+        app
+    }
+
+    /// Which side a row is blamed on follows what the row shows: an
+    /// inline row names its own side, and a split row prefers the new
+    /// side, falling back to the old one for a purely removed line.
+    #[test]
+    fn a_row_is_blamed_on_the_side_it_shows() {
+        let mut app = blamed_app();
+
+        app.view = ViewMode::Inline;
+        app.rebuild_display();
+        // Rows: context line 1 (new), removed line 2 (old), added line 2.
+        assert_eq!(app.blame_for_row(0).unwrap().author, "Ann");
+        assert_eq!(
+            app.blame_for_row(1).unwrap().author,
+            "Cid",
+            "a removed line is blamed on the old side"
+        );
+        assert_eq!(app.blame_for_row(2).unwrap().author, "Bob");
+
+        app.view = ViewMode::SideBySide;
+        app.rebuild_display();
+        // Rows: context, then the modification — the new side wins.
+        assert_eq!(app.blame_for_row(0).unwrap().author, "Ann");
+        assert_eq!(app.blame_for_row(1).unwrap().author, "Bob");
+        assert!(app.blame_for_row(99).is_none(), "past the end");
+    }
+
+    /// A pure deletion has no new side to prefer, so the split view falls
+    /// back to the old one — the only side that can say what is going.
+    #[test]
+    fn a_deleted_line_is_blamed_on_the_old_side_in_split_view() {
+        let mut app = blamed_app();
+        app.view = ViewMode::SideBySide;
+        app.diff = Some(FileDiff::compute(Some("a\nb\n"), Some("a\n")));
+        app.rebuild_display();
+        assert_eq!(app.blame_for_row(1).unwrap().author, "Cid");
+    }
+
+    /// Clicking a blame row opens the commit behind it, with the ways to
+    /// follow it. The pull request line is there only when one is known.
+    #[test]
+    fn clicking_a_blame_row_opens_the_commit() {
+        let mut app = blamed_app();
+        app.view = ViewMode::Inline;
+        app.rebuild_display();
+        app.layout.blame = Rect::new(20, 3, 30, 10);
+        app.repo = Some("acme/tool".into());
+        app.blame_prs.insert(
+            "new2".into(),
+            PrRef {
+                number: 412,
+                title: "Fix the parser".into(),
+                url: "https://github.com/acme/tool/pull/412".into(),
+            },
+        );
+
+        // Row 2 of the diff is the added line, blamed on "new2".
+        app.open_blame_menu(22, 5);
+        let Overlay::BlameMenu(menu) = &app.overlay else {
+            panic!("a click on the pane must open the commit");
+        };
+        assert_eq!(menu.commit.author, "Bob");
+        assert_eq!(menu.pr.as_ref().unwrap().number, 412);
+        let keys: Vec<char> = menu.items.iter().map(|it| it.key).collect();
+        assert_eq!(keys, vec!['o', 'y', 'c'], "open, copy link, copy hash");
+        assert_eq!(
+            menu.items[1].action,
+            BlameAction::Copy("https://github.com/acme/tool/pull/412".into())
+        );
+
+        // A commit with no pull request offers only the hash.
+        app.overlay = Overlay::None;
+        app.open_blame_menu(22, 3);
+        let Overlay::BlameMenu(menu) = &app.overlay else {
+            panic!("still opens");
+        };
+        assert_eq!(menu.commit.author, "Ann");
+        assert!(menu.pr.is_none());
+        assert_eq!(menu.items.len(), 1, "only the hash is on offer");
+    }
+
+    /// The pane is off until asked for, and the ☰ menu shows the same
+    /// state the key sets.
+    #[test]
+    fn the_blame_switch_is_off_until_asked_for() {
+        let mut app = blamed_app();
+        app.blame_on = false;
+        assert_eq!(app.blame_gutter(), 0);
+
+        app.handle_key(key(KeyCode::Char('B')));
+        assert!(app.blame_on);
+        let on = app
+            .build_menu()
+            .iter()
+            .any(|r| matches!(r, MenuRow::Item(it) if it.id == ButtonId::BlameToggle && it.checked == Some(true)));
+        assert!(on, "the menu line shows the pane is on");
+
+        app.handle_key(key(KeyCode::Char('B')));
+        assert!(!app.blame_on);
+        assert!(
+            app.blame_new.is_none(),
+            "and the pane's contents go with it"
+        );
+    }
+
+    /// The commit subjects are the free half of the pull request lookup;
+    /// only what they miss is worth a GitHub call.
+    #[test]
+    fn subjects_seed_the_pull_request_map_before_github_is_asked() {
+        let mut app = blamed_app();
+        app.repo = Some("acme/tool".into());
+        let mut named = commit("abc", "Ann");
+        Arc::get_mut(&mut named).unwrap().pr = Some(77);
+        app.blame_new = Some(blame_of(&[named, commit("def", "Bob")]));
+
+        app.seed_blame_prs();
+        assert_eq!(app.blame_prs["abc"].number, 77);
+        assert_eq!(
+            app.blame_prs["abc"].url,
+            "https://github.com/acme/tool/pull/77"
+        );
+        assert!(
+            !app.blame_prs.contains_key("def"),
+            "a subject with no number is left for the lookup"
+        );
+    }
+
+    /// A GitHub Enterprise host has to survive: the open pull request's
+    /// own url is the template, not github.com.
+    #[test]
+    fn pull_request_links_keep_the_host_of_the_review() {
+        let mut app = blamed_app();
+        app.repo = Some("acme/tool".into());
+        assert_eq!(app.pr_link(9), "https://github.com/acme/tool/pull/9");
+
+        app.pr = Some(PrDetail {
+            url: "https://git.acme.example/acme/tool/pull/3".into(),
+            ..pr_detail(3)
+        });
+        assert_eq!(app.pr_link(9), "https://git.acme.example/acme/tool/pull/9");
     }
 }

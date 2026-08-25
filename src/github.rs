@@ -336,6 +336,128 @@ pub fn post_review_comment(
     run_gh(&arg_refs).map(|_| ())
 }
 
+// ------------------------------------------------------------------ blame
+
+/// The pull request a blamed commit belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrRef {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+}
+
+/// Commit hashes asked about in one GraphQL call. GitHub caps a query's
+/// node count, and a batch this size keeps the request comfortably small
+/// while still costing one call for a typical file's history.
+const PR_BATCH: usize = 50;
+
+/// Which pull request each of `shas` was merged in, for the blame pane.
+///
+/// One GraphQL query per batch, with the commits as aliased `object(oid:)`
+/// fields — the REST route would be one request per commit. Commits with
+/// no associated pull request are simply absent from the result, as are
+/// hashes GitHub does not know; neither is an error, because a repository
+/// full of direct pushes is a normal repository.
+pub fn pulls_for_commits(
+    repo: &str,
+    shas: &[String],
+) -> Result<std::collections::HashMap<String, PrRef>> {
+    let (owner, name) = repo
+        .split_once('/')
+        .context("repository must be owner/name")?;
+    let mut out = std::collections::HashMap::new();
+    for batch in shas.chunks(PR_BATCH) {
+        let mut fields = String::new();
+        for (i, sha) in batch.iter().enumerate() {
+            // Hashes come from `git blame`, but they are spliced into a
+            // query string, so anything that is not hex is dropped rather
+            // than escaped.
+            if sha.is_empty() || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            fields.push_str(&format!(
+                "c{i}: object(oid: \"{sha}\") {{ ... on Commit {{ oid \
+                 associatedPullRequests(first: 1) {{ nodes {{ number title url }} }} }} }} "
+            ));
+        }
+        if fields.is_empty() {
+            continue;
+        }
+        let query = format!(
+            "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {fields} }} }}"
+        );
+        let json = run_gh(&[
+            "api",
+            "graphql",
+            "-F",
+            &format!("owner={owner}"),
+            "-F",
+            &format!("name={name}"),
+            "-f",
+            &format!("query={query}"),
+        ])?;
+        merge_pr_nodes(&json, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Pull the `oid → pull request` pairs out of one GraphQL response.
+/// Split out so the shape can be tested without a network call.
+fn merge_pr_nodes(json: &str, out: &mut std::collections::HashMap<String, PrRef>) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Resp {
+        data: Option<Data>,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        repository: Option<std::collections::HashMap<String, Option<Obj>>>,
+    }
+    #[derive(Deserialize)]
+    struct Obj {
+        oid: Option<String>,
+        #[serde(rename = "associatedPullRequests")]
+        prs: Option<Nodes>,
+    }
+    #[derive(Deserialize)]
+    struct Nodes {
+        nodes: Vec<Node>,
+    }
+    #[derive(Deserialize)]
+    struct Node {
+        number: u64,
+        title: String,
+        url: String,
+    }
+    let resp: Resp = serde_json::from_str(json).context("could not read the GraphQL reply")?;
+    let Some(repo) = resp.data.and_then(|d| d.repository) else {
+        return Ok(());
+    };
+    for obj in repo.into_values().flatten() {
+        let (Some(oid), Some(nodes)) = (obj.oid, obj.prs) else {
+            continue;
+        };
+        if let Some(n) = nodes.nodes.into_iter().next() {
+            out.insert(
+                oid,
+                PrRef {
+                    number: n.number,
+                    title: n.title,
+                    url: n.url,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Open a pull request in the reader's browser. `gh` picks the right host,
+/// which matters on GitHub Enterprise, and it is already the only outward
+/// route loupe has.
+pub fn open_pr_web(repo: &str, number: u64) -> Result<()> {
+    let n = number.to_string();
+    run_gh(&["pr", "view", &n, "--repo", repo, "--web"]).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +482,34 @@ mod tests {
         assert!(!is_commit_oid("--output=/tmp/x"));
         assert!(!is_commit_oid(&"g".repeat(40))); // non-hex
         assert!(!is_commit_oid(&"a".repeat(39))); // wrong length
+    }
+
+    /// The GraphQL reply for the blame pane: aliased commit objects, one
+    /// of which has no pull request behind it and one of which GitHub
+    /// does not know at all.
+    #[test]
+    fn pull_request_nodes_are_read_out_of_the_graphql_reply() {
+        let json = r#"{"data":{"repository":{
+            "c0":{"oid":"aaa1","associatedPullRequests":{"nodes":[
+                {"number":412,"title":"Fix the parser","url":"https://gh/x/pull/412"}]}},
+            "c1":{"oid":"bbb2","associatedPullRequests":{"nodes":[]}},
+            "c2":null}}}"#;
+        let mut out = std::collections::HashMap::new();
+        merge_pr_nodes(json, &mut out).expect("valid reply");
+        assert_eq!(out.len(), 1, "only the commit with a pull request lands");
+        let pr = &out["aaa1"];
+        assert_eq!(pr.number, 412);
+        assert_eq!(pr.title, "Fix the parser");
+        assert_eq!(pr.url, "https://gh/x/pull/412");
+    }
+
+    /// A reply carrying only errors must not panic or invent a pull
+    /// request — the pane simply shows no link for those commits.
+    #[test]
+    fn a_graphql_error_reply_yields_nothing() {
+        let mut out = std::collections::HashMap::new();
+        merge_pr_nodes(r#"{"errors":[{"message":"nope"}]}"#, &mut out).expect("no panic");
+        assert!(out.is_empty());
+        assert!(merge_pr_nodes("not json", &mut out).is_err());
     }
 }

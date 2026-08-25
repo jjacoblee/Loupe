@@ -364,6 +364,33 @@ pub fn fetch_source(repo: &str) -> String {
         .unwrap_or_else(|| format!("https://github.com/{repo}.git"))
 }
 
+/// `owner/name` for the `origin` remote, from the URL git already has.
+///
+/// The blame pane needs a repository to build a pull request link out of,
+/// and local review never resolves one — it has no reason to talk to
+/// GitHub at all. This is the offline answer: one `git` call, no network,
+/// and None for a clone with no origin or a host that is not GitHub.
+pub fn origin_repo() -> Option<String> {
+    let url = run_git(&["remote", "get-url", "origin"]).ok()?;
+    repo_from_url(url.trim())
+}
+
+/// The `owner/name` an origin URL names, in any of the forms git accepts:
+/// `https://host/owner/name(.git)`, `git@host:owner/name.git`,
+/// `ssh://git@host/owner/name.git`.
+fn repo_from_url(url: &str) -> Option<String> {
+    if !url.contains("github") {
+        return None;
+    }
+    let t = url.trim_end_matches('/').trim_end_matches(".git");
+    let mut it = t.rsplit(['/', ':']);
+    let (name, owner) = (it.next()?, it.next()?);
+    if name.is_empty() || owner.is_empty() || owner.contains("://") {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
+}
+
 /// Fetch the base branch and the PR head ref so both commits exist locally.
 /// `source` is a remote name or URL (see [`fetch_source`]). Non-fatal:
 /// review can proceed for whatever objects are already present.
@@ -693,5 +720,24 @@ mod tests {
         assert_eq!(safe_repo_path(root, "../outside"), None);
         assert_eq!(safe_repo_path(root, "src/../../outside"), None);
         assert_eq!(safe_repo_path(root, "./src/x.rs"), None);
+    }
+
+    /// The blame pane builds pull request links from the origin URL, so
+    /// every form git accepts has to resolve to the same `owner/name`.
+    #[test]
+    fn origin_urls_resolve_to_owner_and_name() {
+        for url in [
+            "https://github.com/acme/tool",
+            "https://github.com/acme/tool.git",
+            "https://github.com/acme/tool/",
+            "git@github.com:acme/tool.git",
+            "ssh://git@github.com/acme/tool.git",
+        ] {
+            assert_eq!(repo_from_url(url).as_deref(), Some("acme/tool"), "{url}");
+        }
+        // Not GitHub, and nothing to build a link from.
+        assert_eq!(repo_from_url("git@gitlab.com:acme/tool.git"), None);
+        assert_eq!(repo_from_url(""), None);
+        assert_eq!(repo_from_url("https://github.com/"), None);
     }
 }

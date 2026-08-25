@@ -12,6 +12,7 @@ threading model, and the invariants that are easy to break by accident.
 | `app.rs` | All application state (`App`), input handling, background-job orchestration |
 | `ui.rs` | Rendering: layout, file panel, diff view, buttons, overlays, status bar |
 | `diff.rs` | The diff engine: `FileDiff` computation, folding, display entries, line widths |
+| `blame.rs` | `git blame --porcelain` parsing, the age heat ramp, the change set |
 | `editor.rs` | The in-place editor: a custom renderer over `tui-textarea` |
 | `gitops.rs` | Everything that shells out to `git`: local scans, staging, refs, file content |
 | `github.rs` | Everything that shells out to `gh`: PR lists, details, comments, viewed sync |
@@ -74,6 +75,50 @@ mpsc channel; `poll_jobs` applies results on the UI thread.
   optimistic local change first and revert it if the job fails. Staging
   results carry a fresh read of the index, which is adopted wholesale —
   only a real `git status` knows about partial staging.
+
+## The blame pane
+
+`blame.rs` reads `git blame --porcelain` and hands back one commit per
+file line. Three things about it are load-bearing:
+
+- **It is not part of the file load.** A `git blame` on a long file costs
+  about as much as the whole rest of the load, and folding it in would
+  undo the open latency the diff pipeline is built around. It is its own
+  background job, guarded by a generation counter the way `SearchJob` and
+  `EditorJob` are, and the pane says `loading…` until it lands.
+- **The porcelain format repeats a commit header only once.** Later lines
+  of the same commit carry the hash alone, so the parser keeps a hash →
+  `Commit` map. `--line-porcelain` would be simpler and several times
+  larger on a file whose history is one commit deep.
+- **The pane walks the same window `draw_diff` walks** —
+  `display.iter().skip(diff_scroll).take(h)` — so the two cannot drift.
+  Which side a row is blamed on follows what the row shows: an inline row
+  names its side; a split row prefers the new side and falls back to the
+  old one, which is the only side a purely removed row has.
+
+The colors come from `theme.rs` like everything else Loupe paints, in one
+absolute six-step age ramp plus two classes that outrank it: a line the
+working tree owns, and a line from a commit in the change under review
+(`base..head` for a pull request, `HEAD --not --remotes` locally). Two
+properties of the ramp are load-bearing rather than decorative:
+
+- **It is absolute**, not relative to the file, so a shade means the same
+  age everywhere and the scale is learned once rather than per file.
+- **It is one hue** — the palette's own neutral, lightness only. A ramp
+  that spent color would compete with the two classes above it, and those
+  are the whole point of the pane: they are what answers "is this related
+  to what I am doing now?". `theme::tests` asserts the ramp stays grey
+  and monotonic and that the two classes stay saturated, because a later
+  palette tweak that quietly colored the ramp would cost the signal
+  without breaking anything visible.
+
+Pull request numbers come from the commit subject first — a squash or
+merge commit names its own — and from one batched `gh api graphql` call
+per file for the rest, cached by hash for the session. A hash already
+asked about is never asked again, so a repository full of direct pushes
+costs one call and then nothing. The number is **never truncated to fit**:
+a shortened number is a link to a real but wrong pull request, so a number
+too wide for the column renders as `#…`.
 
 ## The diff pipeline
 
@@ -287,12 +332,13 @@ still works against a real implementation): diff engine and
 folding semantics, tree building, highlight (including incremental ==
 fresh equivalence), `-z` porcelain parsers verified against real git
 output, config parsing and merge precedence, CLI parsing, scroll and
-resize clamps, fuzzy ranking, the definition scanner, LSP message
+resize clamps, fuzzy ranking, the definition scanner, the `git blame --porcelain`
+parser and the age ramp, LSP message
 framing and every shape a `definition` answer can take — plus
 `TestBackend` render tests that assert syntax colors and search
 highlights actually reach the diff cells, and tests that drive a **real
-temporary git repository** to keep the staging and `git grep` plumbing
-honest. Clippy is
+temporary git repository** to keep the staging, `git grep` and
+`git blame` plumbing honest. Clippy is
 kept at zero warnings across all targets.
 
 ## Performance ground rules
