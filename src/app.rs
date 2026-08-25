@@ -19,11 +19,14 @@ use crate::gitops::{self, MergeOp, StageState, Tracking};
 use crate::highlight::{self, HlLine};
 use crate::lsp::{self, Lsp};
 use crate::markdown;
+use crate::pins::{self, Pin, Pins};
 use crate::preview::{self, Preview};
 use crate::search;
 use crate::theme::Appearance;
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -145,6 +148,61 @@ pub enum Overlay {
     ReviewConfirm(Box<ReviewPrompt>),
     /// The verdict list under the review box's ▾.
     VerdictMenu,
+    /// "Open a file by path" (`Ctrl+O`) — one line to type or paste a path
+    /// into. It is the way in for a terminal that cannot report a drop,
+    /// and for a path an agent just printed.
+    OpenPath(Box<OpenPathBox>),
+}
+
+/// The one-line path box behind `Ctrl+O`.
+#[derive(Default)]
+pub struct OpenPathBox {
+    /// What has been typed so far.
+    pub input: String,
+    /// Caret position, counted in characters rather than bytes so a path
+    /// with an accent in it still edits one character at a time.
+    pub caret: usize,
+}
+
+impl OpenPathBox {
+    fn insert(&mut self, text: &str) {
+        let at = self.byte_at(self.caret);
+        self.input.insert_str(at, text);
+        self.caret += text.chars().count();
+    }
+
+    fn backspace(&mut self) {
+        if self.caret == 0 {
+            return;
+        }
+        let end = self.byte_at(self.caret);
+        let start = self.byte_at(self.caret - 1);
+        self.input.replace_range(start..end, "");
+        self.caret -= 1;
+    }
+
+    fn delete(&mut self) {
+        let len = self.input.chars().count();
+        if self.caret >= len {
+            return;
+        }
+        let start = self.byte_at(self.caret);
+        let end = self.byte_at(self.caret + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    fn move_caret(&mut self, delta: i32) {
+        let len = self.input.chars().count() as i32;
+        self.caret = (self.caret as i32 + delta).clamp(0, len) as usize;
+    }
+
+    fn byte_at(&self, chars: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(chars)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len())
+    }
 }
 
 /// What a review submit is about to send. Captured when the prompt opens,
@@ -921,6 +979,20 @@ pub enum ButtonId {
     /// One row that shows or hides the blame pane.
     BlameToggle,
 
+    // --- the pinned-file tab row (see [`crate::pins`])
+    /// A tab in the row: a click opens the file it holds.
+    PinTab(usize),
+    /// The ✕ on one tab, which unpins it.
+    PinClose(usize),
+    /// 📌 in the top bar, and the ☰ row beside it: pin the file in front
+    /// of the reader, or unpin it when it is already pinned.
+    PinToggle,
+    /// The ☰ row that opens the path box (`Ctrl+O`).
+    PinOpenPath,
+    /// The two buttons on that box.
+    OpenPathGo,
+    OpenPathCancel,
+
     // --- the ☰ menu and the lines only it offers
     /// ☰ in the top bar.
     Menu,
@@ -968,6 +1040,9 @@ pub struct HitAreas {
     pub review_box: Rect,
     /// The blame pane, when it is showing. Zero-sized when it is not.
     pub blame: Rect,
+    /// The row of pinned-file tabs. Zero-sized when nothing is pinned,
+    /// which is also when it takes no height off the window.
+    pub pin_row: Rect,
     /// The seam between the blame pane and the diff — the second drag
     /// handle, and zero-sized for the same reason.
     pub blame_divider: Rect,
@@ -1024,6 +1099,83 @@ pub fn lines_phrase(adds: usize, dels: usize) -> String {
         (0, d) => format!("{d} removed line{}", s(d)),
         (a, d) => format!("{a} added and {d} removed line{}", s(a.max(d))),
     }
+}
+
+/// The shortest run of typed characters that is worth testing as a
+/// dropped path. `/a/b.md` is 7, and nothing a reader types on purpose
+/// gets near the real bar — an absolute path to a file that exists.
+const MIN_TYPED_DROP: usize = 6;
+
+/// How long to wait for the rest of a path that is being typed in one
+/// character at a time. A long path, or a slow link, can straddle two
+/// reads, and half a path is not a drop.
+pub const TYPED_DROP_GAP: Duration = Duration::from_millis(30);
+
+/// The characters an absolute path can start with, once a terminal has
+/// had its way with it: the path itself, a home-relative path, either
+/// quote, a backslash escape, or a `file://` URL.
+fn starts_like_path(text: &str) -> bool {
+    matches!(text.chars().next(), Some('/' | '~' | '\'' | '"' | '\\'))
+        || "file://".starts_with(&text[..text.len().min(7)])
+}
+
+/// True when the batch so far could be the beginning of a path being
+/// typed in, and is therefore worth waiting a moment to finish.
+///
+/// Ordinary typing never reaches here: one key press is not a path, and
+/// two characters only arrive together when something wrote them
+/// together.
+pub fn partial_typed_path(events: &[Event]) -> bool {
+    match typed_text(events) {
+        Some(text) => text.len() >= 2 && starts_like_path(&text),
+        None => false,
+    }
+}
+
+/// The text of a batch that is nothing but plain typed characters, or
+/// `None` when it holds anything else.
+fn typed_text(events: &[Event]) -> Option<String> {
+    let mut text = String::new();
+    for ev in events {
+        match ev {
+            Event::Key(k) if k.kind == KeyEventKind::Release => {}
+            Event::Key(k) => {
+                // A modifier means a command, not a character.
+                if k.modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    return None;
+                }
+                match k.code {
+                    KeyCode::Char(c) => text.push(c),
+                    // Some terminals finish a dropped path with a return.
+                    KeyCode::Enter if !text.is_empty() => {}
+                    _ => return None,
+                }
+            }
+            // These say nothing either way, and a resize in the middle of
+            // a drop should not break it.
+            Event::Resize(..) | Event::FocusGained | Event::FocusLost => {}
+            _ => return None,
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+/// The path a run of plain characters spells, when they arrived together
+/// and name a file on disk — a file dropped on a terminal that does not
+/// use bracketed paste.
+///
+/// The bar is deliberately high: every event in the batch has to be an
+/// unmodified printable character, and what they spell has to be an
+/// absolute path to a file that exists. No run of loupe's own keys can
+/// clear that, so nothing a reader actually types is taken for a drop.
+fn typed_path_burst(events: &[Event]) -> Option<String> {
+    let text = typed_text(events)?;
+    if text.trim().len() < MIN_TYPED_DROP {
+        return None;
+    }
+    pins::dropped_paths(&text).is_some().then_some(text)
 }
 
 /// True if `path` itself is a symlink (without following it).
@@ -1583,6 +1735,12 @@ pub struct App {
     /// and there is no review beside it: the preview takes the whole
     /// window and quitting is the only way out.
     pub preview_only: bool,
+    /// Files pinned to the tab row at the top of the window, and which
+    /// of them is open (see [`crate::pins`]).
+    pub pins: Pins,
+    /// Set while a pinned tab loads a file the change touches: the tab
+    /// wants the rendered document, and the file has to land first.
+    pin_wants_preview: bool,
     pub overlay: Overlay,
 
     pub status: String,
@@ -1790,6 +1948,8 @@ impl App {
             editor: None,
             preview: None,
             preview_only: false,
+            pins: Pins::default(),
+            pin_wants_preview: false,
             overlay: Overlay::None,
             status: String::new(),
             status_err: false,
@@ -2391,7 +2551,11 @@ impl App {
                 // when the next file is one it can render, and drops to
                 // the diff when it is not: the pane follows what the
                 // reader was doing, not what they last clicked.
-                let keep_preview = self.preview.take().is_some() && markdown::is_markdown(&d.path);
+                // A pinned tab asked for the document rather than the
+                // diff, so it forces the same door open.
+                let wants = std::mem::take(&mut self.pin_wants_preview);
+                let keep_preview =
+                    (self.preview.take().is_some() || wants) && markdown::is_markdown(&d.path);
                 self.recompute_matches();
                 self.reveal_current_file();
                 // The blame of the file that just landed, on its own job.
@@ -2593,6 +2757,9 @@ impl App {
         if let Some(root) = gitops::repo_root() {
             self.repo_root = root;
         }
+        // Last session's tabs. Read once the root is known, since the
+        // file lives under this clone's git directory.
+        self.load_pins();
         match self.mode {
             LaunchMode::Local => self.spawn_open_local(true),
             LaunchMode::Auto => self.spawn_open_local(false),
@@ -4451,6 +4618,37 @@ impl App {
                 }
                 return;
             }
+            // The path box owns every printable key while it is open —
+            // it is a text field, and a path is made of letters the
+            // review screen would otherwise treat as commands.
+            Overlay::OpenPath(box_) => {
+                match key.code {
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        box_.insert(&c.to_string());
+                    }
+                    KeyCode::Backspace => box_.backspace(),
+                    KeyCode::Delete => box_.delete(),
+                    KeyCode::Left => box_.move_caret(-1),
+                    KeyCode::Right => box_.move_caret(1),
+                    KeyCode::Home => box_.caret = 0,
+                    KeyCode::End => box_.caret = box_.input.chars().count(),
+                    // Ctrl+U clears the line, as it does in a shell.
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        box_.input.clear();
+                        box_.caret = 0;
+                    }
+                    KeyCode::Enter => {
+                        self.confirm_open_path();
+                        return;
+                    }
+                    KeyCode::Esc => {
+                        self.overlay = Overlay::None;
+                        self.ok("Closed — no file opened.");
+                    }
+                    _ => {}
+                }
+                return;
+            }
             Overlay::ConflictMenu(menu) => {
                 let last = menu.items.len().saturating_sub(1);
                 let mut close = false;
@@ -4598,6 +4796,14 @@ impl App {
             Overlay::None => {}
         }
 
+        // The tab row, from anywhere — a text box included, which is why
+        // these keys all hold a modifier. The bare `1`-`9`, `,`, `.`, `=`
+        // and `-` do the same thing on the screens where a bare key is
+        // not a letter (see the review and preview blocks below).
+        if self.pin_key(key) {
+            return;
+        }
+
         // The `/` prompt owns every keystroke while it is open.
         if self.find.typing {
             self.find_key(key);
@@ -4663,6 +4869,7 @@ impl App {
                 KeyCode::Char('>') => self.resize_file_panel(2),
                 KeyCode::Char(']') if !self.preview_only => self.step_file(1),
                 KeyCode::Char('[') if !self.preview_only => self.step_file(-1),
+                _ if self.pin_key_bare(key) => {}
                 _ => {
                     let Some(pv) = &mut self.preview else { return };
                     match key.code {
@@ -4875,6 +5082,10 @@ impl App {
                         self.overlay = Overlay::CheckoutPrompt(pr.number);
                     }
                 }
+                // The tab row is above this screen too, so a pinned plan
+                // file is one key away from the list as well as from a
+                // review.
+                _ if self.pin_key_bare(key) => {}
                 _ => {}
             },
             Screen::Review => {
@@ -5009,6 +5220,10 @@ impl App {
                     // now, and `]`/`[` is the convention anyway.
                     KeyCode::Char(']') => self.step_file(1),
                     KeyCode::Char('[') => self.step_file(-1),
+                    // The tab row: `1`-`9` open a tab, `,`/`.` step
+                    // through them, `=` pins the file in front of you and
+                    // `-` unpins the one you are in.
+                    _ if self.pin_key_bare(key) => {}
                     _ => {}
                 }
             }
@@ -5152,6 +5367,19 @@ impl App {
                 }
                 return;
             }
+            Overlay::OpenPath(_) => {
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    match self.layout.button_at(x, y) {
+                        Some(ButtonId::OpenPathGo) => self.confirm_open_path(),
+                        Some(ButtonId::OpenPathCancel) => {
+                            self.overlay = Overlay::None;
+                            self.ok("Closed — no file opened.");
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
             Overlay::VerdictMenu => {
                 if matches!(m.kind, MouseEventKind::Down(_)) {
                     match self.layout.button_at(x, y) {
@@ -5206,6 +5434,31 @@ impl App {
                 return;
             }
             Overlay::None => {}
+        }
+
+        // The tab row sits above every screen and every mode, so its
+        // clicks are answered before any of them get a look.
+        if contains(self.layout.pin_row, x, y) {
+            match (m.kind, self.layout.button_at(x, y)) {
+                (MouseEventKind::Down(MouseButton::Left), Some(id)) => {
+                    self.activate(id);
+                }
+                // Middle-click closes a tab, as it does in a browser.
+                (MouseEventKind::Down(MouseButton::Middle), Some(ButtonId::PinTab(i)))
+                | (MouseEventKind::Down(MouseButton::Middle), Some(ButtonId::PinClose(i))) => {
+                    self.close_pin(i);
+                }
+                // The wheel walks the row, which is the only way to reach
+                // a tab that has scrolled off a narrow window.
+                (MouseEventKind::ScrollDown, _) | (MouseEventKind::ScrollRight, _) => {
+                    self.step_pin(1)
+                }
+                (MouseEventKind::ScrollUp, _) | (MouseEventKind::ScrollLeft, _) => {
+                    self.step_pin(-1)
+                }
+                _ => {}
+            }
+            return;
         }
 
         // Preview mode: the file panel still switches files, because a
@@ -5893,6 +6146,51 @@ impl App {
     /// of the tool. It is rebuilt on every open rather than cached, so a
     /// line's enabled state and its on/off mark always describe the state
     /// the reader is actually looking at.
+    /// The ☰ lines for the tab row. The same set on every screen, because
+    /// the row itself sits above every screen.
+    fn pin_menu_rows(&self) -> Vec<MenuRow> {
+        // `hint` is a static string, so the tab numbers come from a table
+        // rather than from `format!`.
+        const DIGITS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+        let mut rows = vec![MenuRow::Heading("PINNED FILES")];
+        rows.push(MenuRow::Item(MenuItem {
+            label: if self.current_is_pinned() {
+                "📌 Unpin this file".into()
+            } else {
+                "📌 Pin this file".into()
+            },
+            hint: "=",
+            id: ButtonId::PinToggle,
+            enabled: self.current_target().is_some(),
+            checked: None,
+        }));
+        rows.push(MenuRow::Item(MenuItem {
+            label: "📂 Open a file by path…".into(),
+            hint: "Ctrl+O",
+            id: ButtonId::PinOpenPath,
+            enabled: true,
+            checked: None,
+        }));
+        let open = self.active_pin();
+        for (i, label) in self.pins.labels().into_iter().enumerate() {
+            rows.push(MenuRow::Item(MenuItem {
+                label: format!(
+                    "{} {label}",
+                    if self.pins.items[i].outside {
+                        "↗"
+                    } else {
+                        " "
+                    }
+                ),
+                hint: DIGITS.get(i).copied().unwrap_or(""),
+                id: ButtonId::PinTab(i),
+                enabled: true,
+                checked: Some(open == Some(i)),
+            }));
+        }
+        rows
+    }
+
     fn build_menu(&self) -> Vec<MenuRow> {
         let item = |label: String, hint: &'static str, id: ButtonId| {
             MenuRow::Item(MenuItem {
@@ -5928,6 +6226,7 @@ impl App {
             rows.push(MenuRow::Heading("GO"));
             rows.push(item("⎇  Local changes".into(), "l", ButtonId::LocalChanges));
             rows.push(item("⟳  Refresh the list".into(), "r", ButtonId::Refresh));
+            rows.extend(self.pin_menu_rows());
             rows.push(MenuRow::Heading("SETTINGS"));
             rows.push(item("🎨 Theme".into(), "t", ButtonId::Theme));
             rows.push(item("?  Help".into(), "?", ButtonId::Help));
@@ -5950,6 +6249,7 @@ impl App {
                     ButtonId::PreviewClose,
                 ));
             }
+            rows.extend(self.pin_menu_rows());
             rows.push(MenuRow::Heading("SETTINGS"));
             rows.push(item("🎨 Theme".into(), "t", ButtonId::Theme));
             rows.push(item("?  Help".into(), "?", ButtonId::Help));
@@ -5973,6 +6273,7 @@ impl App {
                 "Esc",
                 ButtonId::EditorClose,
             ));
+            rows.extend(self.pin_menu_rows());
             rows.push(MenuRow::Heading("SETTINGS"));
             rows.push(item("🎨 Theme".into(), "t", ButtonId::Theme));
             rows.push(item("?  Help".into(), "?", ButtonId::Help));
@@ -6047,6 +6348,7 @@ impl App {
             ButtonId::Copy,
             has_sel,
         ));
+        rows.extend(self.pin_menu_rows());
         let revert = self.can_revert();
         // Conflicts first: they block the commit, so they outrank
         // everything else the menu offers.
@@ -6211,6 +6513,15 @@ impl App {
             ButtonId::Edit => self.open_editor(None),
             ButtonId::PreviewToggle => self.toggle_preview(),
             ButtonId::PreviewClose => self.close_preview(),
+            ButtonId::PinTab(i) => self.open_pin(i),
+            ButtonId::PinClose(i) => self.close_pin(i),
+            ButtonId::PinToggle => self.toggle_pin_current(),
+            ButtonId::PinOpenPath => self.open_path_box(),
+            ButtonId::OpenPathGo => self.confirm_open_path(),
+            ButtonId::OpenPathCancel => {
+                self.overlay = Overlay::None;
+                self.ok("Closed — no file opened.");
+            }
             ButtonId::Comment => self.open_comment(),
             ButtonId::Copy => self.yank(),
             ButtonId::RevertSection => self.ask_revert_section(self.diff_cursor),
@@ -8291,6 +8602,13 @@ impl App {
     pub fn start_preview_only(&mut self, path: &std::path::Path) {
         self.preview_only = true;
         self.screen = Screen::Review;
+        // `loupe md` is often run inside a repository even though it
+        // shows no review. When it is, the tab row is the same row the
+        // review would have had.
+        if let Some(root) = gitops::repo_root() {
+            self.repo_root = root;
+            self.load_pins();
+        }
         let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let content = match std::fs::read_to_string(&abs_path) {
             Ok(c) => c,
@@ -8308,6 +8626,553 @@ impl App {
         self.preview = Some(pv);
         if !self.status_err {
             self.ok("📖 P shows the source · Ctrl+S saves · q quits.");
+        }
+    }
+
+    // ---------------------------------------------------------- pinned files
+
+    /// Where this clone's pins live between runs. `None` outside a git
+    /// repository, which is `loupe md <path>` with nothing around it —
+    /// there the tabs last for the session and no file is written.
+    fn pins_path(&self) -> Option<PathBuf> {
+        let dir = gitops::git_dir(&self.repo_root)?;
+        pins::state_path(&dir)
+    }
+
+    /// Read last session's tabs back. Called once the repository root is
+    /// known, which is after the first load, not at construction.
+    pub fn load_pins(&mut self) {
+        let Some(path) = self.pins_path() else { return };
+        let items = pins::load(&path);
+        if items.is_empty() {
+            return;
+        }
+        let n = items.len();
+        self.pins.items = items;
+        self.auto_open_note = Some(format!(
+            "{n} pinned file{} — Alt+1 opens the first",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// Write the tabs out. Called after every change to them, so quitting
+    /// never costs the reader their row.
+    fn save_pins(&mut self) {
+        let Some(path) = self.pins_path() else { return };
+        if let Err(e) = pins::save(&path, &self.pins.items) {
+            self.err(format!("Couldn't save the pinned files: {e}"));
+        }
+    }
+
+    /// The file in front of the reader, as an absolute path: what the
+    /// preview is rendering, what the editor holds, or the file under the
+    /// file-panel cursor.
+    fn current_target(&self) -> Option<PathBuf> {
+        let raw = if let Some(pv) = &self.preview {
+            pv.abs_path.clone()
+        } else if let Some(ed) = &self.editor {
+            ed.abs_path.clone()
+        } else {
+            // The file panel is not on screen on the PR list, so there is
+            // nothing in front of the reader to pin there.
+            if self.screen != Screen::Review {
+                return None;
+            }
+            let file = self.files.get(self.file_cursor)?;
+            gitops::safe_repo_path(&self.repo_root, &file.path)?
+        };
+        // Resolved, so it compares equal to a pin made from a dropped
+        // path — which the terminal always hands over already resolved.
+        Some(std::fs::canonicalize(&raw).unwrap_or(raw))
+    }
+
+    /// The tab whose file is on screen, if any.
+    ///
+    /// Derived rather than remembered: the reader leaves a document by a
+    /// dozen different doors, and every one of them would otherwise have
+    /// to clear a stored index. This cannot go stale.
+    pub fn active_pin(&self) -> Option<usize> {
+        // Nothing pinned is the common case, and it costs nothing: the
+        // answer is asked for on every draw.
+        if self.pins.is_empty() {
+            return None;
+        }
+        let abs = self.current_target()?;
+        self.pins.find(&abs)
+    }
+
+    /// True when the file in front of the reader already has a tab. The
+    /// 📌 button draws as pressed while it is.
+    pub fn current_is_pinned(&self) -> bool {
+        self.active_pin().is_some()
+    }
+
+    /// `=` and the 📌 button: pin the file in front of the reader, or
+    /// unpin it when it is already pinned.
+    pub fn toggle_pin_current(&mut self) {
+        let Some(abs) = self.current_target() else {
+            self.err("Nothing to pin — open a file first.");
+            return;
+        };
+        if let Some(i) = self.pins.find(&abs) {
+            self.close_pin(i);
+            return;
+        }
+        if !abs.is_file() {
+            self.err("That file is not on disk — there is nothing to pin.");
+            return;
+        }
+        let pin = Pin::new(&self.repo_root, abs);
+        let name = pin.path.clone();
+        match self.pins.add(pin) {
+            Ok(i) => {
+                self.save_pins();
+                self.ok(format!(
+                    "📌 {name} pinned — “{}” opens it again, “-” unpins it.",
+                    i + 1
+                ));
+            }
+            Err(max) => self.err(format!(
+                "The tab row holds {max} files — unpin one first (“-”, or the ✕ on a tab)."
+            )),
+        }
+    }
+
+    /// Unpin one tab. The file itself is untouched — a pin is a bookmark,
+    /// not a copy.
+    pub fn close_pin(&mut self, idx: usize) {
+        let was_open = self.active_pin() == Some(idx) && self.preview.is_some();
+        let Some(gone) = self.pins.remove(idx) else {
+            return;
+        };
+        self.save_pins();
+        // Leaving the tab that is on screen would leave the reader inside
+        // a document with no tab, so put them back in the review.
+        if was_open && !self.preview_only {
+            self.close_preview();
+        }
+        self.ok(format!("{} unpinned — the file is untouched.", gone.path));
+    }
+
+    /// `Alt+]` / `Alt+[`: the next or previous tab, wrapping at each end.
+    pub fn step_pin(&mut self, delta: i32) {
+        match self.pins.step(delta, self.active_pin()) {
+            Some(i) => self.open_pin(i),
+            None => self.err("Nothing pinned yet — “=” pins the file you are looking at."),
+        }
+    }
+
+    /// Open the file one tab holds.
+    ///
+    /// A markdown file renders as a document, wherever it lives — that is
+    /// what a tab is for. A file the change touches opens as its diff,
+    /// because during a review that is what coming back to it means.
+    /// Anything else opens in the editor.
+    pub fn open_pin(&mut self, idx: usize) {
+        let Some(pin) = self.pins.items.get(idx).cloned() else {
+            return;
+        };
+        if self.job.is_some() {
+            return;
+        }
+        // Unsaved editor text is the reader's own work. A tab does not
+        // get to throw it away.
+        if self.editor.as_ref().is_some_and(|e| e.dirty) {
+            self.err("Unsaved changes — Ctrl+S saves them, Esc throws them away.");
+            return;
+        }
+        if !pin.abs_path.is_file() {
+            self.err(format!(
+                "{} is not there any more — “-” unpins it.",
+                pin.path
+            ));
+            return;
+        }
+        // Whether there is a review to open the file *inside*. Asked
+        // before the screen changes: the file list is left standing when
+        // the reader goes back to the pull-request list, so on that
+        // screen it names a review that is not on screen.
+        let in_review = self.screen == Screen::Review;
+        self.overlay = Overlay::None;
+        self.screen = Screen::Review;
+
+        // In the changeset: go through the ordinary file-open door, so the
+        // diff, the blame pane and the staging state all follow.
+        let in_change = (in_review && !pin.outside)
+            .then(|| self.files.iter().position(|f| f.path == pin.path))
+            .flatten();
+        if let Some(i) = in_change {
+            let md = markdown::is_markdown(&pin.path);
+            // Already the file under the cursor with its diff in hand, so
+            // it does not have to be read again. The *pane* still has to
+            // change hands, though: what is on screen is usually another
+            // pinned file's document, and leaving it there is what made a
+            // tab for a changed file look like it did nothing at all.
+            if i == self.file_cursor && self.diff.is_some() {
+                self.editor = None;
+                let showing_it = self
+                    .preview
+                    .as_ref()
+                    .is_some_and(|pv| pv.abs_path == pin.abs_path);
+                if md && !showing_it {
+                    // Rebuilt rather than kept: an open preview belongs
+                    // to some other file.
+                    self.preview = None;
+                    self.preview_current_file();
+                } else if !md && self.preview.take().is_some() {
+                    // A document was covering the diff this tab is for.
+                    // The blame pane comes back with it.
+                    self.spawn_blame(self.file_cursor);
+                    self.ok(format!("📌 {} — back to its diff.", pin.path));
+                } else {
+                    self.ok(format!("📌 {} — already open.", pin.path));
+                }
+            } else {
+                // The document, not the diff — that is what the tab is
+                // for. The flag is read when the file lands.
+                self.pin_wants_preview = md;
+                self.spawn_load_file(i);
+            }
+            return;
+        }
+
+        // Outside the changeset — and possibly outside the repository.
+        // Read it here rather than on a worker: the file is the reader's
+        // own choice, and the size guard keeps the wait bounded.
+        let content = match self.read_pinned(&pin) {
+            Ok(text) => text,
+            Err(e) => {
+                self.err(e);
+                return;
+            }
+        };
+        self.editor = None;
+        if markdown::is_markdown(&pin.path) {
+            let mut pv = Preview::new(&pin.path, pin.abs_path.clone(), &content);
+            pv.standalone = true;
+            pv.mtime = preview::mtime_of(&pin.abs_path);
+            self.preview = Some(pv);
+            self.clear_blame();
+            self.ok(format!(
+                "📖 {} — P shows the source, Esc goes back.",
+                pin.path
+            ));
+            return;
+        }
+        self.preview = None;
+        let mut ed = Editor::new(&pin.path, pin.abs_path.clone(), &content);
+        ed.standalone = true;
+        self.editor = Some(ed);
+        // git blame only knows files in this repository; an outside file
+        // has no history here to draw.
+        if pin.outside {
+            self.clear_blame();
+        } else {
+            self.spawn_blame_external(pin.path.clone(), false);
+        }
+        self.ok(format!(
+            "✎ {} — Ctrl+S saves, Esc goes back to the review.",
+            pin.path
+        ));
+    }
+
+    /// Read a pinned file, refusing the two cases that are never what the
+    /// reader meant: a symlink, and something far too big to be a
+    /// document.
+    fn read_pinned(&self, pin: &Pin) -> Result<String, String> {
+        if is_symlink(&pin.abs_path) {
+            return Err(format!(
+                "{} is a symlink — refusing to open through it.",
+                pin.path
+            ));
+        }
+        let size = std::fs::metadata(&pin.abs_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if size > pins::MAX_BYTES {
+            return Err(format!(
+                "{} is {} MB — too big to read as a document.",
+                pin.path,
+                size / (1024 * 1024)
+            ));
+        }
+        std::fs::read_to_string(&pin.abs_path).map_err(|e| format!("Cannot read {}: {e}", pin.path))
+    }
+
+    // ------------------------------------------------- pastes and drops
+
+    /// One drain of the terminal's event queue.
+    ///
+    /// The events are taken as a *batch* rather than one at a time, and
+    /// that is the whole point of this function. Not every terminal wraps
+    /// a dropped file in bracketed paste: several write the path in as if
+    /// it had been typed, one key event per character, all of them
+    /// arriving in the same read. Dispatched as ordinary keys, the
+    /// leading `/` of the path opens the search prompt and the rest of
+    /// the path lands in the query box at the foot of the window — the
+    /// file never opens, and what the reader sees is their own path
+    /// spelled out along the bottom of the screen.
+    ///
+    /// So the batch is read for a path *before* any of it is dispatched.
+    pub fn handle_events(&mut self, events: Vec<Event>) {
+        if let Some(text) = typed_path_burst(&events) {
+            self.handle_paste(text);
+            return;
+        }
+        for ev in events {
+            match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
+                Event::Mouse(m) => self.handle_mouse(m),
+                // A paste, or a drop from a terminal that does bracket
+                // it. `handle_paste` tells those two apart.
+                Event::Paste(text) => self.handle_paste(text),
+                _ => {}
+            }
+        }
+    }
+
+    /// A paste, or a file dropped on the terminal window. The two arrive
+    /// the same way, so the text decides which it is: a paste in which
+    /// every token is an absolute path to a file that exists is a drop,
+    /// and anything else is text (see [`crate::pins::dropped_paths`]).
+    pub fn handle_paste(&mut self, text: String) {
+        self.last_input = Instant::now();
+        // A drop is answered even while a job is running. Pinning costs
+        // nothing, and a file dropped on the window must not vanish
+        // because loupe happened to be loading something at the time —
+        // the reader has no way of knowing that, and nothing on screen
+        // would say the drop was lost.
+        if let Some(paths) = pins::dropped_paths(&text) {
+            self.open_dropped(paths);
+            return;
+        }
+        // Text, then. While a job is modal there is no box to put it in.
+        if self.job.is_some() {
+            return;
+        }
+        // The one place text has to go is wherever the keyboard already
+        // is.
+        match &mut self.overlay {
+            Overlay::OpenPath(box_) => box_.insert(text.trim()),
+            Overlay::Comment(draft) => {
+                draft.textarea.insert_str(&text);
+            }
+            Overlay::Finder(finder) => {
+                // The finder holds one line, so a multi-line paste is
+                // flattened rather than half-swallowed.
+                let one_line: String = text.split(['\n', '\r']).collect::<Vec<_>>().join(" ");
+                finder.input.push_str(&one_line);
+                finder.cursor = finder.input.chars().count();
+                self.refresh_finder();
+            }
+            _ => {
+                if self.find.typing {
+                    // The `/` prompt is one line, like the finder.
+                    let one_line: String = text.split(['\n', '\r']).collect::<Vec<_>>().join(" ");
+                    self.find.query.push_str(&one_line);
+                    self.recompute_matches();
+                } else if self.review.focused {
+                    self.review.textarea.insert_str(&text);
+                } else if let Some(ed) = &mut self.editor {
+                    if ed.read_only {
+                        self.err("This file is read-only — nothing was pasted.");
+                        return;
+                    }
+                    ed.textarea.insert_str(&text);
+                    ed.dirty = true;
+                    self.editor_touched = Some(Instant::now());
+                } else {
+                    self.err(
+                        "Pasted text has nowhere to go here — drop a file to pin it, or Ctrl+O opens one by path.",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Pin every file that was dropped, and open the first of them. A
+    /// drop is the fast way to read a document that lives outside the
+    /// repository, so it never asks and never copies the file anywhere.
+    fn open_dropped(&mut self, paths: Vec<PathBuf>) {
+        let mut opened: Option<usize> = None;
+        let mut full = false;
+        let mut names: Vec<String> = Vec::new();
+        for path in paths {
+            let abs = std::fs::canonicalize(&path).unwrap_or(path);
+            let pin = Pin::new(&self.repo_root, abs);
+            let name = pin.path.clone();
+            match self.pins.add(pin) {
+                Ok(i) => {
+                    names.push(name);
+                    opened.get_or_insert(i);
+                }
+                Err(_) => {
+                    full = true;
+                    break;
+                }
+            }
+        }
+        if names.is_empty() {
+            if full {
+                self.err(format!(
+                    "The tab row already holds {} files — unpin one first (“-”).",
+                    pins::MAX_PINS
+                ));
+            }
+            return;
+        }
+        self.save_pins();
+        let dropped = names.len();
+        // A load is in flight, so the pane is not the reader's to take.
+        // The tabs are made all the same; opening one waits for a key.
+        if self.job.is_some() {
+            self.ok(format!(
+                "📌 {} pinned — “1” opens {} once this finishes.",
+                names.join(", "),
+                if dropped == 1 { "it" } else { "the first" }
+            ));
+            return;
+        }
+        if let Some(i) = opened {
+            self.open_pin(i);
+        }
+        // `open_pin` has already said what it opened; add what else came
+        // in with it, and the warning when the row filled up.
+        let mut note = String::new();
+        if dropped > 1 {
+            note.push_str(&format!(" · {} more pinned", dropped - 1));
+        }
+        if full {
+            note.push_str(" · the rest did not fit in the tab row");
+        }
+        if !note.is_empty() && !self.status_err {
+            let now = self.status.clone();
+            self.ok(format!("{now}{note}"));
+        }
+    }
+
+    /// `-`: unpin the tab the reader is in.
+    pub fn close_open_pin(&mut self) {
+        match self.active_pin() {
+            Some(i) => self.close_pin(i),
+            None => self.err("No pinned file open — “=” pins the one you are looking at."),
+        }
+    }
+
+    /// The tab-row keys that hold a modifier, so they reach the row from
+    /// inside the editor and every text box too. True when the key was
+    /// one of them.
+    ///
+    /// `Ctrl+O` rather than `Alt+O` for the path box: a macOS terminal
+    /// sends the Option key as an accented character by default, not as
+    /// Meta, so an Alt-only binding would not arrive at all there. The
+    /// Alt spellings stay for the terminals that do send Meta.
+    fn pin_key(&mut self, key: KeyEvent) -> bool {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('o') | KeyCode::Char('O') if ctrl => self.open_path_box(),
+            KeyCode::Char(c @ '1'..='9') if alt => self.open_pin_number(c),
+            KeyCode::Char('=') | KeyCode::Char('+') if alt => self.toggle_pin_current(),
+            KeyCode::Char('-') if alt => self.close_open_pin(),
+            KeyCode::Char('.') if alt => self.step_pin(1),
+            KeyCode::Char(',') if alt => self.step_pin(-1),
+            _ => return false,
+        }
+        true
+    }
+
+    /// The bare `1`-`9`, `,`, `.`, `=` and `-`, for the screens where a
+    /// bare key is a command rather than a letter. True when the key was
+    /// one of them.
+    fn pin_key_bare(&mut self, key: KeyEvent) -> bool {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char(c @ '1'..='9') => self.open_pin_number(c),
+            KeyCode::Char('=') | KeyCode::Char('+') => self.toggle_pin_current(),
+            KeyCode::Char('-') => self.close_open_pin(),
+            KeyCode::Char('.') => self.step_pin(1),
+            KeyCode::Char(',') => self.step_pin(-1),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Open the tab a digit names, counting from 1 the way the row is
+    /// labelled.
+    fn open_pin_number(&mut self, c: char) {
+        let n = c.to_digit(10).unwrap_or(0) as usize;
+        if n == 0 {
+            return;
+        }
+        if n > self.pins.len() {
+            if self.pins.is_empty() {
+                self.err("Nothing pinned yet — “=” pins the file you are looking at, or drop one on the window.");
+            } else {
+                self.err(format!(
+                    "There is no tab {n} — {} pinned right now.",
+                    self.pins.len()
+                ));
+            }
+            return;
+        }
+        self.open_pin(n - 1);
+    }
+
+    /// `Ctrl+O`: the path box. It is how a reader on a terminal that
+    /// cannot report a drop still opens a file from anywhere, and how a
+    /// path an agent just printed gets pasted straight in.
+    pub fn open_path_box(&mut self) {
+        self.overlay = Overlay::OpenPath(Box::default());
+        self.ok("Type or paste a path — Enter opens and pins it, Esc cancels.");
+    }
+
+    /// Enter in the path box.
+    fn confirm_open_path(&mut self) {
+        let Overlay::OpenPath(box_) = &self.overlay else {
+            return;
+        };
+        let typed = box_.input.trim().to_string();
+        if typed.is_empty() {
+            self.overlay = Overlay::None;
+            self.ok("Nothing typed — no file opened.");
+            return;
+        }
+        // A path relative to the repository is the other half of what a
+        // reader types here; absolute and `~` paths reach the rest of the
+        // machine.
+        let expanded = pins::expand_home(&typed);
+        let candidate = if expanded.is_absolute() {
+            expanded
+        } else {
+            self.repo_root.join(expanded)
+        };
+        let abs = match std::fs::canonicalize(&candidate) {
+            Ok(p) => p,
+            Err(e) => {
+                self.err(format!("Cannot open {typed}: {e}"));
+                return;
+            }
+        };
+        if !abs.is_file() {
+            self.err(format!("{typed} is not a file."));
+            return;
+        }
+        self.overlay = Overlay::None;
+        let pin = Pin::new(&self.repo_root, abs);
+        match self.pins.add(pin) {
+            Ok(i) => {
+                self.save_pins();
+                self.open_pin(i);
+            }
+            Err(max) => self.err(format!(
+                "The tab row holds {max} files — unpin one first (“-”)."
+            )),
         }
     }
 
@@ -9715,6 +10580,488 @@ b2
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    // ---------------------------------------------------- pinned files
+
+    /// The whole point of the feature: a markdown file from somewhere
+    /// else on the machine, dropped on the window, read without ever
+    /// being copied into the repository.
+    #[test]
+    fn a_dropped_file_from_outside_the_repo_pins_and_renders() {
+        let dir = TempDir::new("drop-outside");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        // Somewhere the repository root cannot reach.
+        let away = std::env::temp_dir().join("loupe-pins-elsewhere");
+        std::fs::create_dir_all(&away).unwrap();
+        let doc = away.join("agent-notes.md");
+        std::fs::write(&doc, "# Notes\n\nfrom the agent\n").unwrap();
+
+        app.handle_paste(doc.to_string_lossy().into_owned());
+
+        assert_eq!(app.pins.len(), 1, "the drop made a tab");
+        assert!(app.pins.items[0].outside, "and marked it as outside");
+        let pv = app.preview.as_ref().expect("it renders the document");
+        assert!(pv.src.contains("from the agent"));
+        assert!(pv.standalone, "there is no diff behind it");
+        assert_eq!(app.active_pin(), Some(0), "the tab is the one on screen");
+        std::fs::remove_dir_all(&away).ok();
+    }
+
+    /// A local review of one source file with its diff already in hand —
+    /// the state a tab for a changed file has to come back to.
+    fn diff_review_app(dir: &std::path::Path) -> App {
+        const SRC: &str = "fn main() {\n    println!(\"hi\");\n}\n";
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.checked_out = true;
+        app.repo_root = dir.to_path_buf();
+        app.files = vec![ChangedFile {
+            path: "src/main.rs".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 0,
+            previous: None,
+            conflicted: false,
+        }];
+        app.rebuild_entries();
+        std::fs::create_dir_all(dir.join("src")).expect("scratch src");
+        std::fs::write(dir.join("src/main.rs"), SRC).expect("fixture written");
+        app.new_content = Some(SRC.to_string());
+        app.diff = Some(FileDiff::compute(Some(SRC), Some(SRC)));
+        app.rebuild_display();
+        app
+    }
+
+    /// One markdown file somewhere else on the machine, to read and come
+    /// back from.
+    fn outside_doc(name: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("loupe-pins-away-{name}"));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let doc = dir.join(format!("{name}.md"));
+        std::fs::write(&doc, body).expect("fixture written");
+        doc
+    }
+
+    /// Pin a changed file, go and read a document, then come back to the
+    /// diff by its tab. The tab used to do nothing at all: the file was
+    /// already under the cursor with its diff loaded, so loupe decided
+    /// there was nothing to do — and left the document covering it.
+    #[test]
+    fn a_tab_for_a_changed_file_comes_back_to_its_diff() {
+        let dir = TempDir::new("pin-diff-back");
+        let mut app = diff_review_app(&dir.0);
+        app.handle_key(key(KeyCode::Char('=')));
+        assert_eq!(app.pins.len(), 1, "the source file is pinned");
+
+        let doc = outside_doc("notes", "# Notes\n\nsomething else\n");
+        app.handle_paste(doc.to_string_lossy().into_owned());
+        assert!(app.preview.is_some(), "the document is on screen");
+        assert_eq!(app.active_pin(), Some(1), "and its tab is the live one");
+
+        app.handle_key(key(KeyCode::Char('1')));
+
+        assert!(app.preview.is_none(), "the document made way for the diff");
+        assert!(app.diff.is_some(), "which is still loaded");
+        assert_eq!(app.active_pin(), Some(0), "and tab 1 is the live one");
+        std::fs::remove_dir_all(doc.parent().unwrap()).ok();
+    }
+
+    /// The same round trip with the mouse, since that is how the row is
+    /// meant to be used.
+    #[test]
+    fn clicking_a_tab_for_a_changed_file_works_too() {
+        let dir = TempDir::new("pin-diff-click");
+        let mut app = diff_review_app(&dir.0);
+        app.handle_key(key(KeyCode::Char('=')));
+        let doc = outside_doc("clicked", "# Clicked\n");
+        app.handle_paste(doc.to_string_lossy().into_owned());
+        assert!(app.preview.is_some());
+
+        // The row records a click target per tab; use the one for tab 1.
+        assert!(app.activate(ButtonId::PinTab(0)));
+
+        assert!(app.preview.is_none(), "back to the diff");
+        assert_eq!(app.active_pin(), Some(0));
+        std::fs::remove_dir_all(doc.parent().unwrap()).ok();
+    }
+
+    /// A markdown file *in the changeset* has the same problem in
+    /// reverse: its tab has to show its own document, not whichever one
+    /// happens to be open.
+    #[test]
+    fn a_tab_for_a_changed_markdown_file_shows_that_file() {
+        let dir = TempDir::new("pin-md-swap");
+        let mut app = md_review_app(&dir.0, "# The plan\n\nin the changeset\n");
+        app.diff = Some(FileDiff::compute(
+            Some("# The plan\n"),
+            Some("# The plan\n"),
+        ));
+        app.rebuild_display();
+        app.handle_key(key(KeyCode::Char('=')));
+        assert_eq!(app.pins.len(), 1);
+
+        let doc = outside_doc("other", "# Other\n\nnot the plan\n");
+        app.handle_paste(doc.to_string_lossy().into_owned());
+        let pv = app.preview.as_ref().expect("the other document");
+        assert!(pv.src.contains("not the plan"));
+
+        app.handle_key(key(KeyCode::Char('1')));
+
+        let pv = app.preview.as_ref().expect("still a document");
+        assert!(
+            pv.src.contains("in the changeset"),
+            "but the one this tab is for: {}",
+            pv.src
+        );
+        assert_eq!(app.active_pin(), Some(0));
+        std::fs::remove_dir_all(doc.parent().unwrap()).ok();
+    }
+
+    /// Every character of `text` as its own key event — what a terminal
+    /// that does not use bracketed paste sends when a file is dropped on
+    /// it. Warp does this; Ghostty sends one paste instead.
+    fn typed(text: &str) -> Vec<Event> {
+        text.chars()
+            .map(|c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)))
+            .collect()
+    }
+
+    /// The bug this fixes: dropped on a terminal that types the path in,
+    /// the leading `/` opened the search prompt and the rest of the path
+    /// filled the query box along the bottom of the window. The file
+    /// never opened.
+    #[test]
+    fn a_drop_typed_one_character_at_a_time_still_opens() {
+        let dir = TempDir::new("typed-drop");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        app.diff = Some(FileDiff::compute(Some("# Plan\n"), Some("# Plan\n")));
+        app.rebuild_display();
+        let away = std::env::temp_dir().join("loupe-pins-typed");
+        std::fs::create_dir_all(&away).unwrap();
+        let doc = away.join("typed-note.md");
+        std::fs::write(&doc, "# Typed note\n\nnot a search term\n").unwrap();
+
+        app.handle_events(typed(&doc.to_string_lossy()));
+
+        assert!(!app.find.typing, "the search prompt did not open");
+        assert!(app.find.query.is_empty(), "and swallowed no path");
+        assert_eq!(app.pins.len(), 1, "the drop made a tab");
+        let pv = app.preview.as_ref().expect("and opened the document");
+        assert!(pv.src.contains("not a search term"));
+        std::fs::remove_dir_all(&away).ok();
+    }
+
+    /// The same, with the spellings terminals use for a path that has a
+    /// space in it, and with the trailing space several of them add.
+    #[test]
+    fn a_typed_drop_survives_quotes_and_escapes() {
+        let dir = TempDir::new("typed-quoted");
+        let away = std::env::temp_dir().join("loupe-pins-typed-space");
+        std::fs::create_dir_all(&away).unwrap();
+        let doc = away.join("my notes.md");
+        std::fs::write(&doc, "# Spaced\n").unwrap();
+        let raw = doc.to_string_lossy().into_owned();
+        // A path with a space arrives quoted or escaped — never bare,
+        // because bare is genuinely two paths.
+        let plain = away.join("plain.md");
+        std::fs::write(&plain, "# Plain\n").unwrap();
+        for text in [
+            format!("'{raw}'"),
+            format!("\"{raw}\""),
+            raw.replace(' ', "\\ "),
+            // The trailing space several terminals add after the path.
+            format!("{} ", plain.to_string_lossy()),
+        ] {
+            let mut app = md_review_app(&dir.0, "# Plan\n");
+            app.handle_events(typed(&text));
+            assert_eq!(app.pins.len(), 1, "{text}");
+            assert!(app.preview.is_some(), "{text}");
+        }
+        std::fs::remove_dir_all(&away).ok();
+    }
+
+    /// The guard that makes the whole thing safe: a burst of keys that is
+    /// not a real path is still just keys. `/` opens the search prompt,
+    /// as it always did.
+    #[test]
+    fn a_typed_burst_that_is_not_a_path_is_still_typed() {
+        let dir = TempDir::new("typed-search");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        app.diff = Some(FileDiff::compute(Some("# Plan\n"), Some("# Plan\n")));
+        app.rebuild_display();
+
+        // Someone searching for a word, fast enough to land in one batch.
+        app.handle_events(typed("/needle"));
+
+        assert!(app.find.typing, "the search prompt opened");
+        assert_eq!(app.find.query, "needle");
+        assert!(app.pins.is_empty(), "and nothing was pinned");
+    }
+
+    /// A path that does not exist is not a drop either — it is someone
+    /// searching for something that looks like a path.
+    #[test]
+    fn a_typed_path_that_is_not_there_is_not_a_drop() {
+        let dir = TempDir::new("typed-missing");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        app.diff = Some(FileDiff::compute(Some("# Plan\n"), Some("# Plan\n")));
+        app.rebuild_display();
+        app.handle_events(typed("/definitely/not/here.md"));
+        assert!(app.find.typing, "it is a search, not a drop");
+        assert_eq!(app.find.query, "definitely/not/here.md");
+        assert!(app.pins.is_empty());
+    }
+
+    /// Ordinary single key presses still go through the batch path
+    /// untouched — that is most of what the loop ever carries.
+    #[test]
+    fn single_keys_are_unaffected_by_the_batch() {
+        let dir = TempDir::new("typed-single");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        app.handle_events(vec![Event::Key(KeyEvent::new(
+            KeyCode::Char('P'),
+            KeyModifiers::NONE,
+        ))]);
+        let pv = app.preview.as_ref().expect("P still opens the preview");
+        assert_eq!(pv.path, "PLAN.md");
+    }
+
+    /// The event loop waits a moment for the rest of a path only when the
+    /// batch really looks like one starting. One key press never waits.
+    #[test]
+    fn only_a_path_shaped_burst_waits_for_more() {
+        assert!(!partial_typed_path(&typed("/")), "one key is not a path");
+        assert!(!partial_typed_path(&typed("jk")), "nor two motions");
+        assert!(
+            partial_typed_path(&typed("/U")),
+            "an absolute path might be"
+        );
+        assert!(partial_typed_path(&typed("~/")), "so might a home path");
+        assert!(partial_typed_path(&typed("'/")), "and a quoted one");
+        assert!(partial_typed_path(&typed("fil")), "and a file:// URL");
+        // A modifier means a command, so the batch is never a path.
+        assert!(!partial_typed_path(&[Event::Key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL
+        ))]));
+    }
+
+    /// The rule that lets paste stay paste: text that is not a path goes
+    /// where the keyboard is, and pins nothing.
+    #[test]
+    fn pasted_text_is_not_a_drop() {
+        let dir = TempDir::new("drop-text");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        app.handle_key(key(KeyCode::Char('P')));
+        app.handle_key(key(KeyCode::Char('P'))); // preview → source
+        assert!(app.editor.is_some(), "the editor is open");
+
+        app.handle_paste("let x = 1;".into());
+
+        assert!(app.pins.is_empty(), "nothing was pinned");
+        let ed = app.editor.as_ref().expect("still in the editor");
+        assert!(ed.content().contains("let x = 1;"), "it was pasted");
+        assert!(ed.dirty, "and counts as an edit");
+    }
+
+    /// `=` pins what is in front of the reader, and `-` takes it back.
+    #[test]
+    fn the_pin_key_adds_and_removes_a_tab() {
+        let dir = TempDir::new("pin-key");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        app.handle_key(key(KeyCode::Char('=')));
+        assert_eq!(app.pins.len(), 1);
+        assert_eq!(app.pins.items[0].path, "PLAN.md", "named against the repo");
+        assert!(!app.pins.items[0].outside);
+        assert!(app.current_is_pinned(), "the 📌 button reads as pressed");
+
+        app.handle_key(key(KeyCode::Char('-')));
+        assert!(app.pins.is_empty(), "and unpinned again");
+        assert!(!app.current_is_pinned());
+    }
+
+    /// A digit opens that tab; a digit past the end says so rather than
+    /// doing nothing.
+    #[test]
+    fn a_digit_opens_the_tab_it_names() {
+        let dir = TempDir::new("pin-digit");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        let away = std::env::temp_dir().join("loupe-pins-digit");
+        std::fs::create_dir_all(&away).unwrap();
+        let doc = away.join("design.md");
+        std::fs::write(&doc, "# Design\n\nthe shape of it\n").unwrap();
+        app.handle_paste(doc.to_string_lossy().into_owned());
+        app.close_preview();
+        assert!(app.preview.is_none(), "back in the diff");
+
+        app.handle_key(key(KeyCode::Char('1')));
+        let pv = app.preview.as_ref().expect("tab 1 opened");
+        assert!(pv.src.contains("the shape of it"));
+
+        app.handle_key(key(KeyCode::Char('4')));
+        assert!(app.status_err, "it says so: {}", app.status);
+        assert!(app.status.contains("no tab 4"));
+        std::fs::remove_dir_all(&away).ok();
+    }
+
+    /// Closing the tab the reader is inside puts them back in the review
+    /// rather than leaving them in a document with no tab.
+    #[test]
+    fn closing_the_open_tab_returns_to_the_diff() {
+        let dir = TempDir::new("pin-close");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        let away = std::env::temp_dir().join("loupe-pins-close");
+        std::fs::create_dir_all(&away).unwrap();
+        let doc = away.join("read-me.md");
+        std::fs::write(&doc, "# Read me\n").unwrap();
+        app.handle_paste(doc.to_string_lossy().into_owned());
+        assert!(app.preview.is_some());
+
+        app.handle_key(key(KeyCode::Char('-')));
+
+        assert!(app.pins.is_empty(), "the tab is gone");
+        assert!(app.preview.is_none(), "and so is the document");
+        assert!(doc.is_file(), "the file itself is untouched");
+        std::fs::remove_dir_all(&away).ok();
+    }
+
+    /// A dropped file that is not markdown opens in the editor, and it is
+    /// a real editor: outside the repository or not, Ctrl+S writes it.
+    #[test]
+    fn a_dropped_source_file_opens_in_the_editor() {
+        let dir = TempDir::new("drop-source");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        let away = std::env::temp_dir().join("loupe-pins-source");
+        std::fs::create_dir_all(&away).unwrap();
+        let src = away.join("snippet.rs");
+        std::fs::write(&src, "fn main() {}\n").unwrap();
+
+        app.handle_paste(src.to_string_lossy().into_owned());
+
+        assert!(app.preview.is_none(), "not a document");
+        let ed = app.editor.as_ref().expect("the editor holds it");
+        assert!(ed.standalone, "it is not part of the changeset");
+        assert!(!ed.read_only, "and it can be saved");
+        assert_eq!(ed.abs_path, std::fs::canonicalize(&src).unwrap());
+        std::fs::remove_dir_all(&away).ok();
+    }
+
+    /// Two files dropped together both get a tab, and the first opens.
+    #[test]
+    fn dropping_two_files_pins_both() {
+        let dir = TempDir::new("drop-two");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        let away = std::env::temp_dir().join("loupe-pins-two");
+        std::fs::create_dir_all(&away).unwrap();
+        let a = away.join("one.md");
+        let b = away.join("two.md");
+        std::fs::write(&a, "# One\n").unwrap();
+        std::fs::write(&b, "# Two\n").unwrap();
+
+        app.handle_paste(format!("{} {}", a.to_string_lossy(), b.to_string_lossy()));
+
+        assert_eq!(app.pins.len(), 2);
+        assert_eq!(app.active_pin(), Some(0), "the first one opened");
+        assert!(app.status.contains("1 more pinned"), "{}", app.status);
+        std::fs::remove_dir_all(&away).ok();
+    }
+
+    /// A tab for a file the change touches opens its diff, not a copy of
+    /// the file: during a review that is what coming back to it means.
+    #[test]
+    fn a_tab_for_a_changed_file_goes_to_its_diff() {
+        let dir = TempDir::new("pin-changed");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        app.handle_key(key(KeyCode::Char('=')));
+        assert_eq!(app.pins.len(), 1);
+        assert!(!app.pins.items[0].outside, "it is a repository file");
+        // Already the file under the cursor with its diff loaded, so the
+        // tab renders it rather than paying for a second load.
+        app.diff = Some(FileDiff::compute(Some("# Plan\n"), Some("# Plan\n")));
+        app.handle_key(key(KeyCode::Char('1')));
+        let pv = app.preview.as_ref().expect("markdown opens as a document");
+        assert!(!pv.standalone, "the diff is still behind it");
+    }
+
+    /// The path box is the way in when a terminal cannot report a drop.
+    #[test]
+    fn the_path_box_opens_a_file_from_anywhere() {
+        let dir = TempDir::new("path-box");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        let away = std::env::temp_dir().join("loupe-pins-box");
+        std::fs::create_dir_all(&away).unwrap();
+        let doc = away.join("typed.md");
+        std::fs::write(&doc, "# Typed\n\nby hand\n").unwrap();
+
+        app.handle_key(ctrl(KeyCode::Char('o')));
+        assert!(matches!(app.overlay, Overlay::OpenPath(_)));
+        for ch in doc.to_string_lossy().chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(app.overlay, Overlay::None), "the box closed");
+        assert_eq!(app.pins.len(), 1);
+        let pv = app.preview.as_ref().expect("it opened");
+        assert!(pv.src.contains("by hand"));
+        std::fs::remove_dir_all(&away).ok();
+    }
+
+    /// A path the box cannot resolve leaves the box open with the reason,
+    /// rather than closing on a typo.
+    #[test]
+    fn the_path_box_keeps_a_bad_path_on_screen() {
+        let dir = TempDir::new("path-bad");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        app.handle_key(ctrl(KeyCode::Char('o')));
+        for ch in "/definitely/not/here.md".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.overlay, Overlay::OpenPath(_)), "still open");
+        assert!(app.status_err, "it says why: {}", app.status);
+        assert!(app.pins.is_empty());
+    }
+
+    /// Pinning the same file twice is one tab, not two.
+    #[test]
+    fn pinning_the_same_file_twice_is_one_tab() {
+        let dir = TempDir::new("pin-twice");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        let away = std::env::temp_dir().join("loupe-pins-twice");
+        std::fs::create_dir_all(&away).unwrap();
+        let doc = away.join("same.md");
+        std::fs::write(&doc, "# Same\n").unwrap();
+        let text = doc.to_string_lossy().into_owned();
+        app.handle_paste(text.clone());
+        app.handle_paste(text);
+        assert_eq!(app.pins.len(), 1);
+        std::fs::remove_dir_all(&away).ok();
+    }
+
+    /// A tab does not get to throw away work the reader has not saved.
+    #[test]
+    fn an_unsaved_editor_blocks_a_tab_switch() {
+        let dir = TempDir::new("pin-dirty");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        let away = std::env::temp_dir().join("loupe-pins-dirty");
+        std::fs::create_dir_all(&away).unwrap();
+        let doc = away.join("held.md");
+        std::fs::write(&doc, "# Held\n").unwrap();
+        app.handle_paste(doc.to_string_lossy().into_owned());
+        app.close_preview();
+        // Open the changeset file in the editor and change it.
+        app.handle_key(key(KeyCode::Char('P')));
+        app.handle_key(key(KeyCode::Char('P')));
+        app.editor.as_mut().expect("the editor").dirty = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT));
+
+        assert!(app.status_err, "it refuses and says why: {}", app.status);
+        assert!(app.editor.is_some(), "the unsaved text is still there");
+        std::fs::remove_dir_all(&away).ok();
     }
 
     #[test]

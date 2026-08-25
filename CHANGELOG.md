@@ -9,6 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pinned files, and a row of tabs to hold them.** A review sends you
+  away from the file you were reading — to the plan file an agent is
+  still writing, to the design note that says why the change looks like
+  this. The file panel only lists what the change touches, so none of
+  those were one key away, and half of them were not in the repository at
+  all.
+
+  - **A tab row under the top bar.** One tab per pinned file, numbered.
+    `=` pins whatever is in front of you (a document, an editor buffer,
+    or the file under the panel cursor), `1`–`9` open a tab, `,` and `.`
+    step through them, and `-` unpins the one you are reading. Click a
+    tab to open it, its `✕` to unpin it, or middle-click it. The same
+    keys with `Alt` work from inside the editor, where a bare key is a
+    letter. The row takes no height at all until something is pinned.
+  - **Drop a file on the window to read it.** Drag a `.md` file onto
+    loupe and it pins it and renders it, from anywhere on the machine —
+    `~/Downloads`, another checkout, a scratch directory. Nothing is
+    copied into the repository, so there is nothing to remember not to
+    commit. Drop several at once and each gets a tab.
+  - **Both kinds of terminal.** Terminals answer a drop in one of two
+    ways, and loupe now reads both. Ghostty, iTerm2 and Terminal.app wrap
+    the path in bracketed paste, which loupe turns on — so a paste into
+    the editor, a comment, or the finder also arrives whole now instead
+    of as a burst of keystrokes. Warp writes the path in as if it had
+    been typed, one key at a time; loupe reads each batch of input for a
+    path before dispatching any of it. Read as ordinary keys, the leading
+    `/` of the path opened the search prompt and the rest of the path
+    filled the query box along the bottom of the window — the file never
+    opened.
+  - **Files from outside are marked.** A `↗` on the tab, because "the
+    plan file" means a different document depending on the answer.
+  - **Any file, not only markdown.** A markdown tab renders as a
+    document; a tab for a file the change touches opens its diff; any
+    other opens in the editor, and `Ctrl+S` saves it — outside the
+    repository or not.
+  - **`Ctrl+O` opens a file by path.** Type or paste one, absolute, `~`,
+    or relative to the repository root. It is the way in on a terminal
+    that cannot report a drop, and the fast way to follow a path an agent
+    just printed.
+  - **The tabs come back.** They are written to `.git/loupe/pins.json` as
+    they change, so quitting loupe does not cost you the row. A pin whose
+    file has since been deleted drops out on read rather than becoming a
+    tab that fails on every click.
+
+- **rust-analyzer was reported as installed when it was not.** rustup
+  keeps a stand-in in `~/.cargo/bin` for every tool it *could* provide,
+  installed or not: on a machine that never added the component,
+  `~/.cargo/bin/rust-analyzer` is still there as a link to `rustup`
+  itself. Loupe looked for a file at that path, found one, and believed
+  it — so `loupe --lsp` printed a ✓ beside Rust, the help overlay called
+  it installed, and `gd` / `gr` / `K` on a `.rs` file failed with
+  rustup's "Unknown binary" error instead of quietly falling back to
+  pattern matching. Anything that resolves to rustup is now checked with
+  `rustup which` before it is believed, and the answer is kept for the
+  session. `loupe --lsp` also says "not installed" rather than "not found
+  on PATH", which was the wrong place to send people looking.
+
+- **The first thing you typed after launch was thrown away** (macOS).
+  Loupe asks the terminal for its background color at startup, and asked
+  down a second handle on `/dev/tty`. Opening and closing another
+  descriptor on the same terminal disturbs the registration the event
+  reader holds on stdin, and the next input to arrive — whenever it
+  arrived — was swallowed re-arming it. A first key press is easy to miss
+  and press again; a first dropped file simply vanished. The query now
+  goes out on the terminal loupe already owns.
+
 - **Reviews, not just comments.** Loupe could say something about a line;
   it had no way to say anything about the pull request, or to approve one.
 

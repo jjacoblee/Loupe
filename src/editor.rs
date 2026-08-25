@@ -120,9 +120,7 @@ impl CompletionState {
             .all
             .iter()
             .enumerate()
-            .filter(|(_, c)| {
-                needle.is_empty() || c.label.to_lowercase().starts_with(&needle)
-            })
+            .filter(|(_, c)| needle.is_empty() || c.label.to_lowercase().starts_with(&needle))
             .map(|(i, _)| i)
             .collect();
         self.sel = 0;
@@ -335,7 +333,9 @@ impl Editor {
     /// After a keystroke: narrow the open popup, or close it when the
     /// cursor has left the word it belongs to.
     pub fn update_completion(&mut self) {
-        let Some(state) = &self.completion else { return };
+        let Some(state) = &self.completion else {
+            return;
+        };
         let (row, col) = self.textarea.cursor();
         if row != state.start.0 || col < state.start.1 {
             self.completion = None;
@@ -534,7 +534,9 @@ impl Editor {
     /// the cursor is near the bottom).
     fn render_completion(&self, f: &mut Frame) {
         let p = palette();
-        let Some(state) = &self.completion else { return };
+        let Some(state) = &self.completion else {
+            return;
+        };
         if state.len() == 0 {
             return;
         }
@@ -655,10 +657,9 @@ impl Editor {
             cells.push((ch, Style::default().fg(p.gutter)));
         }
         match worst {
-            Some(d) if d.is_error() => cells.push((
-                '●',
-                Style::default().fg(p.err).add_modifier(Modifier::BOLD),
-            )),
+            Some(d) if d.is_error() => {
+                cells.push(('●', Style::default().fg(p.err).add_modifier(Modifier::BOLD)))
+            }
             Some(_) => cells.push(('▲', Style::default().fg(p.stage_partial))),
             None => cells.push((' ', Style::default().fg(p.gutter))),
         }
@@ -1050,7 +1051,11 @@ mod tests {
             message: message.into(),
             code: None,
         };
-        e.diagnostics = vec![d(1, 2, "just a warning"), d(1, 1, "a real error"), d(2, 3, "info")];
+        e.diagnostics = vec![
+            d(1, 2, "just a warning"),
+            d(1, 1, "a real error"),
+            d(2, 3, "info"),
+        ];
         assert_eq!(e.diagnostic_on(1).unwrap().message, "a real error");
         assert!(e.diagnostic_on(1).unwrap().is_error());
         assert_eq!(e.diagnostic_on(3), None);

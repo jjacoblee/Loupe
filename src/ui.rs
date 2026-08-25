@@ -28,10 +28,14 @@ const MENU_MIN_H: u16 = 8;
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.layout = Default::default();
     let area = f.area();
+    // The tab row only takes a line when something is pinned, so a reader
+    // who never pins a file never pays for the feature.
+    let tabs = u16::from(!app.pins.is_empty());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(tabs),
             Constraint::Min(3),
             Constraint::Length(1),
         ])
@@ -40,14 +44,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::PrList => {
             draw_topbar_prlist(f, app, chunks[0]);
-            draw_pr_list(f, app, chunks[1]);
+            draw_pr_list(f, app, chunks[2]);
         }
         Screen::Review => {
             draw_topbar_review(f, app, chunks[0]);
-            draw_review(f, app, chunks[1]);
+            draw_review(f, app, chunks[2]);
         }
     }
-    draw_status(f, app, chunks[2]);
+    if tabs > 0 {
+        draw_pin_tabs(f, app, chunks[1]);
+    }
+    draw_status(f, app, chunks[3]);
 
     match &app.overlay {
         Overlay::None => {}
@@ -67,6 +74,167 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::ReviewConfirm(_) => draw_review_confirm(f, app, area),
         Overlay::VerdictMenu => draw_verdict_menu(f, app, area),
         Overlay::Menu(_) => draw_menu(f, app, area),
+        Overlay::OpenPath(_) => draw_open_path(f, app, area),
+    }
+}
+
+// ------------------------------------------------------- pinned-file tabs
+
+/// The row of pinned files under the top bar.
+///
+/// One tab per pinned file: its number, its name, and a ✕ that unpins it.
+/// A file that lives outside the repository carries a `↗`, because "the
+/// plan file" means a different document depending on the answer, and the
+/// row is the only place that says so.
+fn draw_pin_tabs(f: &mut Frame, app: &mut App, area: Rect) {
+    let p = palette();
+    app.layout.pin_row = area;
+    let open = app.active_pin();
+    // Take a copy of what each tab says before drawing: the draw needs
+    // `app` mutably to record the click targets.
+    let labels = app.pins.labels();
+    let outside: Vec<bool> = app.pins.items.iter().map(|i| i.outside).collect();
+    let width = |s: &str| disp_width(s) as u16;
+    // " 1 name ✕ " — the number, the name, the close mark, and the spaces
+    // that keep two tabs from reading as one.
+    let tab_w = |i: usize| {
+        let mark = if outside[i] { 2 } else { 0 };
+        width(&labels[i]) + width(&format!("{} ", i + 1)) + mark + 4
+    };
+
+    // Keep the open tab on screen. A narrow window shows a window onto
+    // the row rather than a squeezed version of all of it.
+    let total: u16 = (0..labels.len()).map(tab_w).sum();
+    let mut first = app.pins.scroll.min(labels.len().saturating_sub(1));
+    if total > area.width {
+        if let Some(at) = open {
+            if at < first {
+                first = at;
+            } else {
+                // Walk the start forward until the open tab fits.
+                while first < at {
+                    let shown: u16 = (first..=at).map(tab_w).sum();
+                    if shown <= area.width.saturating_sub(2) {
+                        break;
+                    }
+                    first += 1;
+                }
+            }
+        }
+    } else {
+        first = 0;
+    }
+    app.pins.scroll = first;
+
+    // Paint the whole row first: a tab that scrolls away must not leave
+    // its old text behind.
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ".repeat(area.width as usize),
+            Style::default().bg(p.btn_bg),
+        ))),
+        area,
+    );
+
+    let mut x = area.x;
+    // A `‹` when tabs have scrolled off the left, so the row admits it.
+    if first > 0 && area.width > 2 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "‹",
+                Style::default().bg(p.btn_bg).fg(p.dim),
+            ))),
+            Rect {
+                x,
+                y: area.y,
+                width: 1,
+                height: 1,
+            },
+        );
+        x += 1;
+    }
+    let right = area.x + area.width;
+    let mut hidden = 0usize;
+    for i in first..labels.len() {
+        let w = tab_w(i);
+        if x + w > right.saturating_sub(1) {
+            hidden = labels.len() - i;
+            break;
+        }
+        let active = open == Some(i);
+        let (bg, fg) = if active {
+            (p.btn_active_bg, p.btn_active_fg)
+        } else {
+            (p.btn_bg, p.btn_fg)
+        };
+        let base = Style::default().bg(bg).fg(fg);
+        let mut spans = vec![
+            Span::styled(" ", base),
+            Span::styled(
+                format!("{} ", i + 1),
+                Style::default().bg(bg).fg(if active { fg } else { p.dim }),
+            ),
+        ];
+        if outside[i] {
+            // One mark, in the color the review already uses for "this is
+            // not part of what you are reviewing".
+            spans.push(Span::styled("↗ ", Style::default().bg(bg).fg(p.accent)));
+        }
+        spans.push(Span::styled(
+            labels[i].clone(),
+            if active {
+                base.add_modifier(Modifier::BOLD)
+            } else {
+                base
+            },
+        ));
+        spans.push(Span::styled(" ", base));
+        spans.push(Span::styled(
+            "✕",
+            Style::default()
+                .bg(bg)
+                .fg(if active { fg } else { p.faint }),
+        ));
+        spans.push(Span::styled(" ", base));
+        let rect = Rect {
+            x,
+            y: area.y,
+            width: w,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(Line::from(spans)), rect);
+        // The ✕ is the second-to-last column of the tab; everything else
+        // in it opens the file. `button_at` takes the first rect that
+        // holds the click, so the ✕ has to be recorded first.
+        app.layout.buttons.push((
+            Rect {
+                x: x + w - 2,
+                y: area.y,
+                width: 1,
+                height: 1,
+            },
+            ButtonId::PinClose(i),
+        ));
+        app.layout.buttons.push((rect, ButtonId::PinTab(i)));
+        x += w;
+    }
+    // A `›` and a count for the tabs that did not fit — silently dropping
+    // them would make the row lie about how many files are pinned.
+    if hidden > 0 {
+        let note = format!("›{hidden}");
+        let w = width(&note).min(area.width);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                note,
+                Style::default().bg(p.btn_bg).fg(p.dim),
+            ))),
+            Rect {
+                x: right.saturating_sub(w),
+                y: area.y,
+                width: w,
+                height: 1,
+            },
+        );
     }
 }
 
@@ -417,6 +585,9 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
             reserve,
             &[
                 ("✎ Source", ButtonId::PreviewToggle, false),
+                // Pressed while this document already has a tab, so the
+                // button says which of the two things it will do.
+                ("📌", ButtonId::PinToggle, app.current_is_pinned()),
                 ("⟳", ButtonId::Refresh, false),
                 ("✕ Close", ButtonId::PreviewClose, false),
                 ("☰", ButtonId::Menu, menu_open(app)),
@@ -452,6 +623,7 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
                 buttons.push(("📖 Preview", ButtonId::PreviewToggle, false));
             }
             buttons.push(("✎ Edit", ButtonId::Edit, false));
+            buttons.push(("📌", ButtonId::PinToggle, app.current_is_pinned()));
         }
         buttons.push(("⟳", ButtonId::Refresh, app.refreshing()));
         buttons.push(("☰", ButtonId::Menu, menu_open(app)));
@@ -2062,6 +2234,76 @@ fn draw_revert_prompt(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// The "open a file by path" box (`Ctrl+O`).
+///
+/// It exists for the two cases a drop cannot cover: a terminal that does
+/// not report drops at all, and a path an agent has just printed, which
+/// is faster to paste than to find in a file browser and drag.
+fn draw_open_path(f: &mut Frame, app: &mut App, area: Rect) {
+    let Overlay::OpenPath(box_) = &app.overlay else {
+        return;
+    };
+    let p = palette();
+    let w = (area.width.saturating_sub(8)).clamp(24, 80);
+    let rect = centered(area, w, 7);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .title(" 📌 Open a file ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let field_w = inner.width.saturating_sub(2) as usize;
+    // Scroll the text so the caret stays in view on a long path.
+    let chars: Vec<char> = box_.input.chars().collect();
+    let from = box_.caret.saturating_sub(field_w.saturating_sub(1));
+    let shown: String = chars[from.min(chars.len())..]
+        .iter()
+        .take(field_w)
+        .collect();
+    let caret_col = (box_.caret - from).min(field_w) as u16;
+
+    let hint = if box_.input.trim().is_empty() {
+        "Type a path, or paste one. A relative path is read from the repository root."
+    } else {
+        "Enter opens and pins it · Esc cancels"
+    };
+    let text = vec![
+        Line::from(Span::styled(
+            "Any file on this machine — it does not have to be in the repository.",
+            Style::default().fg(p.dim),
+        )),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("› ", Style::default().fg(p.accent)),
+            Span::styled(shown, Style::default().fg(p.text)),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(hint, Style::default().fg(p.faint))),
+    ];
+    f.render_widget(Paragraph::new(text), inner);
+    // A real caret, so the box reads as a text field rather than a label.
+    f.set_cursor_position((inner.x + 2 + caret_col, inner.y + 2));
+
+    let btn_area = Rect {
+        x: inner.x,
+        y: inner.y + inner.height.saturating_sub(1),
+        width: inner.width,
+        height: 1,
+    };
+    buttons_right(
+        f,
+        app,
+        btn_area,
+        0,
+        &[
+            ("Open (Enter)", ButtonId::OpenPathGo, true),
+            ("Cancel (Esc)", ButtonId::OpenPathCancel, false),
+        ],
+    );
+}
+
 /// The file-panel right-click menu. It is drawn at the pointer rather
 /// than centred, because it is about one row and the answer to "which
 /// row?" is where the pointer is.
@@ -3025,15 +3267,6 @@ fn draw_finder(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let p = palette();
-    let rect = centered(area, 108.min(area.width), 55.min(area.height));
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(p.accent))
-        .title(" Help — loupe ");
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
     let head = Style::default().fg(p.text).add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(p.dim);
     let key = Style::default().fg(p.key);
@@ -3127,6 +3360,27 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         row(
             ("0 / $", "first / last column"),
             ("] / [", "next / previous file"),
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Pinned files — the tab row at the top",
+            head,
+        )),
+        row(
+            ("drag a file onto loupe", "pin it and read it, from anywhere"),
+            ("Ctrl+O", "open a file by path instead"),
+        ),
+        row(
+            ("=", "pin / unpin the file you are on"),
+            ("-", "unpin the one you are reading"),
+        ),
+        row(
+            ("1 … 9", "open that tab"),
+            (", / .", "previous / next tab"),
+        ),
+        row(
+            ("click a tab / its ✕", "open it / unpin it"),
+            ("Alt+ the same keys", "from inside the editor"),
         ),
         Line::from(""),
         Line::from(Span::styled("Find", head)),
@@ -3244,6 +3498,22 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         // What gd / gr / K can actually answer right now, and why not.
         Line::from(Span::styled(format!("  Language servers: {servers}"), dim)),
     ];
+
+    // The box is as tall as the list, rather than a number kept in step
+    // with it by hand: a reference that silently loses its last line as
+    // it grows is worse than one that is a row taller.
+    let rect = centered(
+        area,
+        108.min(area.width),
+        (lines.len() as u16 + 2).min(area.height),
+    );
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .title(" Help — loupe ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -3778,6 +4048,122 @@ mod tests {
         app.pr = None;
         let screen = screen_of(&mut app, 110, 24);
         assert!(!screen.contains("Summary of this review"), "{screen}");
+    }
+
+    /// A review with two pinned files: one in the repository, one from
+    /// somewhere else on the machine.
+    fn pinned_app() -> App {
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.repo_root = "/repo".into();
+        app.files = vec![changed("src/app.rs", false)];
+        app.rebuild_entries();
+        app.pins
+            .add(crate::pins::Pin::new(
+                std::path::Path::new("/repo"),
+                "/repo/docs/PLAN.md".into(),
+            ))
+            .unwrap();
+        app.pins
+            .add(crate::pins::Pin::new(
+                std::path::Path::new("/repo"),
+                "/home/me/Downloads/review.md".into(),
+            ))
+            .unwrap();
+        app
+    }
+
+    /// The row names every tab, numbers them for the keyboard, marks the
+    /// one that is not in the repository, and offers a ✕ on each.
+    #[test]
+    fn the_tab_row_lists_the_pinned_files() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = pinned_app();
+        let screen = screen_of(&mut app, 90, 20);
+        let row = screen.lines().nth(1).expect("the row under the top bar");
+        assert!(row.contains("1 PLAN.md"), "{row}");
+        assert!(row.contains("2 ↗ review.md"), "{row}");
+        assert_eq!(row.matches('✕').count(), 2, "one close mark each: {row}");
+    }
+
+    /// Nothing pinned means no row at all — the feature costs no height
+    /// until it is used.
+    #[test]
+    fn no_pins_means_no_tab_row() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = pinned_app();
+        let with = screen_of(&mut app, 90, 20);
+        app.pins.items.clear();
+        let without = screen_of(&mut app, 90, 20);
+        assert!(with.lines().nth(1).unwrap().contains("PLAN.md"));
+        assert!(
+            !without.lines().nth(1).unwrap().contains("PLAN.md"),
+            "the row is gone and the review moved up"
+        );
+    }
+
+    /// A row too narrow for every tab says how many it could not draw,
+    /// rather than quietly showing fewer than are pinned.
+    #[test]
+    fn a_narrow_tab_row_admits_what_it_hides() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = pinned_app();
+        let screen = screen_of(&mut app, 24, 20);
+        let row = screen.lines().nth(1).expect("the row");
+        assert!(row.contains('›'), "it marks the ones off the end: {row}");
+    }
+
+    /// The help overlay lists every key, and it all has to fit on one
+    /// screen: a reference that scrolls is a reference nobody reads.
+    #[test]
+    fn the_help_fits_on_one_screen() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = pinned_app();
+        app.overlay = crate::app::Overlay::Help;
+        let screen = screen_of(&mut app, 120, 80);
+        // The last group is the one most at risk of being cut off.
+        // The very last line of the overlay, which is what one row too
+        // many would push off the bottom.
+        assert!(
+            screen.contains("Language servers:"),
+            "the end of the list is still drawn"
+        );
+        assert!(screen.contains("pin / unpin the file you are on"));
+        assert!(screen.contains("drag a file onto loupe"));
+    }
+
+    /// The 📌 button is two columns wide, and the toolbar has to leave it
+    /// exactly that: an emoji counted as one column paints over its
+    /// neighbour.
+    #[test]
+    fn the_pin_button_sits_in_the_toolbar_without_overlap() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = pinned_app();
+        let bar = screen_of(&mut app, 110, 20)
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(bar.contains("📌"), "the button is drawn: {bar}");
+        // Each toolbar button keeps a blank column on either side, so the
+        // pin never runs into Edit before it or ⟳ after it.
+        assert!(bar.contains(" 📌 "), "it keeps its padding: {bar}");
+        assert!(bar.contains("✎ Edit"), "and Edit is still whole: {bar}");
+        assert!(bar.contains("⟳"), "and so is refresh: {bar}");
+    }
+
+    /// The path box says what it accepts, and offers both buttons.
+    #[test]
+    fn the_open_path_box_explains_itself() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = pinned_app();
+        app.open_path_box();
+        let screen = screen_of(&mut app, 90, 20);
+        assert!(screen.contains("Open a file"), "{screen}");
+        assert!(screen.contains("does not have to be in the repository"));
+        assert!(screen.contains("Open (Enter)"));
+        assert!(screen.contains("Cancel (Esc)"));
     }
 
     /// The preview takes the pane the diff and the editor share, keeps the

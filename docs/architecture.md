@@ -18,6 +18,7 @@ threading model, and the invariants that are easy to break by accident.
 | `editor.rs` | The in-place editor: a custom renderer over `tui-textarea` |
 | `markdown.rs` | Markdown → styled lines: the block/inline parser and the width-dependent layout |
 | `preview.rs` | The preview pane: scrolling, the source-line map, reload, and the scrollbar |
+| `pins.rs` | Pinned files: the tab list, the state file, and reading a dropped path out of a paste |
 | `gitops.rs` | Everything that shells out to `git`: local scans, staging, refs, file content |
 | `github.rs` | Everything that shells out to `gh`: PR lists, details, comments, viewed sync |
 | `highlight.rs` | Syntax highlighting via syntect + two-face: themes, caching, incremental editor highlighting |
@@ -433,6 +434,62 @@ When the branch under review isn't checked out, the working tree belongs
 to some other branch; the text then comes from the commit and the editor
 is marked read-only, because saving would write over an unrelated
 branch's file.
+
+## Pinned files, and files dropped on the window
+
+`pins.rs` owns the tab row. A `Pin` is a path and nothing else: a bookmark,
+never a copy. It is named relative to the repository root when it lives
+inside one, and by its whole path when it does not — the `outside` flag
+that the `↗` on the tab draws from.
+
+**Which tab is open is derived, not stored.** `App::active_pin` asks what
+file is on screen — the preview's, the editor's, or the one under the file
+panel cursor — and looks it up in the row. A reader leaves a document by a
+dozen different doors (Esc, the file panel, a search result, a jump to a
+definition), and a remembered index would have to be cleared in every one
+of them. Derived, it cannot go stale. Both sides of the comparison are
+canonicalized, because a dropped path arrives with its symlinks already
+resolved and one built from the file panel does not — on macOS `/tmp`
+alone is enough to give one file two tabs.
+
+**A drop is a paste — or a burst of keystrokes.** Every terminal answers a
+file dropped on its window by writing that file's path into the program as
+if it had been typed, but not all of them mark it as a paste. Ghostty,
+iTerm2 and Terminal.app wrap it in bracketed paste, which `main.rs` turns
+on, so it arrives as one `Event::Paste`. Warp does not: the path arrives
+as one key event per character.
+
+That second case is why the event loop hands `App::handle_events` a
+*batch* rather than dispatching events one at a time. Read as ordinary
+keys, the leading `/` of a path opens the search prompt and the rest of
+the path lands in the query box — the file never opens, and what the
+reader sees is their own path spelled along the bottom of the window. So
+the batch is read for a path first, by the same rule either way:
+`pins::dropped_paths` accepts the text only when *every* token in it is an
+absolute path to a file that exists. That rule is what
+lets an ordinary paste stay an ordinary paste — a snippet of code, a URL,
+a sentence — and it costs nothing, because a drop is always absolute. The
+tokenizer handles the three spellings terminals use for a path with a
+space in it: backslash-escaped, quoted, and percent-encoded in a `file://`
+URL.
+
+Anything that is *not* a drop goes wherever the keyboard already is — the
+path box, a comment draft, the finder, the review box, or the editor —
+which is how paste came to work properly in all of them.
+
+**Where a tab goes.** A markdown file renders as a document wherever it
+lives. A file the change touches goes through the ordinary
+`spawn_load_file` door, so the diff, the blame pane and the staging state
+all follow; `pin_wants_preview` is the one-shot flag that then opens the
+document on top of it once the file lands. Anything else opens in the
+editor with `standalone` set, which is what makes `Ctrl+S` write straight
+to the path rather than try to refresh a diff that does not exist.
+
+The row lives in `.git/loupe/pins.json`, beside the held comments and for
+the same reasons: it is per-clone state, it must never be committed by
+accident, and it belongs to this checkout. It is rewritten on every change,
+so quitting never costs the reader their tabs, and a pin whose file has
+since been deleted is dropped when it is read back.
 
 ## Talking to git and GitHub
 

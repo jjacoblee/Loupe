@@ -86,6 +86,22 @@ leaving your terminal or touching a browser.
   own when an agent rewrites the file. `Ctrl+P` reaches any `.md` file in
   the repository, and `loupe md <path>` reads one from anywhere on the
   machine.
+- **Pin the files you keep coming back to** — a row of tabs under the top
+  bar. `=` pins whatever is in front of you, `1`–`9` open a tab, `,` and
+  `.` step through them, and `-` unpins the one you are reading. The tabs
+  are per clone and survive quitting loupe, so the plan file you read
+  twenty times a day is one key away every morning.
+- **Drag a file onto loupe and read it** — drop a `.md` file anywhere on
+  the window and loupe pins it and renders it, wherever it lives on the
+  machine. A design note an agent wrote in `~/Documents`, a write-up
+  someone sent you that is still in `~/Downloads` — read it beside the
+  review without first copying it into the repository and then
+  remembering not to commit it. Files outside the repository are marked
+  `↗` in the row so the two never blur together. Drop several at once and
+  they all get a tab. It works whether your terminal marks the drop as a
+  paste (Ghostty, iTerm2, Terminal.app) or types the path in one
+  character at a time (Warp). `Ctrl+O` does the same by typing or pasting
+  a path.
 - **Keeps up with an agent** — local review re-scans the working tree
   whenever you pause, so files a coding agent rewrites under an open
   review appear without a key press. It never interrupts (no re-scan

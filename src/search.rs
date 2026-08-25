@@ -174,7 +174,13 @@ pub fn list_files(root: &Path, rev: Option<&str>) -> Result<Vec<String>> {
     let mut args: Vec<&str> = vec!["-C", &root];
     match rev {
         Some(rev) => args.extend(["ls-tree", "-r", "--name-only", "-z", rev]),
-        None => args.extend(["ls-files", "-z", "--cached", "--others", "--exclude-standard"]),
+        None => args.extend([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ]),
     }
     let out = Command::new("git")
         .args(&args)
@@ -465,8 +471,8 @@ fn lang_of(path: &str) -> Lang {
         "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" | "svelte" | "vue" => Lang::Web,
         "py" | "pyi" => Lang::Python,
         "go" => Lang::Go,
-        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "java" | "cs" | "swift" | "kt" | "kts"
-        | "scala" | "php" | "m" | "mm" => Lang::Brace,
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "java" | "cs" | "swift" | "kt"
+        | "kts" | "scala" | "php" | "m" | "mm" => Lang::Brace,
         "rb" | "rake" => Lang::Ruby,
         "sh" | "bash" | "zsh" | "fish" => Lang::Shell,
         _ => Lang::Other,
@@ -552,7 +558,8 @@ fn is_comment(t: &str, lang: Lang) -> bool {
         || t.starts_with("/*")
         || t.starts_with('*')
         || t.starts_with("--")
-        || (matches!(lang, Lang::Python | Lang::Ruby | Lang::Shell | Lang::Other) && t.starts_with('#'))
+        || (matches!(lang, Lang::Python | Lang::Ruby | Lang::Shell | Lang::Other)
+            && t.starts_with('#'))
 }
 
 /// The definition this line makes, if it makes one: `(name, kind)`.
@@ -731,8 +738,22 @@ pub fn identifiers(text: &str) -> Vec<(usize, String)> {
             || KEYWORDS.iter().any(|(k, _)| *k == word)
             || matches!(
                 word.as_str(),
-                "true" | "false" | "null" | "nil" | "None" | "self" | "this" | "let" | "var"
-                    | "const" | "string" | "number" | "boolean" | "void" | "int" | "bool"
+                "true"
+                    | "false"
+                    | "null"
+                    | "nil"
+                    | "None"
+                    | "self"
+                    | "this"
+                    | "let"
+                    | "var"
+                    | "const"
+                    | "string"
+                    | "number"
+                    | "boolean"
+                    | "void"
+                    | "int"
+                    | "bool"
             );
         if !boring {
             out.push((start, word));
@@ -828,15 +849,35 @@ mod tests {
             ("a.rs", "pub fn handle_click(&self) {", "handle_click", "fn"),
             ("a.rs", "pub(crate) struct Finder {", "Finder", "struct"),
             ("a.rs", "impl App {", "App", "impl"),
-            ("a.ts", "export const handleClick = () => {", "handleClick", "fn"),
+            (
+                "a.ts",
+                "export const handleClick = () => {",
+                "handleClick",
+                "fn",
+            ),
             ("a.ts", "export default function main() {", "main", "fn"),
             ("a.ts", "  interface Props {", "Props", "interface"),
-            ("a.tsx", "  handleClick(event: Event) {", "handleClick", "fn"),
+            (
+                "a.tsx",
+                "  handleClick(event: Event) {",
+                "handleClick",
+                "fn",
+            ),
             ("a.py", "def handle_click(self):", "handle_click", "fn"),
             ("a.py", "class Finder(Base):", "Finder", "class"),
-            ("a.go", "func (s *Server) Handle(w http.ResponseWriter) {", "Handle", "fn"),
+            (
+                "a.go",
+                "func (s *Server) Handle(w http.ResponseWriter) {",
+                "Handle",
+                "fn",
+            ),
             ("a.go", "func New() *Server {", "New", "fn"),
-            ("a.java", "  public void handleClick(Event e) {", "handleClick", "fn"),
+            (
+                "a.java",
+                "  public void handleClick(Event e) {",
+                "handleClick",
+                "fn",
+            ),
         ];
         for (path, line, name, kind) in cases {
             let got = definition(path, line);

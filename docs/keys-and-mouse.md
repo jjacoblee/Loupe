@@ -19,6 +19,9 @@ for the built-in help overlay.
 | `l` | Switch to local-changes review (from the PR list) |
 | `B` or `☰ → Blame column` | Show / hide the blame pane (see [The blame pane](#the-blame-pane)) |
 | `P` | Render the open markdown file as a document (see [Markdown preview](#markdown-preview)) |
+| `=` | Pin the file in front of you to the tab row, or unpin it (see [Pinned files](#pinned-files)) |
+| `1` … `9` | Open that tab |
+| `Ctrl+O` | Open a file by path, from anywhere on the machine |
 | `t` or `☰ → Theme` | Open the theme picker — live preview; Enter keeps & saves, Esc reverts; `a` switches light ⇄ dark |
 | `c` | Cancel a cancellable background load |
 
@@ -513,13 +516,73 @@ source view.
 
 ### Reading a file that is not in the change
 
-Two ways in:
+Four ways in:
 
+- **Drop it on the window.** Drag a `.md` file onto loupe from anywhere
+  on the machine and it is pinned and rendered (see
+  [Pinned files](#pinned-files)).
+- `Ctrl+O` and type or paste a path — the same thing, for a terminal that
+  cannot report a drop.
 - `Ctrl+P` and pick any `.md` file in the repository. A markdown file
   opens as a document rather than in the editor.
 - `loupe md <path>` from the shell, for a file anywhere on the machine —
   a review write-up in a central tree, a note in `/tmp`. There is no
   review behind it, so the document takes the whole window and `q` quits.
+
+## Pinned files
+
+A row of tabs under the top bar, holding the files you keep coming back
+to. It takes no height at all until you pin something.
+
+| Key / mouse | Action |
+| --- | --- |
+| **Drag a file onto the window** | Pin it and open it — from anywhere on the machine |
+| `Ctrl+O` | Open a file by path: absolute, `~/…`, or relative to the repository root |
+| `=` (or `+`) | Pin the file in front of you, or unpin it if it already has a tab |
+| `-` | Unpin the file you are reading |
+| `1` … `9` | Open that tab |
+| `,` / `.` | Previous / next tab, wrapping at each end |
+| Click a tab | Open it |
+| Click its `✕`, or middle-click the tab | Unpin it |
+| Wheel over the row | Step through the tabs |
+| `Alt` + any of the keys above | The same, from inside the editor, where a bare key is a letter |
+| `☰ → Pinned files` | All of it with the mouse, plus a line per tab |
+
+**What a tab opens.** A markdown file renders as a document, wherever it
+lives. A file the change touches opens as its diff — during a review that
+is what coming back to it means. Anything else opens in the editor, and
+`Ctrl+S` saves it, outside the repository or not.
+
+**Files from outside the repository carry a `↗`.** "The plan file" means
+a different document depending on the answer, and the row is the only
+place that says so.
+
+**Dropping.** Every terminal answers a drop by writing the file's path in
+as if you had typed it, and they split into two camps about how.
+
+- **Ghostty, iTerm2, Terminal.app** wrap the path in *bracketed paste*, so
+  it arrives as a single event. Loupe turns bracketed paste on for this.
+- **Warp** sends the path as plain keystrokes, one event per character.
+  Loupe reads each batch of input for a path before dispatching any of it,
+  so the leading `/` never reaches the search prompt.
+
+Either way, the text is read as a drop only when *every* path in it is
+absolute and names a file that exists. That is what lets an ordinary paste
+stay an ordinary paste — a snippet of code, a URL, a sentence — and it
+costs nothing, because a dropped path is always absolute. A path with a
+space in it works in all three spellings terminals use: escaped, quoted,
+and percent-encoded in a `file://` URL.
+
+Drop several files at once and each gets a tab. Nothing is ever copied
+into the repository.
+
+If a drop does nothing at all in your terminal, `Ctrl+O` and paste the
+path does the same job.
+
+**They come back.** The tabs are written to `.git/loupe/pins.json` as they
+change, so quitting loupe does not cost you the row. They are per clone,
+never committed. A pin whose file has since been deleted drops out when
+loupe reads the file back.
 
 ## Theme picker
 

@@ -401,22 +401,37 @@ const DRAIN_TIMEOUT_MS: u64 = 30;
 /// Both replies are read to completion even once the color is in hand.
 /// Anything left in the tty queue would be handed to crossterm a moment
 /// later and typed into the review as if the user had pressed the keys.
+///
+/// The question goes out on the terminal loupe already owns — stdout and
+/// stdin — rather than down a second handle on `/dev/tty`. Opening and
+/// closing another descriptor on the same terminal costs the *first*
+/// thing typed after launch on macOS: it disturbs the registration the
+/// event reader has on stdin, and the next input to arrive is swallowed
+/// re-arming it, whenever it arrives. A file dropped on the window is
+/// exactly that kind of input, so the second handle was the difference
+/// between a drop that opens and a drop that silently vanishes.
+///
+/// stdin is read through `libc::read` rather than [`std::io::Stdin`] for
+/// the neighbouring reason: `Stdin` buffers, and bytes it held back would
+/// never reach the event reader at all.
 #[cfg(unix)]
 fn query_background() -> Option<(u8, u8, u8)> {
-    use std::fs::OpenOptions;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::os::unix::io::AsRawFd;
     use std::time::{Duration, Instant};
 
-    let mut tty = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .ok()?;
-    tty.write_all(b"\x1b]11;?\x07\x1b[c").ok()?;
-    tty.flush().ok()?;
+    let fd = std::io::stdin().as_raw_fd();
+    let out_fd = std::io::stdout().as_raw_fd();
+    // Redirected either way: there is no terminal to ask, and writing the
+    // query into a pipe would only corrupt whatever is reading it.
+    // SAFETY: isatty on two descriptors this process owns.
+    if unsafe { libc::isatty(fd) } != 1 || unsafe { libc::isatty(out_fd) } != 1 {
+        return None;
+    }
+    let mut out = std::io::stdout();
+    out.write_all(b"\x1b]11;?\x07\x1b[c").ok()?;
+    out.flush().ok()?;
 
-    let fd = tty.as_raw_fd();
     let mut deadline = Instant::now() + Duration::from_millis(REPLY_TIMEOUT_MS);
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     let mut chunk = [0u8; 256];
@@ -432,14 +447,16 @@ fn query_background() -> Option<(u8, u8, u8)> {
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: one initialized pollfd, a live fd owned by `tty`.
+        // SAFETY: one initialized pollfd on a descriptor this process owns.
         if unsafe { libc::poll(&mut pfd, 1, left.as_millis() as libc::c_int) } <= 0 {
             break;
         }
-        match tty.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        // SAFETY: `chunk` is live and `chunk.len()` bounds the write.
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+        if n <= 0 {
+            break;
         }
+        buf.extend_from_slice(&chunk[..n as usize]);
         if buf.len() > 4096 {
             break; // something else is writing to the tty; give up
         }

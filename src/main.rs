@@ -10,6 +10,7 @@ mod gitops;
 mod highlight;
 mod lsp;
 mod markdown;
+mod pins;
 mod preview;
 mod search;
 mod theme;
@@ -18,7 +19,9 @@ mod wizard;
 
 use anyhow::Result;
 use app::{App, LaunchMode};
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use std::io::stdout;
 use std::time::Duration;
@@ -252,8 +255,13 @@ fn report_language_servers() {
                 exts.join(" ")
             ),
             None => {
+                // "not installed" rather than "not found on PATH": with
+                // rustup, `rust-analyzer` *is* on PATH as a stand-in for
+                // a component that was never added, and saying it is
+                // missing from PATH sends people looking in the wrong
+                // place. The install line below says what to run.
                 println!(
-                    "  ✗ {:<12} {} not found on PATH\n      {}",
+                    "  ✗ {:<12} {} not installed\n      {}",
                     spec.lang,
                     spec.cmd,
                     exts.join(" ")
@@ -480,7 +488,7 @@ fn run_tui(startup: Startup) -> Result<()> {
     // mouse capture on top and make sure it is torn down too.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(stdout(), DisableMouseCapture);
+        let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
         default_hook(info);
     }));
 
@@ -492,6 +500,12 @@ fn run_tui(startup: Startup) -> Result<()> {
     theme::set_appearance(appearance);
     highlight::set_theme(startup.theme(appearance));
     execute!(stdout(), EnableMouseCapture)?;
+    // Bracketed paste turns a paste — and a file dropped on the terminal
+    // window, which every terminal answers by writing the path in as if
+    // it were typed — into one event instead of a burst of key presses.
+    // A terminal that does not support it simply ignores the request, and
+    // `Ctrl+O` is the way in for the reader who lands there.
+    let _ = execute!(stdout(), EnableBracketedPaste);
 
     let result = (|| {
         if startup.wizard {
@@ -503,7 +517,7 @@ fn run_tui(startup: Startup) -> Result<()> {
         run(&mut terminal, startup)
     })();
 
-    let _ = execute!(stdout(), DisableMouseCapture);
+    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -560,19 +574,29 @@ fn run(terminal: &mut ratatui::DefaultTerminal, startup: Startup) -> Result<()> 
             // Drain every pending event before the next draw: a fast mouse
             // drag or wheel flick delivers dozens of events, which would
             // otherwise each pay a full redraw.
+            //
+            // They are collected rather than dispatched one by one,
+            // because a file dropped on a terminal that does not use
+            // bracketed paste arrives as a whole path's worth of key
+            // events at once, and only the batch shows that (see
+            // [`App::handle_events`]).
+            let mut batch = Vec::new();
             loop {
-                match event::read()? {
-                    Event::Key(key) if key.kind != event::KeyEventKind::Release => {
-                        app.handle_key(key)
-                    }
-                    Event::Mouse(m) => app.handle_mouse(m),
-                    _ => {}
+                batch.push(event::read()?);
+                if event::poll(Duration::ZERO)? {
+                    continue;
                 }
-                dirty = true;
-                if !event::poll(Duration::ZERO)? {
-                    break;
+                // A path typed in one character at a time can straddle
+                // two reads. When what has arrived so far looks like the
+                // start of one, wait a moment for the rest rather than
+                // splitting a drop in half.
+                if app::partial_typed_path(&batch) && event::poll(app::TYPED_DROP_GAP)? {
+                    continue;
                 }
+                break;
             }
+            app.handle_events(batch);
+            dirty = true;
         }
     }
 }

@@ -168,13 +168,65 @@ fn tsserver_path(root: &Path) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// Find an executable on `PATH`, the way a shell would.
+/// Find an executable on `PATH`, the way a shell would — and, for the one
+/// case where a shell would be wrong, check that it is really there.
+///
+/// rustup keeps a proxy in `~/.cargo/bin` for every tool it *could*
+/// provide, installed or not. On a machine that has never added the
+/// `rust-analyzer` component, `~/.cargo/bin/rust-analyzer` is still
+/// sitting there as a link to `rustup` itself, and running it prints
+/// "Unknown binary" and exits 1. A file at that path is therefore not the
+/// same thing as the tool being installed. Loupe used to believe it:
+/// `loupe --lsp` printed a ✓ beside Rust, the help overlay called it
+/// installed, and `gd` / `gr` / `K` on a `.rs` file failed with rustup's
+/// error instead of quietly falling back to pattern matching.
 pub fn which(cmd: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|dir| {
+    let found = std::env::split_paths(&path).find_map(|dir| {
         let candidate = dir.join(cmd);
         candidate.is_file().then_some(candidate)
-    })
+    })?;
+    if is_rustup_proxy(&found) {
+        // Ask rustup which one this is. It answers with the real path
+        // when the component is installed, and fails when it is not.
+        return rustup_which(cmd);
+    }
+    Some(found)
+}
+
+/// True when `path` is one of rustup's stand-ins rather than a real tool:
+/// it resolves to `rustup` itself.
+fn is_rustup_proxy(path: &Path) -> bool {
+    let Ok(real) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    real.file_stem()
+        .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("rustup"))
+}
+
+/// What `rustup which <cmd>` says, or `None` when rustup does not have it.
+///
+/// The answer is kept for the session. [`which`] is asked on every frame
+/// the help overlay is open, and a subprocess per frame is not something
+/// to pay for a question whose answer almost never changes. The price is
+/// that a component installed while loupe is running is not noticed until
+/// it restarts.
+fn rustup_which(cmd: &str) -> Option<PathBuf> {
+    static ANSWERS: Mutex<Option<HashMap<String, Option<PathBuf>>>> = Mutex::new(None);
+    let mut guard = lock(&ANSWERS);
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some(hit) = cache.get(cmd) {
+        return hit.clone();
+    }
+    let answer = Command::new("rustup")
+        .args(["which", cmd])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string()))
+        .filter(|p| p.is_file());
+    cache.insert(cmd.to_string(), answer.clone());
+    answer
 }
 
 /// What `loupe --lsp` reports: every supported server and where (or
@@ -567,10 +619,7 @@ impl Client {
             }),
             INIT_TIMEOUT,
         )?;
-        client.caps = init
-            .get("capabilities")
-            .cloned()
-            .unwrap_or(Value::Null);
+        client.caps = init.get("capabilities").cloned().unwrap_or(Value::Null);
         client.notify("initialized", json!({}))?;
         Ok(client)
     }
@@ -654,7 +703,9 @@ impl Client {
                 bail!(
                     "{}: {}",
                     self.lang,
-                    err.get("message").and_then(Value::as_str).unwrap_or("error")
+                    err.get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("error")
                 );
             }
             return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
@@ -929,11 +980,23 @@ impl Lsp {
         })
     }
 
-    pub fn definition(&self, root: &Path, path: &str, text: &str, at: (usize, usize)) -> Result<Vec<Loc>> {
+    pub fn definition(
+        &self,
+        root: &Path,
+        path: &str,
+        text: &str,
+        at: (usize, usize),
+    ) -> Result<Vec<Loc>> {
         self.locations(root, path, text, at, "textDocument/definition", json!({}))
     }
 
-    pub fn references(&self, root: &Path, path: &str, text: &str, at: (usize, usize)) -> Result<Vec<Loc>> {
+    pub fn references(
+        &self,
+        root: &Path,
+        path: &str,
+        text: &str,
+        at: (usize, usize),
+    ) -> Result<Vec<Loc>> {
         self.locations(
             root,
             path,
@@ -956,7 +1019,10 @@ impl Lsp {
         extra: Value,
     ) -> Result<Vec<Loc>> {
         let uri = uri_of(&root.join(path));
-        let character = utf16_col(nth_line(text, line.saturating_sub(1)), col.saturating_sub(1));
+        let character = utf16_col(
+            nth_line(text, line.saturating_sub(1)),
+            col.saturating_sub(1),
+        );
         let root = root.to_path_buf();
         self.with_client(&root.clone(), path, move |c| {
             c.sync(&uri, path, text)?;
@@ -975,9 +1041,18 @@ impl Lsp {
     }
 
     /// The signature-and-docs blurb for a symbol, as plain text.
-    pub fn hover(&self, root: &Path, path: &str, text: &str, (line, col): (usize, usize)) -> Result<Option<String>> {
+    pub fn hover(
+        &self,
+        root: &Path,
+        path: &str,
+        text: &str,
+        (line, col): (usize, usize),
+    ) -> Result<Option<String>> {
         let uri = uri_of(&root.join(path));
-        let character = utf16_col(nth_line(text, line.saturating_sub(1)), col.saturating_sub(1));
+        let character = utf16_col(
+            nth_line(text, line.saturating_sub(1)),
+            col.saturating_sub(1),
+        );
         self.with_client(root, path, |c| {
             c.sync(&uri, path, text)?;
             let result = c.request_when_ready(
@@ -1080,7 +1155,10 @@ impl Lsp {
         (line, col): (usize, usize),
     ) -> Result<Vec<Completion>> {
         let uri = uri_of(&root.join(path));
-        let character = utf16_col(nth_line(text, line.saturating_sub(1)), col.saturating_sub(1));
+        let character = utf16_col(
+            nth_line(text, line.saturating_sub(1)),
+            col.saturating_sub(1),
+        );
         self.with_client(root, path, |c| {
             if c.caps.get("completionProvider").is_none() {
                 return Ok(Vec::new());
@@ -1170,7 +1248,11 @@ fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
     let message = v.get("message")?.as_str()?.trim().to_string();
     // A multi-line span (a whole unclosed block, say) is marked on its
     // first line only; the message says the rest.
-    let end_col = if end_line == line { end_col } else { usize::MAX };
+    let end_col = if end_line == line {
+        end_col
+    } else {
+        usize::MAX
+    };
     let code = match v.get("code") {
         Some(Value::String(s)) => Some(s.clone()),
         Some(Value::Number(n)) => Some(n.to_string()),
@@ -1289,7 +1371,9 @@ fn is_empty_answer(v: &Value) -> bool {
 /// `documentSymbol` answers with either a tree (`DocumentSymbol[]`) or a
 /// flat list (`SymbolInformation[]`), and which one depends on the server.
 fn collect_symbols(value: &Value, container: Option<&str>, out: &mut Vec<Sym>) {
-    let Some(items) = value.as_array() else { return };
+    let Some(items) = value.as_array() else {
+        return;
+    };
     for item in items {
         let Some(name) = item.get("name").and_then(Value::as_str) else {
             continue;
@@ -1342,7 +1426,9 @@ fn parse_locations(value: &Value, root: &Path) -> Vec<Loc> {
         let (Some(uri), Some(range)) = (uri, range) else {
             continue;
         };
-        let Some(path) = path_of_uri(uri) else { continue };
+        let Some(path) = path_of_uri(uri) else {
+            continue;
+        };
         let line = range
             .pointer("/start/line")
             .and_then(Value::as_u64)
@@ -1411,6 +1497,81 @@ mod tests {
         assert_eq!(language_id("a.mjs"), "javascript");
     }
 
+    /// rustup leaves a stand-in on `PATH` for every tool it could
+    /// provide, so "there is a file here" does not mean the tool is
+    /// installed. Anything that resolves to rustup itself is one of
+    /// those, and has to be checked with rustup rather than believed.
+    #[cfg(unix)]
+    #[test]
+    fn a_rustup_stand_in_is_not_a_real_tool() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("loupe-which-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // What `~/.cargo/bin` looks like: rustup, and a link to it named
+        // after a component that may or may not be installed.
+        let rustup = dir.join("rustup");
+        std::fs::write(&rustup, "#!/bin/sh\nexit 1\n").unwrap();
+        let proxy = dir.join("some-analyzer");
+        symlink(&rustup, &proxy).unwrap();
+        assert!(is_rustup_proxy(&proxy), "a link to rustup is a stand-in");
+
+        // A real tool is itself, and is taken at face value.
+        let real = dir.join("real-server");
+        std::fs::write(&real, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(!is_rustup_proxy(&real));
+
+        // Windows keeps a copy rather than a link, and it is still rustup.
+        let copied = dir.join("rustup.exe");
+        std::fs::write(&copied, "x").unwrap();
+        assert!(is_rustup_proxy(&copied), "the name is what gives it away");
+
+        // A path that is not there at all answers no rather than panicking.
+        assert!(!is_rustup_proxy(&dir.join("nothing-here")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bug this all comes from: on a machine with rustup but without
+    /// the component, loupe reported rust-analyzer as installed, offered
+    /// `gd` / `gr` / `K`, and failed at the first request with rustup's
+    /// "Unknown binary" error. Whatever the answer is here, it has to
+    /// match what actually happens when the binary runs.
+    #[test]
+    fn rust_analyzer_is_reported_only_when_it_runs() {
+        let found = which("rust-analyzer").is_some();
+        let runs = Command::new("rust-analyzer")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        assert_eq!(
+            found, runs,
+            "which() said {found} but running it said {runs}"
+        );
+    }
+
+    /// The other half of it: a rustup stand-in whose component *is*
+    /// installed must still resolve, and to the real binary rather than
+    /// to the stand-in. `rustfmt` is the one to test with — it goes
+    /// through the same proxy and every Rust toolchain has it.
+    #[test]
+    fn an_installed_rustup_component_still_resolves() {
+        let Some(found) = which("rustfmt") else {
+            eprintln!("skipping: no rustfmt on PATH");
+            return;
+        };
+        assert!(found.is_file(), "it points at something real: {found:?}");
+        assert!(
+            !is_rustup_proxy(&found),
+            "and at the binary itself, not the stand-in: {found:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_found_for_a_command_that_does_not_exist() {
+        assert!(which("loupe-no-such-binary-xyzzy").is_none());
+    }
+
     #[test]
     fn uris_round_trip_through_awkward_paths() {
         let p = Path::new("/tmp/my repo/src/a b#c.ts");
@@ -1453,7 +1614,12 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                Sym { name: "App".into(), kind: "class", line: 5, container: None },
+                Sym {
+                    name: "App".into(),
+                    kind: "class",
+                    line: 5,
+                    container: None
+                },
                 Sym {
                     name: "handleClick".into(),
                     kind: "method",
@@ -1492,7 +1658,11 @@ mod tests {
         });
         assert_eq!(
             parse_locations(&single, root),
-            vec![Loc { path: "src/a.ts".into(), line: 1, col: 7 }]
+            vec![Loc {
+                path: "src/a.ts".into(),
+                line: 1,
+                col: 7
+            }]
         );
         // A LocationLink.
         let link = json!([{
@@ -1501,7 +1671,11 @@ mod tests {
         }]);
         assert_eq!(
             parse_locations(&link, root),
-            vec![Loc { path: "src/b.ts".into(), line: 4, col: 1 }]
+            vec![Loc {
+                path: "src/b.ts".into(),
+                line: 4,
+                col: 1
+            }]
         );
         // Outside the repository: kept absolute rather than mangled.
         let outside = json!([{
@@ -1570,12 +1744,16 @@ mod tests {
 
         // "handleClick" starts at column 15 of line 5.
         let call = (5, 15);
-        let def = lsp.definition(&root, "a.ts", src, call).expect("definition");
+        let def = lsp
+            .definition(&root, "a.ts", src, call)
+            .expect("definition");
         assert_eq!(def.len(), 1, "one definition: {def:?}");
         assert_eq!(def[0].path, "a.ts");
         assert_eq!(def[0].line, 1, "the definition is on line 1");
 
-        let refs = lsp.references(&root, "a.ts", src, call).expect("references");
+        let refs = lsp
+            .references(&root, "a.ts", src, call)
+            .expect("references");
         let lines: Vec<usize> = {
             let mut l: Vec<usize> = refs.iter().map(|r| r.line).collect();
             l.sort_unstable();
@@ -1585,7 +1763,10 @@ mod tests {
 
         let hover = lsp.hover(&root, "a.ts", src, call).expect("hover");
         let hover = hover.expect("some hover text");
-        assert!(hover.contains("handleClick"), "hover says what it is: {hover}");
+        assert!(
+            hover.contains("handleClick"),
+            "hover says what it is: {hover}"
+        );
 
         // The buffer, not the file, is what gets analyzed: ask about text
         // that exists nowhere on disk and the answer still tracks it.
@@ -1596,11 +1777,10 @@ mod tests {
             "the definition moved down a line with the edit: {syms:?}"
         );
 
-        assert!(
-            lsp.status()
-                .iter()
-                .any(|(lang, state)| *lang == "TypeScript" && state == "running")
-        );
+        assert!(lsp
+            .status()
+            .iter()
+            .any(|(lang, state)| *lang == "TypeScript" && state == "running"));
         lsp.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1631,7 +1811,9 @@ mod tests {
 
         // Column 13 of line 6 is inside the first `handle_click(1)` call.
         let at = (6, 13);
-        let refs = lsp.references(&root, "src/main.rs", src, at).expect("references");
+        let refs = lsp
+            .references(&root, "src/main.rs", src, at)
+            .expect("references");
         let mut lines: Vec<usize> = refs.iter().map(|r| r.line).collect();
         lines.sort_unstable();
         assert_eq!(
@@ -1687,7 +1869,9 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
         }
         assert!(
-            found.iter().any(|d| d.message.contains("totl") && d.line == 3),
+            found
+                .iter()
+                .any(|d| d.message.contains("totl") && d.line == 3),
             "expected a complaint about `totl` on line 3, got {found:?}"
         );
         let d = found.iter().find(|d| d.line == 3).unwrap();
@@ -1697,7 +1881,10 @@ mod tests {
             "the code travels with the message: {:?}",
             d.code
         );
-        assert!(d.col >= 10 && d.end_col > d.col, "the span covers the word: {d:?}");
+        assert!(
+            d.col >= 10 && d.end_col > d.col,
+            "the span covers the word: {d:?}"
+        );
 
         // Completion after a dot, on text that only exists in the buffer.
         let typing = "export function add(count: number): number {\n  const total = count + 1;\n  return total.\n}\n";
@@ -1741,4 +1928,3 @@ mod tests {
         }
     }
 }
-
