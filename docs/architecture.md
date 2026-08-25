@@ -12,6 +12,8 @@ threading model, and the invariants that are easy to break by accident.
 | `app.rs` | All application state (`App`), input handling, background-job orchestration |
 | `ui.rs` | Rendering: layout, file panel, diff view, buttons, overlays, status bar |
 | `diff.rs` | The diff engine: `FileDiff` computation, folding, display entries, line widths |
+| `conflict.rs` | Merge conflict markers: parsing them into hunks, building the two sides, writing a resolution back |
+| — | Reviews live in `github.rs` (the request) and `app.rs` (the held batch and the composer) |
 | `blame.rs` | `git blame --porcelain` parsing, the age heat ramp, the change set |
 | `editor.rs` | The in-place editor: a custom renderer over `tui-textarea` |
 | `markdown.rs` | Markdown → styled lines: the block/inline parser and the width-dependent layout |
@@ -138,6 +140,89 @@ too wide for the column renders as `#…`.
 Tab expansion and `FileDiff::max_width` share `diff::TAB_WIDTH` — the
 horizontal-scroll clamp and the renderer must agree on tab width or
 scrolling drifts on tab-indented files.
+
+## Reviews
+
+An inline comment has two exits, and they are different requests.
+*Post now* is `POST /pulls/{n}/comments` — one comment, immediately.
+*Add to review* touches no network at all: the comment goes into
+`App::pending` and to disk, and reaches GitHub only when the review is
+submitted as `POST /pulls/{n}/reviews`, carrying the summary, the
+`event` (`COMMENT` / `APPROVE` / `REQUEST_CHANGES`) and every held comment
+in one body.
+
+That endpoint takes an array of comment objects, which `gh api -f k=v`
+cannot express — so `run_gh_stdin` pipes JSON to `--input -` instead.
+`review_payload` builds it and omits empty halves: GitHub reads a
+present-but-blank `body` as a body, and a single-line comment carrying
+`start_line` equal to `line` as a malformed range.
+
+Held comments live in `.git/loupe/pending-review-<number>.json`, written
+on every change. Under the git directory rather than the working tree:
+per-clone state, never committed by accident, and it travels with the
+checkout the comments were anchored against. `load_pending` runs when a PR
+opens — after `pr` is set, since the file is keyed by number.
+
+Two anchoring facts shape the rest:
+
+- **Comments anchor to a commit, and the review carries one `commit_id`
+  for all of them.** `pending_commit` records the head they were written
+  against; a head that has since moved makes the confirm prompt warn,
+  because GitHub refuses the *whole* review over one bad anchor.
+- **The whole review is accepted or refused together.** A failure
+  therefore leaves the batch untouched, so nothing written is ever lost to
+  a rejection.
+
+`pending_on_row` puts the `💬` in the change bar. It maps a display row to
+a (side, line) and asks whether any held comment covers it — rather than
+indexing by comment, because the same line can be reached from either view
+mode and only the row model knows which side a row is showing.
+
+## Merge conflicts
+
+A conflicted file is fed through the *same* diff pipeline, with one
+substitution at step 1: instead of `HEAD` against the working tree,
+`load_conflict_data` diffs **our version against theirs**.
+
+`conflict::Conflicted::parse` reads the marker lines into a list of
+`Hunk` values — line ranges for our side, their side, and the common
+ancestor where git wrote one (`diff3` / `zdiff3`) — and
+`Conflicted::sides` rebuilds two plain files from them: agreed lines go
+into both, a hunk's lines go into one each. The diff engine then aligns
+those two, so an agreed line becomes a context row that folds away and a
+conflict becomes a changed section. Everything the diff view already does
+— folding, `{` / `}`, search, the cursor, syntax highlighting on real
+file text — works with no special case in `ui.rs` beyond the marker drawn
+in the change bar.
+
+Mapping a row back to the conflict it came from is *not* done by counting
+sections: a hunk whose two sides share lines splits into several sections,
+and two adjacent hunks can merge into one. `sides` therefore also returns
+a per-line owner vector for each side, which `ConflictView::owner` reads
+by line number — exact by construction.
+
+Writing is the inverse: `Conflicted::apply` walks the original lines and
+substitutes the chosen side for the hunks named in the pick map, leaving
+every other hunk's markers exactly as they were. So resolving one
+conflict is a whole-file rewrite that is byte-identical everywhere else,
+and the result re-parses with one fewer hunk.
+
+Two facts drive the rest:
+
+- **The index is the authority, not the file text.**
+  `gitops::unmerged_paths` (`git diff --diff-filter=U`) decides what is
+  conflicted, so a conflict git could not express with markers — one side
+  deleted the file — is still marked. Those have no hunks to resolve;
+  `gitops::take_side` reads merge stage 2 or 3 out of the index instead,
+  and removes the file when the chosen side deleted it.
+- **git treats a path as conflicted until it is added.** Resolving the
+  last hunk in a file therefore stages it, or the file would keep warning
+  after the reader had settled it.
+
+`App::revert_gutter` is shared: the same two columns carry `↺` on a
+normal diff and `⚑` on a conflict view, and reverting is refused on a
+conflicted path because `git checkout HEAD -- <path>` mid-merge discards
+the merge for it.
 
 ## Reverting
 

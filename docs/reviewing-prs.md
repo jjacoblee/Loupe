@@ -86,8 +86,19 @@ double-click the divider to reset. A starting width can be set with the
    with the motions (`Esc` cancels).
 2. Click `💬 Comment` or press `c` (with no selection, `c` comments on
    the cursor line).
-3. Write the comment and post — it goes to the PR through `gh` as a real
-   review comment, single- or multi-line.
+3. Write the comment, then choose how it leaves the box:
+
+   | Key | Button | What happens |
+   | --- | --- | --- |
+   | `Ctrl+S` | `✎ Add to review` | It is **held** — nothing reaches GitHub yet |
+   | `Ctrl+Enter` | `Post now` | It goes up on its own, immediately |
+   | `Esc` | `Cancel` | Nothing is kept |
+
+**Holding is the default, and it is what you want most of the time.**
+Ten comments posted one at a time are ten notifications to everyone
+watching the pull request, with nothing tying them together. Held
+comments go up as **one review**, with a summary and a verdict — which is
+what the review box is for.
 
 Two GitHub-imposed rules to know:
 
@@ -98,6 +109,64 @@ Two GitHub-imposed rules to know:
 - GitHub only accepts comments on lines inside the PR's diff hunks. A
   comment far outside a hunk is rejected by the API; the error is shown
   in the status bar.
+
+## The review box
+
+Under the file panel is the composer for the pull request as a whole: a
+summary, and the verdict to send with it. Press `R` (or click in it) to
+give it the keyboard.
+
+```
+┌ Review · 3 held ───────────────┐
+│ 💬 3 comments held   ✕ Discard │
+│ The retry loop needs a cap,    │
+│ but the rest reads well.       │
+│                                │
+│ ✓ Approve  ▾  Ctrl+S           │
+└────────────────────────────────┘
+```
+
+- **The button sends the review.** The `▾` beside it (or `Tab` while the
+  box has the keyboard) chooses between **Comment**, **Approve**, and
+  **Request changes**; the button's label and colour follow the choice.
+- **`Ctrl+S` submits.** It asks first, listing the verdict, the summary,
+  and where every held comment will land — a review notifies every
+  watcher of the pull request and cannot be taken back.
+- **Everything goes up in one request.** The summary, the verdict, and
+  all the held comments become a single review, exactly as if you had
+  clicked *Start a review* on github.com and then *Submit review*.
+- `Esc` gives the keyboard back to the diff. `R` returns to the box.
+
+### Held comments
+
+While comments are held, they are visible without opening the box:
+
+- A `💬` in the change bar, on the lines each one covers.
+- A `💬N` beside the file name in the panel.
+- The count in the box's title, and in the status bar.
+
+They are written to `.git/loupe/pending-review-<number>.json` as you make
+them, so quitting loupe does not lose a review in progress — reopening
+the same pull request picks them back up and says so. Nothing in that
+file has ever been sent to GitHub.
+
+`✕ Discard` throws them away; it asks once first, and only a second press
+on the same button confirms.
+
+### What GitHub refuses
+
+Loupe catches the two obvious cases before sending — a review with
+nothing in it at all, and **Request changes** with no summary — and
+reports the rest in the API's own words:
+
+- You cannot approve your own pull request.
+- Every held comment must fall on a line inside the diff of the commit it
+  was written against. If the PR head moves while you have comments held,
+  the confirm prompt warns you before you send.
+
+The whole review is accepted or refused together, so a single bad anchor
+takes the rest with it. Nothing is lost when that happens — the comments
+stay held.
 
 ## Editing the new side
 

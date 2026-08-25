@@ -9,10 +9,13 @@
 
 use crate::blame::{self, Blame};
 use crate::clipboard;
+use crate::conflict::{Conflicted, Resolution};
 use crate::diff::{DisplayEntry, FileDiff, Pos, RowKind, Selection, Side};
 use crate::editor::Editor;
-use crate::github::{self, ChangedFile, CommentSide, PrDetail, PrRef, PrSummary};
-use crate::gitops::{self, StageState};
+use crate::github::{
+    self, ChangedFile, CommentSide, PrDetail, PrRef, PrSummary, ReviewComment, Verdict,
+};
+use crate::gitops::{self, MergeOp, StageState, Tracking};
 use crate::highlight::{self, HlLine};
 use crate::lsp::{self, Lsp};
 use crate::markdown;
@@ -23,7 +26,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
@@ -62,6 +65,59 @@ pub struct CommentDraft {
     pub hi: usize,
 }
 
+// ----------------------------------------------------------- the review box
+
+/// The review composer at the foot of the file panel: a summary to say
+/// something about the pull request as a whole, and the verdict to send
+/// with it.
+///
+/// Inline comments answer "this line is wrong". This answers "should this
+/// be merged" — which is the half of a review the diff pane has no place
+/// for, and the half GitHub needs before anything is actually said.
+pub struct ReviewBox {
+    pub textarea: TextArea<'static>,
+    /// What the button will send.
+    pub verdict: Verdict,
+    /// True while the verdict dropdown is open under the ▾.
+    pub picking: bool,
+    /// Which line of that dropdown is highlighted.
+    pub pick: usize,
+    /// True while the box has the keyboard, so typing goes here rather
+    /// than to the diff.
+    pub focused: bool,
+}
+
+impl ReviewBox {
+    fn new() -> Self {
+        let mut textarea = TextArea::default();
+        // Short on purpose: the box is as wide as the file panel, and a
+        // placeholder that does not fit is cut off rather than wrapped.
+        textarea.set_placeholder_text("Summary of this review…");
+        ReviewBox {
+            textarea,
+            verdict: Verdict::Comment,
+            picking: false,
+            pick: 0,
+            focused: false,
+        }
+    }
+
+    /// The summary as it stands.
+    pub fn body(&self) -> String {
+        self.textarea.lines().join("\n")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.body().trim().is_empty()
+    }
+
+    fn clear(&mut self) {
+        let mut fresh = ReviewBox::new();
+        fresh.verdict = self.verdict;
+        *self = fresh;
+    }
+}
+
 pub enum Overlay {
     None,
     CheckoutPrompt(u64),
@@ -82,6 +138,69 @@ pub enum Overlay {
     /// The ☰ menu in the top bar — everything the toolbar no longer has
     /// room to show.
     Menu(Box<Menu>),
+    /// How to resolve one merge conflict, or the whole conflicted file.
+    ConflictMenu(Box<ConflictMenu>),
+    /// "Send this review?" — everything that is about to go to GitHub,
+    /// listed, before any of it does.
+    ReviewConfirm(Box<ReviewPrompt>),
+    /// The verdict list under the review box's ▾.
+    VerdictMenu,
+}
+
+/// What a review submit is about to send. Captured when the prompt opens,
+/// so the sentence on screen and the request cannot describe two different
+/// things.
+pub struct ReviewPrompt {
+    pub number: u64,
+    pub verdict: Verdict,
+    pub body: String,
+    pub comments: Vec<ReviewComment>,
+    /// The pull request head moved after these comments were written, so
+    /// they may no longer point at lines that exist.
+    pub stale: bool,
+}
+
+// --------------------------------------------------------------- conflicts
+
+/// What a line of the conflict menu does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictAction {
+    /// Keep one side of the conflict under the cursor.
+    Take(Resolution),
+    /// Keep one side of every conflict in the file at once.
+    TakeAll(Resolution),
+    /// Resolve the whole path from the index instead of from the marker
+    /// text — the answer for a conflict markers cannot describe.
+    TakeSide { ours: bool },
+    /// Open the raw file, markers and all, in the editor.
+    EditByHand,
+    /// `git add` the file, telling git the conflict is settled.
+    MarkResolved,
+}
+
+pub struct ConflictItem {
+    /// The key that runs this line on its own.
+    pub key: char,
+    pub label: String,
+    /// The second, greyed line under the label. Empty for none.
+    pub note: String,
+    pub act: ConflictAction,
+}
+
+/// The resolve menu for a conflict: which side to keep, and the ways to
+/// settle the file as a whole.
+pub struct ConflictMenu {
+    pub path: String,
+    /// The conflict the menu was opened on, as an index into the parsed
+    /// file. `None` when it was opened away from one — the whole-file
+    /// lines are then all it offers.
+    pub hunk: Option<usize>,
+    /// Heading above the lines — which conflict of how many, or the file.
+    pub title: String,
+    pub items: Vec<ConflictItem>,
+    pub sel: usize,
+    /// The cell that was clicked. The popup is drawn next to it.
+    pub anchor: (u16, u16),
 }
 
 /// One line of the ☰ menu. A heading is a label with no action; an item
@@ -778,6 +897,27 @@ pub enum ButtonId {
     PathMenuRow(usize),
     /// A line of the blame popup.
     BlameMenuRow(usize),
+    /// A line of the conflict resolve menu.
+    ConflictMenuRow(usize),
+
+    // --- the review box at the foot of the file panel
+    /// The summary text box: a click gives it the keyboard.
+    ReviewBody,
+    /// The button itself — sends whatever verdict it is showing.
+    ReviewSubmit,
+    /// The ▾ beside it, which opens the verdict list.
+    ReviewVerdict,
+    /// A line of that list.
+    VerdictRow(usize),
+    /// One of the three verdicts, chosen from the ☰ menu.
+    SetVerdict(Verdict),
+    /// The held-comment count, which offers to throw them away.
+    ReviewDiscard,
+    /// The two buttons on the submit prompt.
+    ReviewYes,
+    ReviewCancel,
+    /// The two buttons on an inline comment draft.
+    CommentHold,
     /// One row that shows or hides the blame pane.
     BlameToggle,
 
@@ -800,6 +940,10 @@ pub enum ButtonId {
     /// before they touch anything.
     RevertSection,
     RevertFile,
+    /// ⚑ — the resolve menu for the conflict at the cursor, and for the
+    /// whole conflicted file.
+    ResolveConflict,
+    ResolveFile,
     /// The idle re-scan switch (see `App::auto_refresh`).
     AutoRefreshToggle,
     Quit,
@@ -819,6 +963,9 @@ pub struct HitAreas {
     pub review: Rect,
     /// The two border columns between the panels — drag to resize.
     pub divider: Rect,
+    /// The review composer at the foot of the file panel. Zero-sized when
+    /// it is not drawn.
+    pub review_box: Rect,
     /// The blame pane, when it is showing. Zero-sized when it is not.
     pub blame: Rect,
     /// The seam between the blame pane and the diff — the second drag
@@ -903,6 +1050,10 @@ pub enum FileEntry {
         idx: usize,
         depth: u16,
     },
+    /// The heading above the conflicted files, which are listed first in
+    /// both the flat and the tree view. A merge conflict blocks the
+    /// commit, so it never sits inside a folder the reader has to open.
+    ConflictHeading { count: usize },
 }
 
 fn build_tree_entries(files: &[ChangedFile], collapsed: &HashSet<String>) -> Vec<FileEntry> {
@@ -913,6 +1064,11 @@ fn build_tree_entries(files: &[ChangedFile], collapsed: &HashSet<String>) -> Vec
     }
     let mut root = Node::default();
     for (i, f) in files.iter().enumerate() {
+        // Conflicted files are listed above the tree, not inside it (see
+        // `App::rebuild_entries`), so the tree never shows them twice.
+        if f.conflicted {
+            continue;
+        }
         let mut parts: Vec<&str> = f.path.split('/').collect();
         let base = parts.pop().unwrap_or("").to_string();
         let mut node = &mut root;
@@ -1004,6 +1160,11 @@ enum BgKind {
 struct Workspace {
     local: bool,
     local_branch: Option<String>,
+    /// The merge in progress and the upstream drift. Both describe the
+    /// working tree, so only the local side of the swap ever carries them.
+    merge_op: Option<MergeOp>,
+    tracking: Option<Tracking>,
+    conflict: Option<ConflictView>,
     pr: Option<PrDetail>,
     checked_out: bool,
     merge_base: String,
@@ -1077,6 +1238,43 @@ pub struct FileLoadedData {
     new_hl: Vec<HlLine>,
     differs: bool,
     diff: FileDiff,
+    /// The merge conflict this file holds, when it holds one. The two
+    /// sides above are then our version and their version rather than the
+    /// base and the working tree (see [`load_file_data`]).
+    conflict: Option<ConflictView>,
+}
+
+/// A conflicted file, ready to draw: the parsed markers, and the conflict
+/// each line of each side belongs to.
+pub struct ConflictView {
+    pub file: Arc<Conflicted>,
+    /// The conflict owning each 0-based line of the old (ours) side.
+    pub old_owner: Vec<Option<usize>>,
+    /// The same for the new (theirs) side.
+    pub new_owner: Vec<Option<usize>>,
+}
+
+impl ConflictView {
+    fn build(file: Conflicted) -> (Self, String, String) {
+        let sides = file.sides();
+        (
+            ConflictView {
+                file: Arc::new(file),
+                old_owner: sides.ours_owner,
+                new_owner: sides.theirs_owner,
+            },
+            sides.ours,
+            sides.theirs,
+        )
+    }
+
+    /// The conflict a diff row belongs to, from whichever side names one.
+    fn owner(&self, old_ln: Option<usize>, new_ln: Option<usize>) -> Option<usize> {
+        let pick = |owner: &[Option<usize>], ln: Option<usize>| {
+            ln.and_then(|n| owner.get(n - 1).copied().flatten())
+        };
+        pick(&self.new_owner, new_ln).or_else(|| pick(&self.old_owner, old_ln))
+    }
 }
 
 pub struct EditorSavedData {
@@ -1096,6 +1294,10 @@ pub struct LocalOpenedData {
     files: Vec<ChangedFile>,
     /// Which of them are staged (the file panel's + / ✓ column).
     stage: HashMap<String, StageState>,
+    /// The merge, rebase, or cherry-pick in progress, when there is one.
+    merge_op: Option<MergeOp>,
+    /// How far the branch has drifted from the branch it tracks.
+    tracking: Option<Tracking>,
 }
 
 /// A finished revert: what it undid, and the file reloaded from disk when
@@ -1127,6 +1329,12 @@ pub enum Outcome {
         path: String,
         lo: usize,
         hi: usize,
+    },
+    /// A whole review went up: the verdict, and how many inline comments
+    /// went with it.
+    ReviewSubmitted {
+        verdict: Verdict,
+        count: usize,
     },
     EditorSaved(Box<EditorSavedData>),
     ExternalOpened(Box<ExternalFile>),
@@ -1289,6 +1497,16 @@ pub struct App {
     pub local: bool,
     /// Branch name shown in the local-review top bar.
     pub local_branch: Option<String>,
+    /// The merge, rebase, or cherry-pick git is in the middle of. Local
+    /// review only — it is a property of the working tree.
+    pub merge_op: Option<MergeOp>,
+    /// Commits ahead of and behind the tracked branch, for the top bar.
+    /// None when the branch tracks nothing loupe can resolve.
+    pub tracking: Option<Tracking>,
+    /// The conflict of the open file, when it has one. While this is set
+    /// the diff pane shows our version against their version, and the
+    /// change bar resolves conflicts instead of reverting sections.
+    pub conflict: Option<ConflictView>,
 
     pub prs: Vec<PrSummary>,
     pub pr_cursor: usize,
@@ -1296,6 +1514,19 @@ pub struct App {
 
     pub pr: Option<PrDetail>,
     pub checked_out: bool,
+    /// Inline comments written but held back, waiting to go up as one
+    /// review (see [`App::add_to_review`]). Persisted between runs.
+    pub pending: Vec<ReviewComment>,
+    /// The PR head the held comments were written against. A head that
+    /// moves under them would anchor them to lines that no longer exist,
+    /// so the submit prompt says so rather than letting GitHub refuse the
+    /// whole review.
+    pending_commit: Option<String>,
+    /// The review composer at the foot of the file panel.
+    pub review: ReviewBox,
+    /// True once ✕ Discard has been asked for and not yet confirmed. Any
+    /// other action clears it, so the second press has to be deliberate.
+    discard_armed: bool,
     pub merge_base: String,
     pub files: Vec<ChangedFile>,
     /// Paths marked as viewed (mirrors the GitHub PR page checkmarks).
@@ -1410,6 +1641,11 @@ pub struct App {
     post_load_err: Option<String>,
     /// One-shot note prepended to the next file-loaded status message.
     auto_open_note: Option<String>,
+    /// What a resolution just did. A resolution starts a re-scan, and the
+    /// re-scan has its own thing to say when it lands — so the sentence
+    /// the reader actually needs is held here and put back on the line
+    /// once nothing else is in flight.
+    resolved_note: Option<String>,
 
     // --- the blame pane (see [`crate::blame`])
     /// Show the blame pane between the file panel and the diff. `blame`
@@ -1510,11 +1746,18 @@ impl App {
             repo_root: PathBuf::from("."),
             local: false,
             local_branch: None,
+            merge_op: None,
+            tracking: None,
+            conflict: None,
             prs: Vec::new(),
             pr_cursor: 0,
             pr_scroll: 0,
             pr: None,
             checked_out: false,
+            pending: Vec::new(),
+            pending_commit: None,
+            review: ReviewBox::new(),
+            discard_armed: false,
             merge_base: String::new(),
             files: Vec::new(),
             viewed: HashSet::new(),
@@ -1573,6 +1816,7 @@ impl App {
             pending_jump: None,
             post_load_err: None,
             auto_open_note: None,
+            resolved_note: None,
             blame_on: false,
             blame_w: BLAME_DEFAULT,
             blame_new: None,
@@ -1994,6 +2238,14 @@ impl App {
                 }
                 self.local = true;
                 self.local_branch = d.branch;
+                // Held comments belong to the pull request, and travel
+                // with it into the stash — but the box must not keep the
+                // keyboard on a side that has no review box at all.
+                self.review.focused = false;
+                self.review.picking = false;
+                self.merge_op = d.merge_op;
+                self.tracking = d.tracking;
+                self.conflict = None;
                 self.pr = None;
                 // The working tree IS the review target, so editing works.
                 self.checked_out = true;
@@ -2021,9 +2273,14 @@ impl App {
                 } else {
                     let n = self.files.len();
                     let what = if n == 1 { "file" } else { "files" };
-                    self.auto_open_note = Some(format!(
-                        "Reviewing uncommitted changes vs HEAD ({n} {what}; b for the PR list)"
-                    ));
+                    // A conflict outranks the file count: it is the reason
+                    // the reader opened loupe, and it blocks the commit.
+                    self.auto_open_note = Some(match self.conflict_note() {
+                        Some(note) => note,
+                        None => format!(
+                            "Reviewing uncommitted changes vs HEAD ({n} {what}; b for the PR list)"
+                        ),
+                    });
                     self.spawn_load_file(0);
                 }
             }
@@ -2056,6 +2313,11 @@ impl App {
                 }
                 self.local = false;
                 self.local_branch = None;
+                // All three describe the working tree, and a PR review is
+                // about a commit range instead.
+                self.merge_op = None;
+                self.tracking = None;
+                self.conflict = None;
                 self.repo = Some(d.repo);
                 if let Some(root) = d.repo_root {
                     self.repo_root = root;
@@ -2065,6 +2327,9 @@ impl App {
                 self.reset_blame_review();
                 self.files = d.files;
                 self.viewed = d.viewed;
+                // Whatever was held for this pull request last time. Read
+                // after `pr` is set, since the file is keyed by number.
+                self.load_pending();
                 if d.auto {
                     self.auto_open_note = Some(format!(
                         "Opened PR #{number} for branch “{}” (b for the PR list)",
@@ -2106,6 +2371,7 @@ impl App {
                 self.new_hl = d.new_hl;
                 self.differs_from_head = d.differs;
                 self.diff = Some(d.diff);
+                self.conflict = d.conflict;
                 self.expanded_folds.clear();
                 self.rebuild_display();
                 // A search result names a line; opening the file normally
@@ -2129,7 +2395,14 @@ impl App {
                 self.recompute_matches();
                 self.reveal_current_file();
                 // The blame of the file that just landed, on its own job.
-                self.spawn_blame(self.file_cursor);
+                // A conflict view is not the working-tree file — the marker
+                // lines are gone — so its line numbers would blame the
+                // wrong lines. The pane stands down until it is resolved.
+                if self.conflict.is_some() {
+                    self.clear_blame();
+                } else {
+                    self.spawn_blame(self.file_cursor);
+                }
                 // Start this language's server in the background, so the
                 // first gd / gr / K doesn't pay for the handshake.
                 if self.lsp_enabled {
@@ -2140,12 +2413,25 @@ impl App {
                         self.lsp.warm(&self.repo_root, &file.path, text);
                     }
                 }
-                let mode = if self.checked_out {
-                    "editable"
-                } else {
-                    "read-only (branch not checked out)"
+                let msg = match &self.conflict {
+                    Some(c) => {
+                        let n = c.file.len();
+                        let (ours, theirs) = c.file.labels();
+                        format!(
+                            "⚠ {} — {n} conflict{} · left is {ours}, right is {theirs} · o resolves the one at the cursor",
+                            d.path,
+                            if n == 1 { "" } else { "s" }
+                        )
+                    }
+                    None => {
+                        let mode = if self.checked_out {
+                            "editable"
+                        } else {
+                            "read-only (branch not checked out)"
+                        };
+                        format!("{} — {}", d.path, mode)
+                    }
                 };
-                let msg = format!("{} — {}", d.path, mode);
                 match self.auto_open_note.take() {
                     Some(note) => self.ok(format!("{note} · {msg}")),
                     None => self.ok(msg),
@@ -2153,6 +2439,24 @@ impl App {
                 if keep_preview {
                     self.preview_current_file();
                 }
+            }
+            Outcome::ReviewSubmitted { verdict, count } => {
+                let n = self.pr.as_ref().map(|p| p.number).unwrap_or(0);
+                // It is on GitHub now, so nothing is held any more.
+                self.pending.clear();
+                self.pending_commit = None;
+                self.review.clear();
+                self.save_pending();
+                self.blur_review();
+                let with = if count == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " with {count} inline comment{}",
+                        if count == 1 { "" } else { "s" }
+                    )
+                };
+                self.ok(format!("✔ You {} PR #{n}{with}.", verdict.past()));
             }
             Outcome::CommentPosted { path, lo, hi } => {
                 self.overlay = Overlay::None;
@@ -2176,6 +2480,17 @@ impl App {
                 self.differs_from_head = d.differs;
                 self.diff = Some(d.diff);
                 self.rebuild_display();
+                // A hand edit of a conflicted file rewrites the very text
+                // the conflict view was built from, so the parse behind it
+                // is now stale — and resolving against a stale parse would
+                // write the file back the way it was before the edit. Drop
+                // it and re-read the file, which parses whatever is left.
+                if self.conflict.take().is_some() {
+                    self.ok(format!("✔ Saved {} — re-reading the conflict…", d.path));
+                    let idx = self.file_cursor;
+                    self.spawn_quiet_file(idx, true);
+                    return;
+                }
                 self.ok(format!(
                     "✔ Saved {} — diff updated. Commit & push when ready.",
                     d.path
@@ -2321,6 +2636,8 @@ impl App {
                     // Cosmetic: a status read that fails just shows everything
                     // as unstaged rather than sinking the whole scan.
                     stage: gitops::stage_states(&root).unwrap_or_default(),
+                    merge_op: gitops::merge_op(&root),
+                    tracking: gitops::tracking(&root),
                 })))
             },
         );
@@ -2700,6 +3017,34 @@ impl App {
         }
     }
 
+    /// Take the open inline draft and hold it for the review.
+    ///
+    /// No network at all: the comment goes into the batch and to disk, and
+    /// reaches GitHub only when the review is submitted.
+    fn hold_comment(&mut self) {
+        let Overlay::Comment(draft) = &self.overlay else {
+            return;
+        };
+        let body = draft.textarea.lines().join("\n");
+        if body.trim().is_empty() {
+            self.err("Comment is empty — write something or press Esc to cancel.");
+            return;
+        }
+        let comment = ReviewComment {
+            path: draft.path.clone(),
+            side: match draft.side {
+                Side::Left => CommentSide::Left,
+                Side::Right => CommentSide::Right,
+            },
+            line: draft.hi,
+            start_line: (draft.lo != draft.hi).then_some(draft.lo),
+            body,
+        };
+        self.overlay = Overlay::None;
+        self.selection = None;
+        self.add_to_review(comment);
+    }
+
     fn spawn_post_comment(&mut self) {
         let Overlay::Comment(draft) = &self.overlay else {
             return;
@@ -2801,7 +3146,9 @@ impl App {
     /// it. Every piece of diff geometry measures from
     /// [`Self::diff_body`], which subtracts this.
     pub fn revert_gutter(&self) -> u16 {
-        if self.can_revert() && self.diff.is_some() {
+        // The same two columns carry the ⚑ conflict markers, which are
+        // offered even where a revert is not (see `ui::draw_diff`).
+        if self.diff.is_some() && (self.can_revert() || self.conflict.is_some()) {
             REVERT_W
         } else {
             0
@@ -2845,10 +3192,628 @@ impl App {
         Some(above != Some(here))
     }
 
+    // ------------------------------------------------------ pending review
+
+    /// Where the held comments for one pull request live between runs.
+    ///
+    /// Under the git directory rather than in the working tree: it is
+    /// per-clone state, it must never be committed by accident, and it
+    /// travels with the checkout the comments were written against.
+    fn pending_path(&self, number: u64) -> Option<PathBuf> {
+        let dir = gitops::git_dir(&self.repo_root)?.join("loupe");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir.join(format!("pending-review-{number}.json")))
+    }
+
+    /// Read back whatever was held for this pull request last time.
+    fn load_pending(&mut self) {
+        #[derive(serde::Deserialize)]
+        struct Saved {
+            commit: Option<String>,
+            comments: Vec<ReviewComment>,
+            #[serde(default)]
+            body: String,
+            #[serde(default)]
+            verdict: Option<String>,
+        }
+        self.pending.clear();
+        self.pending_commit = None;
+        self.review.clear();
+        let Some(number) = self.pr.as_ref().map(|p| p.number) else {
+            return;
+        };
+        let Some(saved) = self
+            .pending_path(number)
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| serde_json::from_str::<Saved>(&t).ok())
+        else {
+            return;
+        };
+        self.pending = saved.comments;
+        self.pending_commit = saved.commit;
+        if !saved.body.is_empty() {
+            self.review.textarea = TextArea::from(saved.body.split('\n').collect::<Vec<_>>());
+        }
+        self.review.verdict = Verdict::all()
+            .into_iter()
+            .find(|v| Some(v.api()) == saved.verdict.as_deref())
+            .unwrap_or_default();
+        if !self.pending.is_empty() {
+            let n = self.pending.len();
+            self.auto_open_note = Some(format!(
+                "{n} held comment{} from last time — R opens the review box",
+                if n == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
+    /// Write the held comments out. Called after every change to them, so
+    /// a crash or a `q` never costs the reader a review they had written.
+    fn save_pending(&mut self) {
+        let Some(number) = self.pr.as_ref().map(|p| p.number) else {
+            return;
+        };
+        let Some(path) = self.pending_path(number) else {
+            return;
+        };
+        // Nothing held and nothing written: leave no file behind.
+        if self.pending.is_empty() && self.review.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let payload = serde_json::json!({
+            "commit": self.pending_commit,
+            "comments": self.pending,
+            "body": self.review.body(),
+            "verdict": self.review.verdict.api(),
+        });
+        if let Err(e) = std::fs::write(&path, payload.to_string()) {
+            self.err(format!("Couldn't save the held comments: {e}"));
+        }
+    }
+
+    /// Hold one inline comment back for the review instead of posting it.
+    fn add_to_review(&mut self, draft: ReviewComment) {
+        let first = self.pending.is_empty();
+        let where_at = draft.where_at();
+        self.pending.push(draft);
+        self.pending_commit = self.pr.as_ref().map(|p| p.head_ref_oid.clone());
+        self.save_pending();
+        let n = self.pending.len();
+        if first {
+            self.ok(format!(
+                "✎ Review started — {where_at} held. Nothing is on GitHub yet; R opens the review box."
+            ));
+        } else {
+            self.ok(format!(
+                "✎ {where_at} held — {n} comments in this review. R opens the review box."
+            ));
+        }
+    }
+
+    /// How many held comments there are for a file, for the panel badge.
+    pub fn pending_in(&self, path: &str) -> usize {
+        self.pending.iter().filter(|c| c.path == path).count()
+    }
+
+    /// True when a held comment covers the display row — the 💬 in the
+    /// change bar, so a note already written is visible where it was left.
+    pub fn pending_on_row(&self, display_row: usize) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        let Some(path) = self.files.get(self.file_cursor).map(|f| f.path.as_str()) else {
+            return false;
+        };
+        let Some(DisplayEntry::Line(i)) = self.display.get(display_row).copied() else {
+            return false;
+        };
+        let Some(diff) = &self.diff else { return false };
+        let (row, only) = match self.view {
+            ViewMode::SideBySide => (diff.rows.get(i), None),
+            ViewMode::Inline => {
+                let Some(e) = diff.inline.get(i) else {
+                    return false;
+                };
+                (diff.rows.get(e.row), Some(e.side))
+            }
+        };
+        let Some(row) = row else { return false };
+        let covers = |c: &ReviewComment, ln: usize| {
+            let lo = c.start_line.unwrap_or(c.line).min(c.line);
+            ln >= lo && ln <= c.line
+        };
+        self.pending.iter().any(|c| {
+            if c.path != path {
+                return false;
+            }
+            let side = match c.side {
+                CommentSide::Left => Side::Left,
+                CommentSide::Right => Side::Right,
+            };
+            // An inline row shows one side, so only that side can match.
+            if only.is_some_and(|s| s != side) {
+                return false;
+            }
+            match side {
+                Side::Left => row.old_ln.is_some_and(|n| covers(c, n)),
+                Side::Right => row.new_ln.is_some_and(|n| covers(c, n)),
+            }
+        })
+    }
+
+    /// True when the review composer should be drawn at all: a pull
+    /// request review, with the pane showing the diff rather than a
+    /// document or an editor.
+    pub fn review_box_on(&self) -> bool {
+        self.screen == Screen::Review
+            && !self.local
+            && self.pr.is_some()
+            && self.editor.is_none()
+            && self.preview.is_none()
+    }
+
+    /// `R`, and a click in the box: give it the keyboard.
+    pub fn focus_review(&mut self) {
+        if !self.review_box_on() {
+            self.err("No pull request open — a review needs one (b for the PR list).");
+            return;
+        }
+        self.review.focused = true;
+        self.selection = None;
+        self.ok("Review summary — Ctrl+S submits · Tab changes the verdict · Esc leaves it.");
+    }
+
+    fn blur_review(&mut self) {
+        self.review.focused = false;
+        self.review.picking = false;
+        self.save_pending();
+    }
+
+    /// Set the verdict the button will send.
+    pub fn set_verdict(&mut self, v: Verdict) {
+        self.review.verdict = v;
+        self.review.picking = false;
+        self.save_pending();
+        self.ok(format!("{} {} — Ctrl+S submits it.", v.icon(), v.label()));
+    }
+
+    fn cycle_verdict(&mut self) {
+        let all = Verdict::all();
+        let at = all
+            .iter()
+            .position(|v| *v == self.review.verdict)
+            .unwrap_or(0);
+        self.set_verdict(all[(at + 1) % all.len()]);
+    }
+
+    /// Ask before the review goes up. Submitting notifies everyone
+    /// watching the pull request and cannot be taken back, so it is the
+    /// second thing loupe confirms — reverting is the first.
+    pub fn ask_submit_review(&mut self) {
+        if !self.review_box_on() {
+            self.err("No pull request open — a review needs one (b for the PR list).");
+            return;
+        }
+        let verdict = self.review.verdict;
+        let body = self.review.body();
+        if body.trim().is_empty() && self.pending.is_empty() {
+            self.err("Nothing to send — write a summary, or hold a comment with c first.");
+            return;
+        }
+        // GitHub refuses "request changes" with nothing said. An approval
+        // is a complete statement on its own, and a plain comment is
+        // carried by its inline notes.
+        if verdict == Verdict::RequestChanges && body.trim().is_empty() {
+            self.err("Request changes needs a summary — say what has to change.");
+            return;
+        }
+        let Some(pr) = &self.pr else { return };
+        // Comments anchored to a head that has since moved point at lines
+        // that may no longer exist, and GitHub refuses the whole review
+        // over one of them — so the prompt says so before it is sent.
+        let stale = !self.pending.is_empty()
+            && self
+                .pending_commit
+                .as_deref()
+                .is_some_and(|c| c != pr.head_ref_oid);
+        self.review.picking = false;
+        self.overlay = Overlay::ReviewConfirm(Box::new(ReviewPrompt {
+            number: pr.number,
+            verdict,
+            body,
+            comments: self.pending.clone(),
+            stale,
+        }));
+    }
+
+    /// Send it.
+    fn spawn_submit_review(&mut self) {
+        let Overlay::ReviewConfirm(prompt) = &self.overlay else {
+            return;
+        };
+        let (Some(repo), Some(pr)) = (self.repo.clone(), self.pr.as_ref()) else {
+            return;
+        };
+        let number = pr.number;
+        let commit = self
+            .pending_commit
+            .clone()
+            .unwrap_or_else(|| pr.head_ref_oid.clone());
+        let (verdict, body) = (prompt.verdict, prompt.body.clone());
+        let comments = prompt.comments.clone();
+        let n = comments.len();
+        self.overlay = Overlay::None;
+        self.spawn(
+            format!("Submitting your review of PR #{number}"),
+            false,
+            false,
+            move || {
+                github::submit_review(&repo, number, &commit, &body, verdict, &comments)?;
+                Ok(Outcome::ReviewSubmitted { verdict, count: n })
+            },
+        );
+    }
+
+    /// Throw the held comments away.
+    ///
+    /// Asks once, the way the editor asks before dropping unsaved text:
+    /// these are written words with no copy anywhere else, and one stray
+    /// click on ✕ should not cost a review.
+    pub fn discard_pending(&mut self) {
+        if self.pending.is_empty() {
+            self.err("No held comments to discard.");
+            self.discard_armed = false;
+            return;
+        }
+        let n = self.pending.len();
+        let s = if n == 1 { "" } else { "s" };
+        if !self.discard_armed {
+            self.discard_armed = true;
+            self.err(format!(
+                "Discard {n} held comment{s}? Press ✕ again (or the menu line) to throw them away."
+            ));
+            return;
+        }
+        self.discard_armed = false;
+        self.pending.clear();
+        self.pending_commit = None;
+        self.save_pending();
+        self.ok(format!(
+            "Discarded {n} held comment{s} — nothing was ever sent to GitHub."
+        ));
+    }
+    // -------------------------------------------------------- conflicts
+
+    /// How many files of the open review are conflicted.
+    pub fn conflict_count(&self) -> usize {
+        self.files.iter().filter(|f| f.conflicted).count()
+    }
+
+    /// True when the file at `idx` is conflicted.
+    pub fn file_conflicted(&self, idx: usize) -> bool {
+        self.files.get(idx).is_some_and(|f| f.conflicted)
+    }
+
+    /// The one-line summary of the merge, for the status bar after a scan.
+    /// `None` when nothing is conflicted.
+    fn conflict_note(&self) -> Option<String> {
+        let n = self.conflict_count();
+        if n == 0 {
+            return None;
+        }
+        let what = if n == 1 { "file has" } else { "files have" };
+        let finish = self.finish_hint();
+        Some(format!(
+            "⚠ {n} {what} merge conflicts — press o to resolve one.{finish}"
+        ))
+    }
+
+    /// The conflict a display row belongs to, when the open file is a
+    /// conflict view. Fold banners and agreed lines belong to none.
+    pub fn conflict_on_row(&self, display_row: usize) -> Option<usize> {
+        let view = self.conflict.as_ref()?;
+        let entry = *self.display.get(display_row)?;
+        let DisplayEntry::Line(i) = entry else {
+            return None;
+        };
+        let diff = self.diff.as_ref()?;
+        let row = match self.view {
+            ViewMode::SideBySide => diff.rows.get(i)?,
+            ViewMode::Inline => diff.rows.get(diff.inline.get(i)?.row)?,
+        };
+        view.owner(row.old_ln, row.new_ln)
+    }
+
+    /// What the change bar draws on a conflicted file: `Some(true)` on the
+    /// first row of a conflict (the ⚑ marker), `Some(false)` further down
+    /// it, None on the lines both branches agree on.
+    pub fn conflict_bar(&self, display_row: usize) -> Option<bool> {
+        let here = self.conflict_on_row(display_row)?;
+        let above = display_row
+            .checked_sub(1)
+            .and_then(|i| self.conflict_on_row(i));
+        Some(above != Some(here))
+    }
+
+    /// Open the resolve menu for the conflict on `display_row`, anchored
+    /// at (`x`, `y`). With no conflict on that row the menu covers the
+    /// whole file, which is the only thing left to offer.
+    pub fn open_conflict_menu(&mut self, display_row: usize, x: u16, y: u16) {
+        let Some(file) = self.files.get(self.file_cursor) else {
+            self.err("No file open — pick one on the left.");
+            return;
+        };
+        if !file.conflicted {
+            self.err("No merge conflict in this file — ⚠ marks the ones that have one.");
+            return;
+        }
+        let path = file.path.clone();
+        let hunk = self.conflict_on_row(display_row);
+        let view = self.conflict.as_ref();
+        let mut items = Vec::new();
+        let title = match (hunk, view) {
+            (Some(i), Some(v)) => {
+                let h = &v.file.hunks[i];
+                let (ours_n, theirs_n) = h.counts();
+                let (ours, theirs) = v.file.labels();
+                items.push(ConflictItem {
+                    key: 'o',
+                    label: format!("Take ours — {ours}"),
+                    note: format!("{ours_n} line{}", if ours_n == 1 { "" } else { "s" }),
+                    act: ConflictAction::Take(Resolution::Ours),
+                });
+                items.push(ConflictItem {
+                    key: 't',
+                    label: format!("Take theirs — {theirs}"),
+                    note: format!("{theirs_n} line{}", if theirs_n == 1 { "" } else { "s" }),
+                    act: ConflictAction::Take(Resolution::Theirs),
+                });
+                items.push(ConflictItem {
+                    key: 'b',
+                    label: "Take both".into(),
+                    note: "ours first, then theirs".into(),
+                    act: ConflictAction::Take(Resolution::Both),
+                });
+                if h.base.is_some() {
+                    items.push(ConflictItem {
+                        key: 'a',
+                        label: "Take the common ancestor".into(),
+                        note: "what both branches started from".into(),
+                        act: ConflictAction::Take(Resolution::Base),
+                    });
+                }
+                format!("Conflict {} of {}", i + 1, v.file.len())
+            }
+            _ => format!("{path} — whole file"),
+        };
+        // The whole-file lines, always. They are the only answer for a
+        // conflict with no markers to read.
+        if let Some(v) = view {
+            let n = v.file.len();
+            if n > 1 || hunk.is_none() {
+                items.push(ConflictItem {
+                    key: 'O',
+                    label: "Take ours everywhere".into(),
+                    note: format!("all {n} conflicts in this file"),
+                    act: ConflictAction::TakeAll(Resolution::Ours),
+                });
+                items.push(ConflictItem {
+                    key: 'T',
+                    label: "Take theirs everywhere".into(),
+                    note: format!("all {n} conflicts in this file"),
+                    act: ConflictAction::TakeAll(Resolution::Theirs),
+                });
+            }
+        } else {
+            items.push(ConflictItem {
+                key: 'o',
+                label: "Take our whole file".into(),
+                note: "the version on this branch".into(),
+                act: ConflictAction::TakeSide { ours: true },
+            });
+            items.push(ConflictItem {
+                key: 't',
+                label: "Take their whole file".into(),
+                note: "the version being merged in".into(),
+                act: ConflictAction::TakeSide { ours: false },
+            });
+        }
+        items.push(ConflictItem {
+            key: 'e',
+            label: "Edit it by hand".into(),
+            note: "opens the file with its markers".into(),
+            act: ConflictAction::EditByHand,
+        });
+        items.push(ConflictItem {
+            key: 'x',
+            label: "Mark it resolved".into(),
+            note: "git add — do this once it reads right".into(),
+            act: ConflictAction::MarkResolved,
+        });
+        self.overlay = Overlay::ConflictMenu(Box::new(ConflictMenu {
+            path,
+            hunk,
+            title,
+            items,
+            sel: 0,
+            anchor: (x, y),
+        }));
+    }
+
+    /// `o`: the resolve menu for the conflict under the keyboard cursor,
+    /// drawn where the diff cursor is.
+    pub fn open_conflict_menu_from_key(&mut self) {
+        let r = self.layout.diff;
+        let y = r.y + (self.diff_cursor.saturating_sub(self.diff_scroll)) as u16;
+        self.open_conflict_menu(self.diff_cursor, r.x + 2, y.min(r.y + r.height));
+    }
+
+    /// Run the conflict menu line at `i` and close the menu.
+    fn conflict_menu_run(&mut self, i: usize) {
+        let Overlay::ConflictMenu(menu) = &self.overlay else {
+            return;
+        };
+        let Some(item) = menu.items.get(i) else {
+            return;
+        };
+        let (act, path, hunk) = (item.act, menu.path.clone(), menu.hunk);
+        self.overlay = Overlay::None;
+        match act {
+            ConflictAction::Take(how) => self.resolve_hunk(&path, hunk, how),
+            ConflictAction::TakeAll(how) => self.resolve_all(&path, how),
+            ConflictAction::TakeSide { ours } => self.take_whole_side(&path, ours),
+            ConflictAction::EditByHand => self.open_editor(None),
+            ConflictAction::MarkResolved => self.mark_resolved(&path),
+        }
+    }
+
+    /// Write one conflict's chosen side back to the file, then reload.
+    fn resolve_hunk(&mut self, path: &str, hunk: Option<usize>, how: Resolution) {
+        let Some(idx) = hunk else {
+            self.err("No conflict on that line — ⚑ marks each one.");
+            return;
+        };
+        let Some(view) = &self.conflict else { return };
+        if idx >= view.file.len() {
+            return;
+        }
+        let text = view.file.resolve_one(idx, how);
+        let left = view.file.len() - 1;
+        self.write_resolution(path, text, format!("kept {}", how.label()), left);
+    }
+
+    /// The same, for every conflict in the file at once.
+    fn resolve_all(&mut self, path: &str, how: Resolution) {
+        let Some(view) = &self.conflict else {
+            self.err("Nothing to resolve — this file has no conflict markers.");
+            return;
+        };
+        let n = view.file.len();
+        let text = view.file.resolve_all(how);
+        self.write_resolution(
+            path,
+            text,
+            format!(
+                "kept {} in all {n} conflict{}",
+                how.label(),
+                if n == 1 { "" } else { "s" }
+            ),
+            0,
+        );
+    }
+
+    /// Write resolved text, stage the file when nothing is left to
+    /// resolve, and reload the pane in place.
+    ///
+    /// Staging is part of resolving: git treats a path as conflicted until
+    /// it is added, so a file left unstaged would keep showing the warning
+    /// after the last conflict was settled. `x` puts it back.
+    fn write_resolution(&mut self, path: &str, text: String, what: String, left: usize) {
+        if let Err(e) = gitops::write_repo_file(&self.repo_root, path, &text) {
+            self.err(format!("Couldn't write {path}: {e:#}"));
+            return;
+        }
+        if left == 0 {
+            match gitops::stage_file(&self.repo_root, path, None) {
+                Ok(()) => self.resolved(format!(
+                    "✔ Resolved {path} — {what}, and staged it.{}",
+                    self.finish_hint()
+                )),
+                // The file is written either way; only the index missed out.
+                Err(e) => self.err(format!("Wrote {path}, but `git add` failed: {e:#}")),
+            }
+        } else {
+            self.resolved(format!(
+                "✔ Resolved 1 conflict — {what}. {left} left in this file."
+            ));
+        }
+        self.after_resolution();
+    }
+
+    /// " Finish with `git commit`." — empty outside a merge.
+    fn finish_hint(&self) -> String {
+        match self.merge_op {
+            Some(op) => format!(" Finish with `{}`.", op.finish()),
+            None => String::new(),
+        }
+    }
+
+    /// Say what a resolution did, and say it again after the re-scan that
+    /// follows has had its turn.
+    fn resolved(&mut self, msg: String) {
+        self.ok(msg.clone());
+        self.resolved_note = Some(msg);
+    }
+
+    /// Take a whole path from the index rather than from marker text.
+    fn take_whole_side(&mut self, path: &str, ours: bool) {
+        let which = if ours { "ours" } else { "theirs" };
+        let finish = self.finish_hint();
+        match gitops::take_side(&self.repo_root, path, ours) {
+            Ok(true) => self.resolved(format!(
+                "✔ Resolved {path} — took {which}, and staged it.{finish}"
+            )),
+            Ok(false) => self.resolved(format!(
+                "✔ Resolved {path} — {which} deleted it, so it is gone and staged.{finish}"
+            )),
+            Err(e) => {
+                self.err(format!("Couldn't take {which} for {path}: {e:#}"));
+                return;
+            }
+        }
+        self.after_resolution();
+    }
+
+    /// `git add` the file exactly as it stands, conflict markers included
+    /// if any are left. This is what a hand resolution ends with.
+    fn mark_resolved(&mut self, path: &str) {
+        let still = gitops::safe_repo_path(&self.repo_root, path)
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .is_some_and(|t| crate::conflict::has_markers(&t));
+        if still {
+            self.err(format!(
+                "{path} still holds conflict markers — resolve them first, or edit it by hand."
+            ));
+            return;
+        }
+        let finish = self.finish_hint();
+        match gitops::stage_file(&self.repo_root, path, None) {
+            Ok(()) => {
+                self.resolved(format!("✔ Marked {path} resolved.{finish}"));
+                self.after_resolution();
+            }
+            Err(e) => self.err(format!("Couldn't stage {path}: {e:#}")),
+        }
+    }
+
+    /// Re-read the tree after a resolution. The file list changes shape —
+    /// a resolved file stops being a conflict and leaves the top group —
+    /// so this is the full scan rather than the cheap index re-read.
+    fn after_resolution(&mut self) {
+        self.last_auto_rescan = Instant::now();
+        if self.quiet.is_none() {
+            // Quiet on purpose: the reader is told what the resolution did,
+            // not what the re-scan behind it found.
+            self.spawn_quiet_local(true);
+        } else {
+            self.refresh_stage_states();
+        }
+    }
+
     /// Ask before reverting one section of the open diff, named by the
     /// display row the click landed on. Deliberately not tied to the cursor:
     /// the marker you click is the change that goes.
     pub fn ask_revert_section(&mut self, display_row: usize) {
+        // On a conflict view the sections are conflicts, not changes, and
+        // the two sides are two branches rather than before and after.
+        // Reverting one would write the wrong text, so `o` takes over —
+        // asked before the guard, so `u` offers the menu instead of an
+        // error the reader can do nothing with.
+        if self.conflict.is_some() {
+            self.open_conflict_menu(display_row, self.layout.diff.x + 2, self.layout.diff.y + 1);
+            return;
+        }
         if !self.revert_allowed() {
             return;
         }
@@ -2883,7 +3848,7 @@ impl App {
 
     /// Ask before throwing away every change in one file.
     pub fn ask_revert_file(&mut self, idx: usize) {
-        if !self.revert_allowed() {
+        if !self.revert_allowed_for(idx) {
             return;
         }
         let Some(file) = self.files.get(idx) else {
@@ -2898,8 +3863,20 @@ impl App {
         }));
     }
 
-    /// Shared guard: says why not, rather than doing nothing.
+    /// Shared guard for the open file: says why not, rather than doing
+    /// nothing.
     fn revert_allowed(&mut self) -> bool {
+        self.revert_allowed_for(self.file_cursor)
+    }
+
+    /// The same guard, for a file named by the row that was clicked.
+    fn revert_allowed_for(&mut self, idx: usize) -> bool {
+        if self.file_conflicted(idx) {
+            self.err(
+                "This file has a merge conflict — press o to resolve it. Reverting would undo the merge.",
+            );
+            return false;
+        }
         if self.editor.is_some() {
             self.err("Close the editor first (Ctrl+S to save, Esc to close) before reverting.");
             return false;
@@ -3274,13 +4251,39 @@ impl App {
     // ------------------------------------------------------- derived state
 
     pub fn rebuild_entries(&mut self) {
-        self.entries = if self.tree_view {
-            build_tree_entries(&self.files, &self.collapsed_dirs)
+        // Conflicted files come first under their own heading, in the flat
+        // view and the tree alike. `local_changes` already sorts them to
+        // the front of `files`, so they are contiguous here.
+        let mut out: Vec<FileEntry> = Vec::with_capacity(self.files.len() + 1);
+        let conflicts: Vec<usize> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.conflicted)
+            .map(|(i, _)| i)
+            .collect();
+        if !conflicts.is_empty() {
+            out.push(FileEntry::ConflictHeading {
+                count: conflicts.len(),
+            });
+            out.extend(conflicts.iter().map(|idx| FileEntry::File {
+                idx: *idx,
+                depth: 0,
+            }));
+        }
+        if self.tree_view {
+            // The tree skips conflicted files; they are already above it.
+            out.extend(build_tree_entries(&self.files, &self.collapsed_dirs));
         } else {
-            (0..self.files.len())
-                .map(|idx| FileEntry::File { idx, depth: 0 })
-                .collect()
-        };
+            out.extend(
+                self.files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| !f.conflicted)
+                    .map(|(idx, _)| FileEntry::File { idx, depth: 0 }),
+            );
+        }
+        self.entries = out;
         let max = self.entries.len().saturating_sub(1);
         if self.file_scroll > max {
             self.file_scroll = max;
@@ -3404,6 +4407,80 @@ impl App {
                 }
                 return;
             }
+            Overlay::ReviewConfirm(_) => {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char('y') => self.spawn_submit_review(),
+                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                        self.overlay = Overlay::None;
+                        self.ok("Not sent — your comments are still held here.");
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            Overlay::VerdictMenu => {
+                let all = Verdict::all();
+                let last = all.len() - 1;
+                let mut close = false;
+                let hit = match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.review.pick = self.review.pick.saturating_sub(1);
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.review.pick = (self.review.pick + 1).min(last);
+                        None
+                    }
+                    KeyCode::Enter => Some(self.review.pick),
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        close = true;
+                        None
+                    }
+                    // The first letter of each verdict: c, a, r.
+                    KeyCode::Char(c) => all.iter().position(|v| {
+                        v.label().chars().next().map(|f| f.to_ascii_lowercase()) == Some(c)
+                    }),
+                    _ => None,
+                };
+                if close {
+                    self.overlay = Overlay::None;
+                    self.review.picking = false;
+                } else if let Some(i) = hit {
+                    self.overlay = Overlay::None;
+                    self.set_verdict(all[i.min(last)]);
+                }
+                return;
+            }
+            Overlay::ConflictMenu(menu) => {
+                let last = menu.items.len().saturating_sub(1);
+                let mut close = false;
+                let hit = match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        menu.sel = menu.sel.saturating_sub(1);
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        menu.sel = (menu.sel + 1).min(last);
+                        None
+                    }
+                    KeyCode::Enter => Some(menu.sel),
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        close = true;
+                        None
+                    }
+                    // Every line has its own letter, so resolving a
+                    // conflict is one key press.
+                    KeyCode::Char(c) => menu.items.iter().position(|it| it.key == c),
+                    _ => None,
+                };
+                if close {
+                    self.overlay = Overlay::None;
+                    self.ok("Left alone — nothing was resolved.");
+                } else if let Some(i) = hit {
+                    self.conflict_menu_run(i);
+                }
+                return;
+            }
             Overlay::BlameMenu(menu) => {
                 let last = menu.items.len().saturating_sub(1);
                 let mut close = false;
@@ -3484,10 +4561,11 @@ impl App {
             Overlay::Comment(draft) => {
                 match (key.code, key.modifiers) {
                     (KeyCode::Esc, _) => self.overlay = Overlay::None,
-                    (KeyCode::Char('s'), KeyModifiers::CONTROL)
-                    | (KeyCode::Enter, KeyModifiers::CONTROL) => {
-                        self.spawn_post_comment();
-                    }
+                    // The two ways a comment can leave this box. Holding
+                    // it is the primary one: a review reads as one piece,
+                    // and notifies its watchers once instead of per note.
+                    (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.hold_comment(),
+                    (KeyCode::Enter, KeyModifiers::CONTROL) => self.spawn_post_comment(),
                     _ => {
                         draft.textarea.input(key);
                     }
@@ -3523,6 +4601,37 @@ impl App {
         // The `/` prompt owns every keystroke while it is open.
         if self.find.typing {
             self.find_key(key);
+            return;
+        }
+
+        // The review box, while it has the keyboard. It is a panel rather
+        // than an overlay — the diff stays readable beside it — so it
+        // takes keys here instead of in the overlay match above.
+        if self.review.focused {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.blur_review();
+                    self.ok("Left the review box — R comes back to it.");
+                }
+                (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.ask_submit_review(),
+                // Tab picks the verdict from the keyboard; the ▾ does the
+                // same with the mouse.
+                (KeyCode::Tab, _) => self.cycle_verdict(),
+                (KeyCode::BackTab, _) => {
+                    let all = Verdict::all();
+                    let at = all
+                        .iter()
+                        .position(|v| *v == self.review.verdict)
+                        .unwrap_or(0);
+                    self.set_verdict(all[(at + all.len() - 1) % all.len()]);
+                }
+                _ => {
+                    self.review.textarea.input(key);
+                    // Cheap enough to write on every keystroke, and it is
+                    // what makes a summary survive a crash.
+                    self.save_pending();
+                }
+            }
             return;
         }
 
@@ -3871,6 +4980,10 @@ impl App {
                     // shift) the whole file. Both ask first.
                     KeyCode::Char('u') => self.ask_revert_section(self.diff_cursor),
                     KeyCode::Char('U') => self.ask_revert_file(self.file_cursor),
+                    // Resolve the merge conflict at the cursor. `o` is
+                    // free here, and it is the letter every merge tool
+                    // already uses for "ours".
+                    KeyCode::Char('o') => self.open_conflict_menu_from_key(),
                     KeyCode::Char('e') | KeyCode::Char('i') => {
                         let line = match self.cursor_pos() {
                             Some((Side::Right, n)) => Some(n),
@@ -3882,6 +4995,9 @@ impl App {
                     // belongs to search and the diff takes bare letters.
                     KeyCode::Char('P') => self.toggle_preview(),
                     KeyCode::Char('c') => self.open_comment(),
+                    // The review box at the foot of the file panel: the
+                    // pull request as a whole, rather than one line of it.
+                    KeyCode::Char('R') => self.focus_review(),
                     KeyCode::Char('`') => self.toggle_workspace(),
                     KeyCode::Char('r') => self.refresh_review(),
                     KeyCode::Char('m') => self.open_menu_from_key(),
@@ -3902,6 +5018,7 @@ impl App {
     fn back_to_pr_list(&mut self) {
         self.screen = Screen::PrList;
         self.diff = None;
+        self.conflict = None;
         self.display.clear();
         self.selection = None;
         // After an auto-opened PR the list was never fetched.
@@ -3961,6 +5078,7 @@ impl App {
             Overlay::Comment(_) => {
                 if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
                     match self.layout.button_at(x, y) {
+                        Some(ButtonId::CommentHold) => self.hold_comment(),
                         Some(ButtonId::CommentPost) => self.spawn_post_comment(),
                         Some(ButtonId::CommentCancel) => self.overlay = Overlay::None,
                         _ => {}
@@ -4017,6 +5135,47 @@ impl App {
                     match self.layout.button_at(x, y) {
                         Some(ButtonId::BlameMenuRow(i)) => self.blame_menu_run(i),
                         _ => self.overlay = Overlay::None,
+                    }
+                }
+                return;
+            }
+            Overlay::ReviewConfirm(_) => {
+                if matches!(m.kind, MouseEventKind::Down(_)) {
+                    match self.layout.button_at(x, y) {
+                        Some(ButtonId::ReviewYes) => self.spawn_submit_review(),
+                        Some(ButtonId::ReviewCancel) => {
+                            self.overlay = Overlay::None;
+                            self.ok("Not sent — your comments are still held here.");
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            Overlay::VerdictMenu => {
+                if matches!(m.kind, MouseEventKind::Down(_)) {
+                    match self.layout.button_at(x, y) {
+                        Some(ButtonId::VerdictRow(i)) => {
+                            self.overlay = Overlay::None;
+                            let all = Verdict::all();
+                            self.set_verdict(all[i.min(all.len() - 1)]);
+                        }
+                        _ => {
+                            self.overlay = Overlay::None;
+                            self.review.picking = false;
+                        }
+                    }
+                }
+                return;
+            }
+            Overlay::ConflictMenu(_) => {
+                if matches!(m.kind, MouseEventKind::Down(_)) {
+                    match self.layout.button_at(x, y) {
+                        Some(ButtonId::ConflictMenuRow(i)) => self.conflict_menu_run(i),
+                        _ => {
+                            self.overlay = Overlay::None;
+                            self.ok("Left alone — nothing was resolved.");
+                        }
                     }
                 }
                 return;
@@ -4213,10 +5372,19 @@ impl App {
                     Some(id) if self.activate(id) => return,
                     _ => {}
                 }
+                if contains(self.layout.review_box, x, y) {
+                    self.focus_review();
+                    return;
+                }
                 let fl = self.layout.file_list;
                 if contains(fl, x, y) {
                     self.file_list_click(x, y);
                     return;
+                }
+                // A click anywhere else takes the keyboard back from the
+                // review box, so typing goes where the eye is.
+                if self.review.focused {
+                    self.blur_review();
                 }
                 if contains(self.layout.blame, x, y) {
                     self.open_blame_menu(x, y);
@@ -4481,15 +5649,36 @@ impl App {
                 let cb_start = fl.x + depth;
                 // ↺ at the far right of the row, where the counts end.
                 let revert_from = fl.x + fl.width.saturating_sub(REVERT_W);
+                let conflicted = self.file_conflicted(idx);
                 if x >= cb_start && x < cb_start + 4 {
-                    self.toggle_file_mark(idx);
-                } else if self.can_revert() && x >= revert_from {
+                    // A conflicted file cannot be staged as it stands, so
+                    // its icon offers the resolve menu instead.
+                    if conflicted {
+                        self.open_conflict_for_file(idx, x, y);
+                    } else {
+                        self.toggle_file_mark(idx);
+                    }
+                } else if self.can_revert() && !conflicted && x >= revert_from {
                     self.ask_revert_file(idx);
                 } else if idx != self.file_cursor {
                     self.spawn_load_file(idx);
                 }
             }
+            // The heading is a label, not a target.
+            FileEntry::ConflictHeading { .. } => {}
         }
+    }
+
+    /// The resolve menu for a file in the panel. When it is not the open
+    /// one, load it first — the menu describes the conflict on screen, and
+    /// resolving from the wrong file would be a trap.
+    fn open_conflict_for_file(&mut self, idx: usize, x: u16, y: u16) {
+        if idx != self.file_cursor {
+            self.spawn_load_file(idx);
+            self.ok("Opening it — press o to resolve a conflict once it is on screen.");
+            return;
+        }
+        self.open_conflict_menu(self.diff_cursor, x, y);
     }
 
     /// Absolute path of a repo-relative path. The repo root is a relative
@@ -4515,6 +5704,8 @@ impl App {
                 Some(f) => (f.path.clone(), false),
                 None => return,
             },
+            // The heading names no path, so there is nothing to copy.
+            FileEntry::ConflictHeading { .. } => return,
         };
         let mut items = vec![PathMenuItem {
             key: 'r',
@@ -4857,6 +6048,22 @@ impl App {
             has_sel,
         ));
         let revert = self.can_revert();
+        // Conflicts first: they block the commit, so they outrank
+        // everything else the menu offers.
+        if self.file_conflicted(self.file_cursor) {
+            rows.push(MenuRow::Heading("MERGE CONFLICT"));
+            rows.push(item(
+                "⚑  Resolve the one at the cursor".into(),
+                "o",
+                ButtonId::ResolveConflict,
+            ));
+            rows.push(item(
+                "⚑  Resolve this whole file".into(),
+                "",
+                ButtonId::ResolveFile,
+            ));
+        }
+
         rows.push(maybe(
             "↺  Revert this section".into(),
             "u",
@@ -4869,6 +6076,42 @@ impl App {
             ButtonId::RevertFile,
             revert,
         ));
+
+        // The pull request as a whole, rather than one line of it. Local
+        // review has no pull request to say anything about.
+        if self.review_box_on() {
+            let held = self.pending.len();
+            rows.push(MenuRow::Heading("REVIEW"));
+            rows.push(item(
+                match held {
+                    0 => "✎  Write a review".into(),
+                    1 => "✎  Write a review (1 comment held)".into(),
+                    n => format!("✎  Write a review ({n} comments held)"),
+                },
+                "R",
+                ButtonId::ReviewBody,
+            ));
+            for v in Verdict::all() {
+                rows.push(switch(
+                    format!("{}  Send as: {}", v.icon(), v.label()),
+                    "",
+                    ButtonId::SetVerdict(v),
+                    v == self.review.verdict,
+                ));
+            }
+            rows.push(maybe(
+                "▲  Submit it now".into(),
+                "",
+                ButtonId::ReviewSubmit,
+                held > 0 || !self.review.is_empty(),
+            ));
+            rows.push(maybe(
+                "✕  Discard the held comments".into(),
+                "",
+                ButtonId::ReviewDiscard,
+                held > 0,
+            ));
+        }
 
         rows.push(MenuRow::Heading("GO"));
         rows.push(item("⟳  Refresh now".into(), "r", ButtonId::Refresh));
@@ -4949,6 +6192,11 @@ impl App {
     /// line. Returns false for an id this does not own (an overlay's own
     /// buttons handle those themselves).
     pub fn activate(&mut self, id: ButtonId) -> bool {
+        // Only a second Discard confirms a discard; anything else in
+        // between means the reader moved on.
+        if id != ButtonId::ReviewDiscard {
+            self.discard_armed = false;
+        }
         match id {
             ButtonId::ViewToggle => self.toggle_view(),
             ButtonId::ViewTree => self.set_tree_view(true),
@@ -4967,6 +6215,25 @@ impl App {
             ButtonId::Copy => self.yank(),
             ButtonId::RevertSection => self.ask_revert_section(self.diff_cursor),
             ButtonId::RevertFile => self.ask_revert_file(self.file_cursor),
+            ButtonId::ReviewBody => self.focus_review(),
+            ButtonId::ReviewSubmit => self.ask_submit_review(),
+            ButtonId::ReviewVerdict => {
+                self.review.picking = true;
+                self.review.pick = Verdict::all()
+                    .iter()
+                    .position(|v| *v == self.review.verdict)
+                    .unwrap_or(0);
+                self.overlay = Overlay::VerdictMenu;
+            }
+            ButtonId::ReviewDiscard => self.discard_pending(),
+            ButtonId::SetVerdict(v) => self.set_verdict(v),
+            ButtonId::ResolveConflict => self.open_conflict_menu_from_key(),
+            // Away from any one conflict: the menu then offers only the
+            // lines that settle the file as a whole.
+            ButtonId::ResolveFile => {
+                let r = self.layout.diff;
+                self.open_conflict_menu(usize::MAX, r.x + 2, r.y + 1);
+            }
             ButtonId::Refresh if self.preview.is_some() => self.reload_preview(),
             ButtonId::Refresh => match self.screen {
                 Screen::PrList => self.spawn_load_prs(),
@@ -5004,9 +6271,14 @@ impl App {
         let r = self.layout.diff;
         let vis = self.diff_scroll + (y - r.y) as usize;
         // The change bar down the left edge: anywhere on a section's bar
-        // offers to put that section back.
+        // offers to put that section back — or, on a conflicted file, to
+        // resolve the conflict that bar belongs to.
         if x < r.x + self.revert_gutter() {
-            self.ask_revert_section(vis);
+            if self.conflict.is_some() {
+                self.open_conflict_menu(vis, x, y);
+            } else {
+                self.ask_revert_section(vis);
+            }
             return;
         }
         if self.toggle_fold_row(vis) {
@@ -7171,6 +8443,9 @@ impl App {
         Workspace {
             local: self.local,
             local_branch: self.local_branch.take(),
+            merge_op: self.merge_op.take(),
+            tracking: self.tracking.take(),
+            conflict: self.conflict.take(),
             pr: self.pr.take(),
             checked_out: self.checked_out,
             merge_base: std::mem::take(&mut self.merge_base),
@@ -7198,6 +8473,9 @@ impl App {
     fn restore_workspace(&mut self, ws: Workspace) {
         self.local = ws.local;
         self.local_branch = ws.local_branch;
+        self.merge_op = ws.merge_op;
+        self.tracking = ws.tracking;
+        self.conflict = ws.conflict;
         self.pr = ws.pr;
         self.checked_out = ws.checked_out;
         self.merge_base = ws.merge_base;
@@ -7304,6 +8582,8 @@ impl App {
                     head: gitops::head_oid(),
                     files,
                     stage: gitops::stage_states(&root).unwrap_or_default(),
+                    merge_op: gitops::merge_op(&root),
+                    tracking: gitops::tracking(&root),
                 })))
             })());
         });
@@ -7397,6 +8677,8 @@ impl App {
                 let changed = self.files != d.files || self.merge_base != head;
                 self.local_branch = d.branch;
                 self.stage = d.stage;
+                self.merge_op = d.merge_op;
+                self.tracking = d.tracking;
 
                 // Nothing moved. An idle re-scan lands every few seconds,
                 // so it must leave the panel exactly as the reader left it
@@ -7448,6 +8730,7 @@ impl App {
                 self.new_hl = d.new_hl;
                 self.differs_from_head = d.differs;
                 self.diff = Some(d.diff);
+                self.conflict = d.conflict;
                 if !same {
                     self.expanded_folds.clear();
                     self.selection = None;
@@ -7464,7 +8747,9 @@ impl App {
                 // line numbers the pane is indexed by have shifted. A
                 // refresh that moved only the head still needs one,
                 // because the change set the pane colours against moved.
-                if !same || (self.blame_on && !self.blame_done && self.blame_job.is_none()) {
+                if self.conflict.is_some() {
+                    self.clear_blame();
+                } else if !same || (self.blame_on && !self.blame_done && self.blame_job.is_none()) {
                     self.spawn_blame(self.file_cursor);
                 }
                 if !same {
@@ -7472,6 +8757,15 @@ impl App {
                 } else if !auto {
                     self.ok(format!("✔ {} — up to date.", d.path));
                 }
+            }
+        }
+        // The last word belongs to the resolution that started this, not
+        // to the re-scan it triggered. Held until the chain is finished:
+        // a local re-scan starts a file reload, and only that one lands
+        // with nothing left in flight.
+        if self.quiet.is_none() && self.job.is_none() {
+            if let Some(note) = self.resolved_note.take() {
+                self.ok(note);
             }
         }
     }
@@ -7485,6 +8779,16 @@ fn load_file_data(
     file: ChangedFile,
     (merge_base, head_oid, checked_out, local, root): (String, String, bool, bool, PathBuf),
 ) -> Result<FileLoadedData> {
+    // A conflicted file is a different question, so it gets a different
+    // answer: our version against their version, with the marker lines
+    // taken out. Diffing the working tree against HEAD would instead show
+    // the markers themselves as added lines, which says nothing about
+    // what the two branches disagree on.
+    if file.conflicted {
+        if let Some(d) = load_conflict_data(idx, &file, &root) {
+            return Ok(d);
+        }
+    }
     let old = if file.status == "added" || merge_base.is_empty() {
         None
     } else {
@@ -7541,6 +8845,44 @@ fn load_file_data(
         new_hl,
         differs,
         diff,
+        conflict: None,
+    })
+}
+
+/// Load a conflicted file as the two versions that disagree.
+///
+/// The old side is our version and the new side is theirs, both with the
+/// marker lines removed. Every line the two branches agree on is in both,
+/// so it diffs to a context row and folds away; every conflict diffs to a
+/// changed section. That makes each conflict a section the reader can
+/// already jump between, fold, search, and act on.
+///
+/// `None` when the file has no markers to read — a delete/modify conflict
+/// has none, and neither does a binary file. The caller then falls back to
+/// the ordinary diff, and the whole-file resolve still works from the
+/// index (see [`gitops::take_side`]).
+fn load_conflict_data(idx: usize, file: &ChangedFile, root: &Path) -> Option<FileLoadedData> {
+    let text =
+        gitops::safe_repo_path(root, &file.path).and_then(|p| std::fs::read_to_string(p).ok())?;
+    let parsed = Conflicted::parse(&text)?;
+    let (view, ours, theirs) = ConflictView::build(parsed);
+    let diff = FileDiff::compute(Some(&ours), Some(&theirs));
+    let (old_hl, new_hl) = thread::scope(|s| {
+        let left = s.spawn(|| highlight::highlight(&file.path, &ours));
+        let right = highlight::highlight(&file.path, &theirs);
+        (left.join().expect("highlight thread panicked"), right)
+    });
+    Some(FileLoadedData {
+        idx,
+        path: file.path.clone(),
+        old: Some(ours),
+        new: Some(theirs),
+        old_hl,
+        new_hl,
+        // Nothing to anchor a PR comment against: there is no PR here.
+        differs: false,
+        diff,
+        conflict: Some(view),
     })
 }
 
@@ -7555,7 +8897,782 @@ mod tests {
             additions: 1,
             deletions: 0,
             previous: None,
+            conflicted: false,
         }
+    }
+
+    /// A conflicted entry for the file panel.
+    fn cf_conflicted(path: &str) -> ChangedFile {
+        ChangedFile {
+            conflicted: true,
+            ..cf(path)
+        }
+    }
+
+    // ---------------------------------------------------- pending review
+
+    /// A PR review of one file, in a real repository, with the diff loaded
+    /// — the state `c` and `R` act on.
+    fn review_app(dir: &std::path::Path) -> App {
+        init_repo(dir);
+        let mut app = App::new(LaunchMode::Pr, None);
+        app.screen = Screen::Review;
+        app.local = false;
+        app.checked_out = true;
+        app.repo_root = dir.to_path_buf();
+        app.repo = Some("acme/tool".into());
+        app.pr = Some(pr_detail(7));
+        app.files = vec![cf("src/a.rs")];
+        app.rebuild_entries();
+        let old = "one\ntwo\nthree\nfour\n";
+        let new = "one\nTWO\nthree\nFOUR\n";
+        app.old_content = Some(old.into());
+        app.new_content = Some(new.into());
+        app.diff = Some(FileDiff::compute(Some(old), Some(new)));
+        app.collapse_unchanged = false;
+        app.rebuild_display();
+        app
+    }
+
+    /// Ctrl+S holds a comment instead of posting it, and nothing at all
+    /// goes to the network.
+    #[test]
+    fn ctrl_s_holds_a_comment_for_the_review() {
+        let dir = TempDir::new("review-hold");
+        let mut app = review_app(&dir.0);
+        app.selection = Some(Selection::lines(Side::Right, 2, 2));
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(matches!(app.overlay, Overlay::Comment(_)));
+
+        type_into_comment(&mut app, "this needs a name");
+        app.handle_key(ctrl(KeyCode::Char('s')));
+
+        assert!(
+            matches!(app.overlay, Overlay::None),
+            "the draft is put away"
+        );
+        assert!(app.job.is_none(), "nothing was posted");
+        assert_eq!(app.pending.len(), 1);
+        let c = &app.pending[0];
+        assert_eq!(c.path, "src/a.rs");
+        assert_eq!(c.line, 2);
+        assert_eq!(c.start_line, None, "one line carries no range");
+        assert_eq!(c.side, CommentSide::Right);
+        assert_eq!(c.body, "this needs a name");
+        assert!(app.status.contains("Review started"), "{}", app.status);
+        assert!(
+            app.status.contains("Nothing is on GitHub"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// A multi-line selection keeps both ends.
+    #[test]
+    fn a_range_comment_keeps_its_first_line() {
+        let dir = TempDir::new("review-range");
+        let mut app = review_app(&dir.0);
+        app.selection = Some(Selection::lines(Side::Right, 2, 4));
+        app.handle_key(key(KeyCode::Char('c')));
+        type_into_comment(&mut app, "all of this");
+        app.handle_key(ctrl(KeyCode::Char('s')));
+        let c = &app.pending[0];
+        assert_eq!((c.start_line, c.line), (Some(2), 4));
+        assert_eq!(c.where_at(), "src/a.rs:2–4");
+    }
+
+    /// Held comments outlive the process: they are written under the git
+    /// directory as they are made, and read back when the PR reopens.
+    #[test]
+    fn held_comments_survive_a_restart() {
+        let dir = TempDir::new("review-persist");
+        let mut app = review_app(&dir.0);
+        app.selection = Some(Selection::lines(Side::Right, 2, 2));
+        app.handle_key(key(KeyCode::Char('c')));
+        type_into_comment(&mut app, "held");
+        app.handle_key(ctrl(KeyCode::Char('s')));
+        app.focus_review();
+        app.handle_key(key(KeyCode::Char('L')));
+        app.handle_key(key(KeyCode::Char('G')));
+        app.handle_key(key(KeyCode::Char('T')));
+        app.set_verdict(Verdict::RequestChanges);
+
+        // A second run of loupe, opening the same pull request.
+        let mut fresh = review_app(&dir.0);
+        assert!(fresh.pending.is_empty(), "nothing until it is read");
+        fresh.load_pending();
+        assert_eq!(fresh.pending.len(), 1);
+        assert_eq!(fresh.pending[0].body, "held");
+        assert_eq!(fresh.review.body(), "LGT");
+        assert_eq!(fresh.review.verdict, Verdict::RequestChanges);
+        assert!(
+            fresh
+                .auto_open_note
+                .as_deref()
+                .is_some_and(|n| n.contains("1 held comment")),
+            "{:?}",
+            fresh.auto_open_note
+        );
+
+        // Discarding removes the file rather than leaving an empty one.
+        // It asks once first, so this is two presses.
+        fresh.discard_pending();
+        fresh.discard_pending();
+        assert!(fresh.pending.is_empty());
+        fresh.review.clear();
+        fresh.save_pending();
+        let path = fresh.pending_path(7).expect("a path under .git");
+        assert!(!path.exists(), "nothing held, nothing left behind");
+    }
+
+    /// The 💬 in the change bar sits on the lines a held comment covers,
+    /// and nowhere else.
+    #[test]
+    fn held_comments_mark_their_own_lines() {
+        let dir = TempDir::new("review-marks");
+        let mut app = review_app(&dir.0);
+        app.selection = Some(Selection::lines(Side::Right, 2, 2));
+        app.handle_key(key(KeyCode::Char('c')));
+        type_into_comment(&mut app, "here");
+        app.handle_key(ctrl(KeyCode::Char('s')));
+
+        let marked: Vec<usize> = (0..app.display.len())
+            .filter(|i| app.pending_on_row(*i))
+            .collect();
+        assert_eq!(marked.len(), 1, "one row, not the whole file");
+        // …and it is the row showing new-side line 2.
+        let row = &app.diff.as_ref().unwrap().rows[marked[0]];
+        assert_eq!(row.new_ln, Some(2));
+
+        // A comment on the old side does not mark the new side's rows.
+        app.pending[0].side = CommentSide::Left;
+        app.pending[0].line = 4;
+        app.view = ViewMode::Inline;
+        app.rebuild_display();
+        let marked: Vec<usize> = (0..app.display.len())
+            .filter(|i| app.pending_on_row(*i))
+            .collect();
+        assert_eq!(marked.len(), 1);
+        let e = app.diff.as_ref().unwrap().inline[match app.display[marked[0]] {
+            DisplayEntry::Line(i) => i,
+            _ => panic!("a line"),
+        }];
+        assert_eq!(e.side, Side::Left, "the old side's row, not the new one's");
+
+        // A comment on another file marks nothing here.
+        app.pending[0].path = "src/other.rs".into();
+        assert!(!(0..app.display.len()).any(|i| app.pending_on_row(i)));
+    }
+
+    /// The submit prompt lists exactly what is about to be sent, and the
+    /// two cases GitHub would refuse are caught before it is.
+    #[test]
+    fn submitting_asks_first_and_says_what_goes() {
+        let dir = TempDir::new("review-submit");
+        let mut app = review_app(&dir.0);
+
+        // Nothing written and nothing held: there is no review to send.
+        app.ask_submit_review();
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status_err);
+        assert!(app.status.contains("Nothing to send"), "{}", app.status);
+
+        // "Request changes" with no summary is refused before GitHub does.
+        app.set_verdict(Verdict::RequestChanges);
+        app.pending.push(ReviewComment {
+            path: "src/a.rs".into(),
+            side: CommentSide::Right,
+            line: 2,
+            start_line: None,
+            body: "rename this".into(),
+        });
+        app.ask_submit_review();
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("needs a summary"), "{}", app.status);
+
+        // With a summary it asks, and the prompt carries the whole review.
+        app.focus_review();
+        for c in "please fix".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(ctrl(KeyCode::Char('s')));
+        let Overlay::ReviewConfirm(prompt) = &app.overlay else {
+            panic!("the confirm prompt is open, got {}", app.status);
+        };
+        assert_eq!(prompt.number, 7);
+        assert_eq!(prompt.verdict, Verdict::RequestChanges);
+        assert_eq!(prompt.body, "please fix");
+        assert_eq!(prompt.comments.len(), 1);
+        assert!(!prompt.stale);
+        assert!(app.job.is_none(), "nothing is sent until it is confirmed");
+
+        // Esc keeps everything held rather than throwing it away.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert_eq!(app.pending.len(), 1);
+        assert!(app.status.contains("still held"), "{}", app.status);
+    }
+
+    /// A head that moved under the held comments is called out, because
+    /// GitHub refuses the whole review over one bad anchor.
+    #[test]
+    fn a_moved_head_is_flagged_before_sending() {
+        let dir = TempDir::new("review-stale");
+        let mut app = review_app(&dir.0);
+        app.selection = Some(Selection::lines(Side::Right, 2, 2));
+        app.handle_key(key(KeyCode::Char('c')));
+        type_into_comment(&mut app, "note");
+        app.handle_key(ctrl(KeyCode::Char('s')));
+
+        // The PR head moves — a push landing under an open review.
+        if let Some(pr) = &mut app.pr {
+            pr.head_ref_oid = "f".repeat(40);
+        }
+        app.ask_submit_review();
+        let Overlay::ReviewConfirm(prompt) = &app.overlay else {
+            panic!("the confirm prompt is open");
+        };
+        assert!(prompt.stale, "the prompt warns rather than letting it fail");
+    }
+
+    /// A submitted review leaves nothing behind.
+    #[test]
+    fn a_sent_review_clears_what_was_held() {
+        let dir = TempDir::new("review-clear");
+        let mut app = review_app(&dir.0);
+        app.pending.push(ReviewComment {
+            path: "src/a.rs".into(),
+            side: CommentSide::Right,
+            line: 2,
+            start_line: None,
+            body: "x".into(),
+        });
+        app.save_pending();
+        assert!(app.pending_path(7).expect("path").exists());
+
+        app.apply(Outcome::ReviewSubmitted {
+            verdict: Verdict::Approve,
+            count: 1,
+        });
+        assert!(app.pending.is_empty());
+        assert!(app.review.is_empty());
+        assert!(!app.review.focused);
+        assert!(!app.pending_path(7).expect("path").exists());
+        assert!(app.status.contains("approved PR #7"), "{}", app.status);
+        assert!(app.status.contains("1 inline comment"), "{}", app.status);
+    }
+
+    /// Discarding written work asks once first.
+    #[test]
+    fn discarding_held_comments_asks_first() {
+        let dir = TempDir::new("review-discard");
+        let mut app = review_app(&dir.0);
+        app.pending.push(ReviewComment {
+            path: "src/a.rs".into(),
+            side: CommentSide::Right,
+            line: 2,
+            start_line: None,
+            body: "keep me".into(),
+        });
+        app.save_pending();
+
+        app.activate(ButtonId::ReviewDiscard);
+        assert_eq!(app.pending.len(), 1, "the first press only asks");
+        assert!(
+            app.status.contains("Discard 1 held comment?"),
+            "{}",
+            app.status
+        );
+
+        // Doing something else in between means the reader moved on.
+        app.activate(ButtonId::ViewToggle);
+        app.activate(ButtonId::ReviewDiscard);
+        assert_eq!(app.pending.len(), 1, "it asks again rather than acting");
+
+        app.activate(ButtonId::ReviewDiscard);
+        assert!(app.pending.is_empty());
+        assert!(
+            app.status.contains("nothing was ever sent to GitHub"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// Tab walks the three verdicts and comes back round.
+    #[test]
+    fn tab_cycles_the_verdict() {
+        let dir = TempDir::new("review-verdict");
+        let mut app = review_app(&dir.0);
+        app.focus_review();
+        assert_eq!(app.review.verdict, Verdict::Comment);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.review.verdict, Verdict::Approve);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.review.verdict, Verdict::RequestChanges);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.review.verdict, Verdict::Comment);
+        // Esc gives the keyboard back to the diff.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.review.focused);
+        // …and `j` moves the diff cursor again rather than typing a "j".
+        let before = app.diff_cursor;
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_ne!(app.diff_cursor, before);
+        assert!(app.review.is_empty(), "nothing was typed into the box");
+    }
+
+    /// The review box belongs to a pull request, and says so elsewhere.
+    #[test]
+    fn the_review_box_is_pr_only() {
+        let dir = TempDir::new("review-local");
+        let mut app = review_app(&dir.0);
+        assert!(app.review_box_on());
+        app.local = true;
+        app.pr = None;
+        assert!(!app.review_box_on());
+        app.focus_review();
+        assert!(app.status_err);
+        assert!(
+            app.status.contains("No pull request open"),
+            "{}",
+            app.status
+        );
+    }
+    // -------------------------------------------------------- conflicts
+
+    const CONFLICT_TEXT: &str = "\
+keep-one
+<<<<<<< HEAD
+ours-line
+=======
+theirs-line
+>>>>>>> feature
+keep-two
+keep-three
+<<<<<<< HEAD
+ours-two
+=======
+theirs-two
+>>>>>>> feature
+keep-four
+";
+
+    /// A repository in `dir`, so the staging half of a resolution has an
+    /// index to write to.
+    fn init_repo(dir: &std::path::Path) {
+        let d = dir.to_string_lossy().into_owned();
+        for args in [
+            vec!["-C", d.as_str(), "init", "-q", "-b", "main", "."],
+            vec!["-C", d.as_str(), "config", "user.email", "loupe@test"],
+            vec!["-C", d.as_str(), "config", "user.name", "loupe"],
+        ] {
+            gitops::run_git(&args).unwrap();
+        }
+    }
+
+    /// A local review of one conflicted file, loaded the way the real load
+    /// job loads it.
+    fn conflict_app(dir: &std::path::Path) -> App {
+        init_repo(dir);
+        std::fs::write(dir.join("merge.txt"), CONFLICT_TEXT).unwrap();
+        let mut app = App::new(LaunchMode::Local, None);
+        app.local = true;
+        app.checked_out = true;
+        app.screen = Screen::Review;
+        app.repo_root = dir.to_path_buf();
+        app.files = vec![cf_conflicted("merge.txt")];
+        app.rebuild_entries();
+        let d = load_conflict_data(0, &app.files[0], dir).expect("the markers parse");
+        app.apply(Outcome::FileLoaded(Box::new(d)));
+        app
+    }
+
+    #[test]
+    fn conflicts_are_listed_first_under_their_own_heading() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.local = true;
+        // As `local_changes` returns them: conflicts first, then by path.
+        app.files = vec![cf_conflicted("src/z.rs"), cf("a.rs"), cf("src/deep/b.rs")];
+        for tree in [true, false] {
+            app.tree_view = tree;
+            app.rebuild_entries();
+            assert_eq!(
+                app.entries[0],
+                FileEntry::ConflictHeading { count: 1 },
+                "tree_view = {tree}"
+            );
+            assert_eq!(
+                app.entries[1],
+                FileEntry::File { idx: 0, depth: 0 },
+                "the conflict sits under the heading, tree_view = {tree}"
+            );
+            // …and it is not repeated further down.
+            let repeats = app.entries[2..]
+                .iter()
+                .filter(|e| matches!(e, FileEntry::File { idx: 0, .. }))
+                .count();
+            assert_eq!(repeats, 0, "no second copy, tree_view = {tree}");
+            // The other two files are still all there.
+            let files = app
+                .entries
+                .iter()
+                .filter(|e| matches!(e, FileEntry::File { .. }))
+                .count();
+            assert_eq!(files, 3, "tree_view = {tree}");
+        }
+        // With nothing conflicted the heading is gone entirely.
+        app.files = vec![cf("a.rs")];
+        app.rebuild_entries();
+        assert!(!app
+            .entries
+            .iter()
+            .any(|e| matches!(e, FileEntry::ConflictHeading { .. })));
+    }
+
+    /// The diff of a conflicted file is our version against theirs, with
+    /// one changed section per conflict and the markers nowhere on screen.
+    #[test]
+    fn a_conflict_shows_as_our_version_against_theirs() {
+        let dir = TempDir::new("conflict-view");
+        let app = conflict_app(&dir.0);
+
+        let view = app.conflict.as_ref().expect("the file is a conflict view");
+        assert_eq!(view.file.len(), 2);
+        assert_eq!(view.file.labels(), ("HEAD", "feature"));
+
+        let old = app.old_content.as_deref().expect("our side");
+        let new = app.new_content.as_deref().expect("their side");
+        assert_eq!(
+            old,
+            "keep-one\nours-line\nkeep-two\nkeep-three\nours-two\nkeep-four\n"
+        );
+        assert_eq!(
+            new,
+            "keep-one\ntheirs-line\nkeep-two\nkeep-three\ntheirs-two\nkeep-four\n"
+        );
+        for text in [old, new] {
+            assert!(!text.contains("<<<<<<<"), "markers never reach the pane");
+            assert!(!text.contains("======="));
+        }
+
+        // Two conflicts, so two changed sections in the row model.
+        let diff = app.diff.as_ref().expect("a diff");
+        assert_eq!(diff.sections().len(), 2);
+        // …and the blame pane stands down: its line numbers would be wrong.
+        assert!(app.blame_new.is_none() && app.blame_old.is_none());
+    }
+
+    /// The change bar marks each conflict, and only the rows inside one.
+    #[test]
+    fn the_change_bar_marks_each_conflict() {
+        let dir = TempDir::new("conflict-bar");
+        let mut app = conflict_app(&dir.0);
+        app.collapse_unchanged = false;
+        app.rebuild_display();
+
+        let bars: Vec<Option<bool>> = (0..app.display.len())
+            .map(|i| app.conflict_bar(i))
+            .collect();
+        let firsts: Vec<usize> = bars
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b == Some(true))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(firsts.len(), 2, "one ⚑ per conflict: {bars:?}");
+        // The agreed lines carry nothing at all.
+        assert_eq!(app.conflict_bar(0), None, "keep-one is agreed");
+        // And each ⚑ row names the conflict it opens.
+        assert_eq!(app.conflict_on_row(firsts[0]), Some(0));
+        assert_eq!(app.conflict_on_row(firsts[1]), Some(1));
+    }
+
+    /// The whole flow: put the cursor on a conflict, take one side, and
+    /// see it written to disk with the other conflict left alone.
+    #[test]
+    fn taking_a_side_rewrites_only_that_conflict() {
+        let dir = TempDir::new("conflict-resolve");
+        let mut app = conflict_app(&dir.0);
+        app.collapse_unchanged = false;
+        app.rebuild_display();
+        let first = (0..app.display.len())
+            .find(|i| app.conflict_bar(*i) == Some(true))
+            .expect("a ⚑ row");
+        app.diff_cursor = first;
+
+        // `o` opens the menu for the conflict under the cursor.
+        app.handle_key(key(KeyCode::Char('o')));
+        let Overlay::ConflictMenu(menu) = &app.overlay else {
+            panic!("the resolve menu is open");
+        };
+        assert_eq!(menu.hunk, Some(0));
+        assert_eq!(menu.title, "Conflict 1 of 2");
+        // Ours, theirs, both, take-all ×2, edit, mark resolved. No
+        // ancestor line: this file was written in the plain marker style.
+        let keys: Vec<char> = menu.items.iter().map(|it| it.key).collect();
+        assert_eq!(keys, vec!['o', 't', 'b', 'O', 'T', 'e', 'x']);
+
+        // `t` keeps their side of this one conflict.
+        app.handle_key(key(KeyCode::Char('t')));
+        let on_disk = std::fs::read_to_string(dir.0.join("merge.txt")).unwrap();
+        assert_eq!(
+            on_disk,
+            "keep-one\ntheirs-line\nkeep-two\nkeep-three\n\
+             <<<<<<< HEAD\nours-two\n=======\ntheirs-two\n>>>>>>> feature\nkeep-four\n",
+            "the second conflict keeps its markers"
+        );
+        assert!(app.status.contains("1 left"), "{}", app.status);
+        assert!(!app.status_err, "{}", app.status);
+    }
+
+    /// Taking one side everywhere clears the file in one go.
+    #[test]
+    fn taking_one_side_everywhere_clears_the_file() {
+        let dir = TempDir::new("conflict-all");
+        let mut app = conflict_app(&dir.0);
+        app.resolve_all("merge.txt", Resolution::Ours);
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("merge.txt")).unwrap(),
+            "keep-one\nours-line\nkeep-two\nkeep-three\nours-two\nkeep-four\n"
+        );
+        // Nothing is left to resolve, so the file is staged with it —
+        // git treats a path as conflicted until it is added.
+        assert!(!app.status_err, "{}", app.status);
+        assert!(app.status.contains("staged it"), "{}", app.status);
+        assert_eq!(
+            gitops::stage_states(&dir.0).unwrap().get("merge.txt"),
+            Some(&StageState::Staged)
+        );
+    }
+
+    /// A conflicted file must not be reverted: `git checkout` against HEAD
+    /// mid-merge throws the merge away for that path.
+    #[test]
+    fn a_conflicted_file_refuses_to_be_reverted() {
+        let dir = TempDir::new("conflict-revert");
+        let mut app = conflict_app(&dir.0);
+        app.handle_key(key(KeyCode::Char('U')));
+        assert!(matches!(app.overlay, Overlay::None), "no revert prompt");
+        assert!(app.status_err);
+        assert!(app.status.contains("merge conflict"), "{}", app.status);
+
+        // `u` on a conflict view offers the resolve menu instead.
+        app.status.clear();
+        app.handle_key(key(KeyCode::Char('u')));
+        assert!(matches!(app.overlay, Overlay::ConflictMenu(_)));
+    }
+
+    /// Away from any one conflict, the menu offers only the lines that
+    /// settle the whole file.
+    #[test]
+    fn the_whole_file_menu_leaves_out_the_single_conflict_lines() {
+        let dir = TempDir::new("conflict-whole");
+        let mut app = conflict_app(&dir.0);
+        app.open_conflict_menu(usize::MAX, 0, 0);
+        let Overlay::ConflictMenu(menu) = &app.overlay else {
+            panic!("the menu is open");
+        };
+        assert_eq!(menu.hunk, None);
+        assert!(menu.title.contains("whole file"), "{}", menu.title);
+        let keys: Vec<char> = menu.items.iter().map(|it| it.key).collect();
+        assert_eq!(keys, vec!['O', 'T', 'e', 'x']);
+    }
+
+    /// A conflict git could not write markers for — one side deleted the
+    /// file — still opens, still warns, and still offers the whole-file
+    /// lines that read the index instead.
+    #[test]
+    fn a_conflict_with_no_markers_still_offers_a_way_out() {
+        let dir = TempDir::new("conflict-nomarkers");
+        init_repo(&dir.0);
+        std::fs::write(dir.0.join("plain.txt"), "no markers here\n").unwrap();
+        let file = cf_conflicted("plain.txt");
+        assert!(
+            load_conflict_data(0, &file, &dir.0).is_none(),
+            "nothing to parse, so the ordinary diff is used"
+        );
+
+        let mut app = App::new(LaunchMode::Local, None);
+        app.local = true;
+        app.checked_out = true;
+        app.screen = Screen::Review;
+        app.repo_root = dir.0.clone();
+        app.files = vec![file];
+        app.rebuild_entries();
+        app.open_conflict_menu(0, 0, 0);
+        let Overlay::ConflictMenu(menu) = &app.overlay else {
+            panic!("the menu is open");
+        };
+        let keys: Vec<char> = menu.items.iter().map(|it| it.key).collect();
+        assert_eq!(keys, vec!['o', 't', 'e', 'x']);
+        assert!(menu
+            .items
+            .iter()
+            .any(|it| it.act == ConflictAction::TakeSide { ours: true }));
+    }
+
+    /// Two conflicts with no agreed line between them collapse into one
+    /// diff section. The row-to-conflict map does not come from the
+    /// sections, so both are still marked and both are still resolvable.
+    #[test]
+    fn back_to_back_conflicts_stay_separate() {
+        let dir = TempDir::new("conflict-adjacent");
+        init_repo(&dir.0);
+        let text = "\
+<<<<<<< HEAD
+a1
+=======
+b1
+>>>>>>> feature
+<<<<<<< HEAD
+a2
+=======
+b2
+>>>>>>> feature
+";
+        std::fs::write(dir.0.join("merge.txt"), text).unwrap();
+        let mut app = App::new(LaunchMode::Local, None);
+        app.local = true;
+        app.checked_out = true;
+        app.screen = Screen::Review;
+        app.repo_root = dir.0.clone();
+        app.files = vec![cf_conflicted("merge.txt")];
+        app.rebuild_entries();
+        let d = load_conflict_data(0, &app.files[0], &dir.0).expect("markers");
+        app.apply(Outcome::FileLoaded(Box::new(d)));
+        app.collapse_unchanged = false;
+        app.rebuild_display();
+
+        // One section — there is no context row to split them.
+        assert_eq!(app.diff.as_ref().unwrap().sections().len(), 1);
+        // …but two conflicts, and every row belongs to one of them.
+        let owners: Vec<Option<usize>> = (0..app.display.len())
+            .map(|i| app.conflict_on_row(i))
+            .collect();
+        assert!(
+            owners.contains(&Some(0)) && owners.contains(&Some(1)),
+            "{owners:?}"
+        );
+
+        // Resolving the second leaves the first exactly as it was.
+        app.resolve_hunk("merge.txt", Some(1), Resolution::Theirs);
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("merge.txt")).unwrap(),
+            "<<<<<<< HEAD\na1\n=======\nb1\n>>>>>>> feature\nb2\n"
+        );
+    }
+
+    /// A hand edit rewrites the very text the conflict view was parsed
+    /// from. Keeping the old parse would let the next resolution write the
+    /// file back the way it was before the edit, silently losing it.
+    #[test]
+    fn saving_a_hand_edit_throws_the_stale_parse_away() {
+        let dir = TempDir::new("conflict-save");
+        let mut app = conflict_app(&dir.0);
+        assert!(app.conflict.is_some());
+
+        // What `spawn_save_editor` lands with once the buffer is written.
+        let edited = CONFLICT_TEXT.replace("keep-one", "keep-one-edited");
+        std::fs::write(dir.0.join("merge.txt"), &edited).unwrap();
+        app.apply(Outcome::EditorSaved(Box::new(EditorSavedData {
+            path: "merge.txt".into(),
+            content: edited.clone(),
+            differs: false,
+            diff: FileDiff::compute(app.old_content.as_deref(), Some(&edited)),
+            new_hl: Vec::new(),
+        })));
+        assert!(
+            app.conflict.is_none(),
+            "the parse is dropped until the file is read again"
+        );
+        assert!(app.status.contains("re-reading"), "{}", app.status);
+
+        // Reading it again picks the edit up, still as a conflict view.
+        let d = load_conflict_data(0, &app.files[0], &dir.0).expect("markers survive the edit");
+        app.apply(Outcome::FileLoaded(Box::new(d)));
+        let view = app.conflict.as_ref().expect("a fresh parse");
+        assert_eq!(view.file.len(), 2);
+        assert!(app
+            .old_content
+            .as_deref()
+            .unwrap()
+            .starts_with("keep-one-edited"));
+    }
+
+    /// A conflict settled by hand: no markers left, so `x` stages it.
+    #[test]
+    fn marking_resolved_needs_the_markers_gone() {
+        let dir = TempDir::new("conflict-mark");
+        let mut app = conflict_app(&dir.0);
+
+        // Markers still there: it refuses rather than staging a broken file.
+        app.mark_resolved("merge.txt");
+        assert!(app.status_err);
+        assert!(
+            app.status.contains("still holds conflict markers"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            gitops::stage_states(&dir.0).unwrap().get("merge.txt"),
+            Some(&StageState::Unstaged),
+            "nothing reached the index"
+        );
+
+        // Resolved by hand, then marked.
+        std::fs::write(dir.0.join("merge.txt"), "settled by hand\n").unwrap();
+        app.mark_resolved("merge.txt");
+        assert!(!app.status_err, "{}", app.status);
+        assert!(
+            app.status.contains("Marked merge.txt resolved"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            gitops::stage_states(&dir.0).unwrap().get("merge.txt"),
+            Some(&StageState::Staged)
+        );
+    }
+
+    /// The ancestor line only appears when git wrote an ancestor.
+    #[test]
+    fn the_ancestor_line_appears_only_in_the_diff3_style() {
+        let dir = TempDir::new("conflict-diff3");
+        init_repo(&dir.0);
+        std::fs::write(
+            dir.0.join("merge.txt"),
+            "<<<<<<< HEAD\nours\n||||||| base\nwas\n=======\ntheirs\n>>>>>>> feature\n",
+        )
+        .unwrap();
+        let mut app = App::new(LaunchMode::Local, None);
+        app.local = true;
+        app.checked_out = true;
+        app.screen = Screen::Review;
+        app.repo_root = dir.0.clone();
+        app.files = vec![cf_conflicted("merge.txt")];
+        app.rebuild_entries();
+        let d = load_conflict_data(0, &app.files[0], &dir.0).expect("markers");
+        app.apply(Outcome::FileLoaded(Box::new(d)));
+        app.collapse_unchanged = false;
+        app.rebuild_display();
+        let first = (0..app.display.len())
+            .find(|i| app.conflict_bar(*i) == Some(true))
+            .expect("a ⚑ row");
+        app.diff_cursor = first;
+        app.handle_key(key(KeyCode::Char('o')));
+        let Overlay::ConflictMenu(menu) = &app.overlay else {
+            panic!("the menu is open");
+        };
+        assert!(menu
+            .items
+            .iter()
+            .any(|it| it.act == ConflictAction::Take(Resolution::Base)));
+        // Taking it writes the ancestor's line.
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("merge.txt")).unwrap(),
+            "was\n"
+        );
     }
 
     // ------------------------------------------------- the markdown preview
@@ -7574,6 +9691,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         std::fs::write(dir.join("PLAN.md"), body).expect("fixture written");
@@ -7654,6 +9772,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             previous: None,
+            conflicted: false,
         });
         app.files.push(cf("src/main.rs"));
         app.rebuild_entries();
@@ -7671,6 +9790,7 @@ mod tests {
             new_hl: Vec::new(),
             differs: false,
             diff: FileDiff::compute(None, Some("# Notes\n")),
+            conflict: None,
         })));
         assert_eq!(
             app.preview.as_ref().map(|p| p.path.as_str()),
@@ -7687,6 +9807,7 @@ mod tests {
             new_hl: Vec::new(),
             differs: false,
             diff: FileDiff::compute(None, Some("fn main() {}\n")),
+            conflict: None,
         })));
         assert!(app.preview.is_none());
     }
@@ -7772,6 +9893,17 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    /// Type into the inline comment draft that is open.
+    fn type_into_comment(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
     }
 
     /// The theme picker previews live (selection switches the process-wide
@@ -8236,6 +10368,7 @@ mod tests {
             new_hl: Vec::new(),
             differs: false,
             diff: FileDiff::compute(a.old_content.as_deref(), a.new_content.as_deref()),
+            conflict: None,
         };
         let data = same(&app);
         app.apply_quiet(QuietOutcome::File(Box::new(data)), true);
@@ -8267,6 +10400,7 @@ mod tests {
                 new_hl: Vec::new(),
                 differs: false,
                 diff: FileDiff::compute(Some("a\n"), Some("c\n")),
+                conflict: None,
             })),
             true,
         );
@@ -8292,6 +10426,8 @@ mod tests {
                 head: Some(app.merge_base.clone()),
                 files: vec![cf("a.rs"), cf("b.rs"), cf("c.rs")],
                 stage: HashMap::new(),
+                merge_op: None,
+                tracking: None,
             })),
             true,
         );
@@ -8812,6 +10948,9 @@ mod tests {
         Workspace {
             local: false,
             local_branch: None,
+            merge_op: None,
+            tracking: None,
+            conflict: None,
             pr: Some(pr_detail(number)),
             checked_out: true,
             merge_base: "c".repeat(40),
@@ -8915,6 +11054,7 @@ mod tests {
             new_hl: Vec::new(),
             differs: false,
             diff: FileDiff::compute(Some(old), Some(new)),
+            conflict: None,
         };
 
         // Identical content: position and selection survive untouched.
@@ -9643,6 +11783,7 @@ mod tests {
             additions: 3,
             deletions: 0,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         app.ask_revert_file(0);

@@ -6,6 +6,7 @@ use crate::app::{
 };
 use crate::blame::{self, Heat};
 use crate::diff::{DisplayEntry, Row, RowKind, Selection, Side, TAB_WIDTH};
+use crate::github::Verdict;
 use crate::gitops::StageState;
 use crate::highlight::HlLine;
 use crate::theme::palette;
@@ -62,6 +63,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Hover(_) => draw_hover(f, app, area),
         Overlay::PathMenu(_) => draw_path_menu(f, app, area),
         Overlay::BlameMenu(_) => draw_blame_menu(f, app, area),
+        Overlay::ConflictMenu(_) => draw_conflict_menu(f, app, area),
+        Overlay::ReviewConfirm(_) => draw_review_confirm(f, app, area),
+        Overlay::VerdictMenu => draw_verdict_menu(f, app, area),
         Overlay::Menu(_) => draw_menu(f, app, area),
     }
 }
@@ -253,6 +257,46 @@ fn menu_open(app: &App) -> bool {
     matches!(app.overlay, Overlay::Menu(_))
 }
 
+/// The "↑2 ↓1 origin/main" counts beside the branch name.
+///
+/// Ahead and behind answer two different questions — what is not pushed,
+/// and what has landed upstream since — so they keep two colors and are
+/// both left off when there is nothing to say. An empty list means the
+/// branch is level with its upstream, or tracks nothing loupe can resolve.
+fn track_spans<'a>(app: &App) -> Vec<Span<'a>> {
+    let p = palette();
+    let Some(t) = &app.tracking else {
+        return Vec::new();
+    };
+    if t.in_sync() {
+        return vec![Span::styled(
+            format!("  ≡ {}", t.upstream),
+            Style::default().fg(p.faint),
+        )];
+    }
+    let mut out = vec![Span::raw("  ")];
+    if t.ahead > 0 {
+        out.push(Span::styled(
+            format!("↑{}", t.ahead),
+            Style::default().fg(p.ahead).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if t.behind > 0 {
+        if t.ahead > 0 {
+            out.push(Span::raw(" "));
+        }
+        out.push(Span::styled(
+            format!("↓{}", t.behind),
+            Style::default().fg(p.behind).add_modifier(Modifier::BOLD),
+        ));
+    }
+    out.push(Span::styled(
+        format!(" {}", t.upstream),
+        Style::default().fg(p.faint),
+    ));
+    out
+}
+
 fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
     // Badge + title: "PR #N — <title>" for a PR review, "LOCAL — <branch>,
     // uncommitted changes" when reviewing the working tree.
@@ -294,30 +338,49 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
         );
         return;
     }
+    let conflicts = app.conflict_count();
     let (badge, badge_bg, title, note) = if app.local {
         let branch = app
             .local_branch
             .clone()
             .unwrap_or_else(|| "detached HEAD".into());
-        (
-            " ⎇ LOCAL ".to_string(),
-            p.badge_local,
-            branch,
-            "  — uncommitted changes vs HEAD",
-        )
+        // Mid-merge, the badge says so: the working tree is not just
+        // "some edits" any more, and the way out is a different one.
+        match app.merge_op {
+            Some(op) => (
+                format!(" ⚠ {} ", op.badge()),
+                p.badge_conflict,
+                branch,
+                if conflicts > 0 {
+                    format!("  — resolve the conflicts to finish the {}", op.noun())
+                } else {
+                    format!("  — conflicts resolved; finish the {}", op.noun())
+                },
+            ),
+            None => (
+                " ⎇ LOCAL ".to_string(),
+                p.badge_local,
+                branch,
+                "  — uncommitted changes vs HEAD".to_string(),
+            ),
+        }
     } else {
         let (num, title) = app
             .pr
             .as_ref()
             .map(|p| (p.number, p.title.clone()))
             .unwrap_or((0, String::new()));
-        (format!(" PR #{num} "), p.badge_pr, title, "")
+        (format!(" PR #{num} "), p.badge_pr, title, String::new())
     };
+    // How far the branch has drifted from the branch it tracks. Two short
+    // counts, next to the name they are about.
+    let drift = track_spans(app);
+    let drift_w: usize = drift.iter().map(|s| disp_width(&s.content)).sum();
     // The badge and the PR title (or branch) are what the buttons have to
     // leave room for; the trailing note is expendable.
     let shown_title = tail_truncate(&title, (area.width / 3) as usize);
     let badge_w = disp_width(&badge) as u16;
-    let reserve = badge_w + 1 + disp_width(&shown_title) as u16 + 1;
+    let reserve = badge_w + 1 + disp_width(&shown_title) as u16 + drift_w as u16 + 1;
     // The badge is a click target: right-click copies the PR link.
     app.layout.badge = Rect {
         x: area.x,
@@ -325,7 +388,7 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
         width: badge_w.min(area.width),
         height: 1,
     };
-    let left = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             badge,
             Style::default()
@@ -338,9 +401,10 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
             shown_title,
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(note, Style::default().fg(p.dim)),
-    ]);
-    f.render_widget(Paragraph::new(left), area);
+    ];
+    spans.extend(drift);
+    spans.push(Span::styled(note, Style::default().fg(p.dim)));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 
     // The toolbar carries only what fits what you are doing right now;
     // ☰ holds the rest. Eleven buttons on one row left no space for the
@@ -495,7 +559,20 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
         width: 2.min(area.width.saturating_sub(fw.saturating_sub(1))),
         height: area.height,
     };
-    draw_file_list(f, app, cols[0]);
+    // The review composer takes the foot of the file panel. It is only
+    // drawn when there is a pull request to review and enough height that
+    // the file list is still usable above it.
+    let rw = review_box_height(app, cols[0].height);
+    let panel = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(rw)])
+        .split(cols[0]);
+    draw_file_list(f, app, panel[0]);
+    if rw > 0 {
+        draw_review_box(f, app, panel[1]);
+    } else {
+        app.layout.review_box = Rect::default();
+    }
 
     if bw > 0 {
         let seam = fw + bw;
@@ -597,17 +674,35 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
     // The Tree/Flat toggle is drawn on the same border row as the title:
     // on a narrowed panel, shorten the title rather than let them collide.
     let n = app.files.len();
-    let full = if app.local {
+    let conflicts = app.conflict_count();
+    let full = if conflicts > 0 {
+        format!(
+            " Files — ⚠ {conflicts} conflict{} ",
+            if conflicts == 1 { "" } else { "s" }
+        )
+    } else if app.local {
         format!(" Files {viewed_n}/{n} staged ")
     } else {
         format!(" Files {viewed_n}/{n} ✓ ")
     };
-    let title = if area.width as usize >= disp_width(&full) + TOGGLE_W + 2 {
-        full
+    let short = if conflicts > 0 {
+        format!(" ⚠ {conflicts} ")
     } else {
         format!(" {viewed_n}/{n} ")
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let title = if area.width as usize >= disp_width(&full) + TOGGLE_W + 2 {
+        full
+    } else {
+        short
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if conflicts > 0 {
+            Style::default().fg(p.conflict)
+        } else {
+            Style::default()
+        })
+        .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.layout.file_list = inner;
@@ -641,6 +736,16 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = Vec::new();
     for entry in app.entries.iter().skip(app.file_scroll).take(h) {
         match entry {
+            FileEntry::ConflictHeading { count } => {
+                let text = format!(
+                    "⚠ {count} MERGE CONFLICT{}",
+                    if *count == 1 { "" } else { "S" }
+                );
+                lines.push(Line::from(Span::styled(
+                    truncate_pad(&text, inner.width as usize),
+                    Style::default().fg(p.conflict).add_modifier(Modifier::BOLD),
+                )));
+            }
             FileEntry::Dir { label, path, depth } => {
                 let arrow = if app.collapsed_dirs.contains(path) {
                     "▸"
@@ -666,12 +771,21 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                 };
                 let sc = file.status_char();
                 let sc_color = match sc {
+                    '!' => p.conflict,
                     'A' => p.st_added,
                     'D' => p.st_removed,
                     'R' | 'C' => p.st_renamed,
                     _ => p.st_other,
                 };
-                let (cb, cb_style) = if app.local {
+                let conflicted = file.conflicted;
+                let (cb, cb_style) = if conflicted {
+                    // A conflicted file cannot be staged as it stands, so
+                    // the icon column warns instead of counting.
+                    (
+                        "[!]",
+                        Style::default().fg(p.conflict).add_modifier(Modifier::BOLD),
+                    )
+                } else if app.local {
                     match staged {
                         StageState::Staged => (
                             "[✓]",
@@ -685,6 +799,12 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                                 .add_modifier(Modifier::BOLD),
                         ),
                         StageState::Unstaged => ("[+]", Style::default().fg(p.stage_add)),
+                        // Handled above — a conflicted file never reaches
+                        // this arm, but the index can say so first.
+                        StageState::Conflicted => (
+                            "[!]",
+                            Style::default().fg(p.conflict).add_modifier(Modifier::BOLD),
+                        ),
                     }
                 } else if done {
                     (
@@ -699,18 +819,38 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     file.path.as_str()
                 };
-                let counts = format!(" +{} −{}", file.additions, file.deletions);
+                // A conflicted file's +/− counts describe the marker text
+                // git wrote, not a change anyone made, so they are left
+                // off. The columns stay, so the rows still line up.
+                let counts = if conflicted {
+                    " ".repeat(
+                        format!(" +{} −{}", file.additions, file.deletions)
+                            .chars()
+                            .count(),
+                    )
+                } else {
+                    format!(" +{} −{}", file.additions, file.deletions)
+                };
+                // Held comments on this file, so a review in progress is
+                // visible from the panel rather than only from the diff.
+                let held = app.pending_in(&file.path);
+                let held_s = if held > 0 {
+                    format!(" 💬{held}")
+                } else {
+                    String::new()
+                };
                 let indent = *depth as usize;
                 // ↺ at the end of the row throws the whole file's changes
                 // away (after asking). Only when there is a working tree to
                 // put back — a read-only PR keeps the columns for the name.
-                let revert_w = if app.can_revert() {
+                let revert_w = if app.can_revert() && !conflicted {
                     crate::app::REVERT_W as usize
                 } else {
                     0
                 };
-                let name_w = (inner.width as usize)
-                    .saturating_sub(indent + 6 + counts.chars().count() + revert_w);
+                let name_w = (inner.width as usize).saturating_sub(
+                    indent + 6 + counts.chars().count() + disp_width(&held_s) + revert_w,
+                );
                 let name_t = tail_truncate(name, name_w);
                 let pad = name_w.saturating_sub(disp_width(&name_t));
                 let base = if selected {
@@ -718,12 +858,19 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                 } else {
                     Style::default()
                 };
-                let name_fg = if done { p.viewed } else { p.text };
+                let name_fg = if conflicted {
+                    p.conflict
+                } else if done {
+                    p.viewed
+                } else {
+                    p.text
+                };
                 let mut spans = vec![
                     Span::styled(" ".repeat(indent), base),
                     Span::styled(format!("{cb} "), base.patch(cb_style)),
                     Span::styled(format!("{sc} "), base.fg(sc_color)),
                     Span::styled(format!("{name_t}{}", " ".repeat(pad)), base.fg(name_fg)),
+                    Span::styled(held_s, base.fg(p.accent)),
                     Span::styled(counts, base.fg(p.dim)),
                 ];
                 if revert_w > 0 {
@@ -734,6 +881,385 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ----------------------------------------------------------- the review box
+
+/// Rows the review composer takes at the foot of the file panel.
+///
+/// A border, the heading, the summary box, and the button row. It stands
+/// down entirely on a short terminal: a file list squeezed to two rows to
+/// make space for it would be the worse trade.
+fn review_box_height(app: &App, panel_h: u16) -> u16 {
+    if !app.review_box_on() {
+        return 0;
+    }
+    // 2 border + 1 heading + 3 text + 1 buttons.
+    const WANT: u16 = 7;
+    // …and at least this much left over for the files themselves.
+    const KEEP: u16 = 6;
+    if panel_h < WANT + KEEP {
+        0
+    } else {
+        WANT
+    }
+}
+
+/// The composer: a summary, and the verdict to send with it.
+///
+/// Inline comments say "this line is wrong". This is where the review says
+/// what it thinks of the change as a whole — and it is the only control
+/// that actually sends anything, held comments included.
+fn draw_review_box(f: &mut Frame, app: &mut App, area: Rect) {
+    let p = palette();
+    let held = app.pending.len();
+    let focused = app.review.focused;
+    let title = if held == 0 {
+        " Review ".to_string()
+    } else {
+        format!(" Review · {held} held ")
+    };
+    let border = if focused {
+        p.divider_active
+    } else if held > 0 {
+        p.accent
+    } else {
+        p.divider
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height < 4 {
+        app.layout.review_box = Rect::default();
+        return;
+    }
+
+    // Line 1: what is held, and the way to throw it away.
+    let head = Rect { height: 1, ..inner };
+    if held == 0 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_pad(" c holds a line comment", inner.width as usize),
+                Style::default().fg(p.faint),
+            ))),
+            head,
+        );
+    } else {
+        const DISCARD: &str = "✕ Discard";
+        // The button is drawn over the right of this row, so the label
+        // gets what is left rather than running underneath it.
+        let room = (inner.width as usize).saturating_sub(disp_width(DISCARD) + 3);
+        let label = format!(
+            " 💬 {held} comment{} held",
+            if held == 1 { "" } else { "s" }
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_pad(&label, room),
+                Style::default().fg(p.accent),
+            ))),
+            head,
+        );
+        buttons_right(
+            f,
+            app,
+            head,
+            room as u16,
+            &[(DISCARD, ButtonId::ReviewDiscard, false)],
+        );
+    }
+
+    // The summary box. It is the same widget the editor and the comment
+    // overlay use, so the keys inside it are the keys everywhere else.
+    let body_h = inner.height.saturating_sub(2);
+    let body = Rect {
+        y: inner.y + 1,
+        height: body_h,
+        ..inner
+    };
+    app.layout.review_box = body;
+    app.layout.buttons.push((body, ButtonId::ReviewBody));
+    let ta = &mut app.review.textarea;
+    ta.set_style(Style::default().fg(p.text));
+    ta.set_placeholder_style(Style::default().fg(p.dim));
+    ta.set_cursor_line_style(Style::default());
+    // The cursor is only real where the keyboard is; a block cursor in an
+    // unfocused box reads as "type here" and would be a lie.
+    ta.set_cursor_style(if focused {
+        Style::default().bg(p.accent).fg(p.badge_fg)
+    } else {
+        Style::default()
+    });
+    f.render_widget(&*ta, body);
+
+    // The split button: the verdict, and a ▾ that offers the other two.
+    let row = Rect {
+        y: inner.y + inner.height - 1,
+        height: 1,
+        ..inner
+    };
+    let v = app.review.verdict;
+    let can_send = held > 0 || !app.review.is_empty();
+    let label = format!(" {} {} ", v.icon(), v.label());
+    let arrow = " ▾ ";
+    let lw = disp_width(&label) as u16;
+    let aw = disp_width(arrow) as u16;
+    let total = (lw + aw).min(row.width);
+    let btn = Rect {
+        width: total.saturating_sub(aw),
+        ..row
+    };
+    let drop = Rect {
+        x: row.x + total.saturating_sub(aw),
+        width: aw.min(row.width),
+        ..row
+    };
+    let btn_style = if can_send {
+        Style::default()
+            .bg(verdict_bg(v))
+            .fg(p.btn_active_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(p.btn_bg).fg(p.btn_fg)
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_pad(&label, btn.width as usize),
+            btn_style,
+        ))),
+        btn,
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            arrow,
+            Style::default()
+                .bg(p.btn_bg)
+                .fg(if app.review.picking { p.text } else { p.btn_fg }),
+        ))),
+        drop,
+    );
+    app.layout.buttons.push((btn, ButtonId::ReviewSubmit));
+    app.layout.buttons.push((drop, ButtonId::ReviewVerdict));
+
+    // Whatever room is left after the button says which key sends it.
+    let hint_x = row.x + total + 1;
+    if hint_x < row.x + row.width {
+        let hint = Rect {
+            x: hint_x,
+            width: row.x + row.width - hint_x,
+            ..row
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_pad(if focused { "Ctrl+S" } else { "R" }, hint.width as usize),
+                Style::default().fg(p.faint),
+            ))),
+            hint,
+        );
+    }
+}
+
+/// The button colour for each verdict: approving and asking for changes
+/// are opposite answers, so they are not the same shade of "primary".
+fn verdict_bg(v: Verdict) -> Color {
+    let p = palette();
+    match v {
+        Verdict::Comment => p.btn_active_bg,
+        Verdict::Approve => p.badge_local,
+        Verdict::RequestChanges => p.badge_conflict,
+    }
+}
+
+/// The verdict list, under the ▾.
+fn draw_verdict_menu(f: &mut Frame, app: &mut App, area: Rect) {
+    let p = palette();
+    let all = Verdict::all();
+    let rows: Vec<String> = all
+        .iter()
+        .map(|v| format!(" {} {} ", v.icon(), v.label()))
+        .collect();
+    let w = (rows.iter().map(|r| disp_width(r)).max().unwrap_or(0) as u16 + 2).min(area.width);
+    let h = (all.len() as u16 + 2).min(area.height);
+    // Anchored to the ▾ it belongs to, and flipped above it — the button
+    // sits at the foot of the panel, so there is never room below.
+    let anchor = app
+        .layout
+        .buttons
+        .iter()
+        .find(|(_, id)| *id == ButtonId::ReviewVerdict)
+        .map(|(r, _)| *r)
+        .unwrap_or(area);
+    let x = anchor
+        .x
+        .saturating_sub(w.saturating_sub(anchor.width))
+        .min(area.x + area.width.saturating_sub(w));
+    let y = anchor.y.saturating_sub(h).max(area.y);
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .title(" Send as ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    for (i, text) in rows.iter().enumerate() {
+        if i as u16 >= inner.height {
+            break;
+        }
+        let r = Rect {
+            y: inner.y + i as u16,
+            height: 1,
+            ..inner
+        };
+        let selected = i == app.review.pick;
+        let style = if selected {
+            Style::default()
+                .bg(p.row)
+                .fg(p.text)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.text)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_pad(text, inner.width as usize),
+                style,
+            ))),
+            r,
+        );
+        app.layout.buttons.push((r, ButtonId::VerdictRow(i)));
+    }
+}
+
+/// "Send this review?" — everything that is about to reach GitHub, listed.
+///
+/// A review notifies every watcher of the pull request and cannot be taken
+/// back, so this says exactly what goes: the verdict, the summary, and
+/// where each held comment will land.
+fn draw_review_confirm(f: &mut Frame, app: &mut App, area: Rect) {
+    let Overlay::ReviewConfirm(prompt) = &app.overlay else {
+        return;
+    };
+    let p = palette();
+    let n = prompt.comments.len();
+    // The list is capped: a long review would otherwise push the buttons
+    // off a short terminal.
+    let shown = n.min(6);
+    // Verdict, summary, a blank, the listed comments, the "and N more"
+    // line, the stale warning, the "cannot be undone" line, the buttons,
+    // and the two border rows.
+    let height =
+        (3 + shown as u16 + u16::from(n > shown) + u16::from(prompt.stale) + 4).min(area.height);
+    let rect = centered(area, 78.min(area.width), height);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(verdict_bg(prompt.verdict)))
+        .style(Style::default().fg(p.text))
+        .title(format!(" Send this review to PR #{} ? ", prompt.number));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut text = vec![Line::from(vec![
+        Span::styled(
+            format!("{} {}", prompt.verdict.icon(), prompt.verdict.label()),
+            Style::default()
+                .fg(verdict_bg(prompt.verdict))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            match n {
+                0 => "  ·  summary only".to_string(),
+                1 => "  ·  1 inline comment".to_string(),
+                _ => format!("  ·  {n} inline comments"),
+            },
+            Style::default().fg(p.dim),
+        ),
+    ])];
+    if prompt.body.trim().is_empty() {
+        text.push(Line::from(Span::styled(
+            "No summary — the inline comments speak for themselves.",
+            Style::default().fg(p.dim),
+        )));
+    } else {
+        let first = prompt.body.lines().next().unwrap_or("");
+        let more = prompt.body.lines().count().saturating_sub(1);
+        let tail = if more > 0 {
+            format!("  (+{more} more line{})", if more == 1 { "" } else { "s" })
+        } else {
+            String::new()
+        };
+        text.push(Line::from(vec![
+            Span::styled(
+                truncate_pad(first, (inner.width as usize).saturating_sub(tail.len())),
+                Style::default().fg(p.text),
+            ),
+            Span::styled(tail, Style::default().fg(p.dim)),
+        ]));
+    }
+    text.push(Line::from(""));
+    for c in prompt.comments.iter().take(shown) {
+        let head = c.body.lines().next().unwrap_or("");
+        let at = c.where_at();
+        let room = (inner.width as usize).saturating_sub(disp_width(&at) + 5);
+        text.push(Line::from(vec![
+            Span::styled("  💬 ", Style::default().fg(p.accent)),
+            Span::styled(at, Style::default().fg(p.key)),
+            Span::styled(
+                format!("  {}", tail_truncate(head, room)),
+                Style::default().fg(p.dim),
+            ),
+        ]));
+    }
+    if n > shown {
+        text.push(Line::from(Span::styled(
+            format!("  …and {} more", n - shown),
+            Style::default().fg(p.dim),
+        )));
+    }
+    if prompt.stale {
+        text.push(Line::from(Span::styled(
+            "⚠ The PR head moved since these were written — GitHub may refuse them.",
+            Style::default().fg(p.err),
+        )));
+    }
+    text.push(Line::from(Span::styled(
+        "This notifies everyone watching the pull request. It cannot be undone.",
+        Style::default().fg(p.dim),
+    )));
+    // Everything above the button row, which is drawn over the last line.
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    f.render_widget(Paragraph::new(text), body);
+
+    let btn_area = Rect {
+        x: inner.x,
+        y: inner.y + inner.height - 1,
+        width: inner.width,
+        height: 1,
+    };
+    let send = format!("{} Send (Enter)", prompt.verdict.icon());
+    buttons_right(
+        f,
+        app,
+        btn_area,
+        0,
+        &[
+            (send.as_str(), ButtonId::ReviewYes, true),
+            ("Cancel (Esc)", ButtonId::ReviewCancel, false),
+        ],
+    );
 }
 
 // ------------------------------------------------------------------ diff
@@ -1185,8 +1711,19 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         String::new()
     };
-    let title = match (file, &app.diff) {
-        (Some(fl), Some(d)) => format!(
+    // A conflict view is not a before-and-after, so it is not titled like
+    // one: it names the two branches whose lines are on each side.
+    let title = match (file, &app.diff, &app.conflict) {
+        (Some(fl), _, Some(c)) => {
+            let n = c.file.len();
+            let (ours, theirs) = c.file.labels();
+            format!(
+                " ⚑ {} — {n} conflict{} · ◀ {ours} │ {theirs} ▶{hoff} ",
+                fl.path,
+                if n == 1 { "" } else { "s" }
+            )
+        }
+        (Some(fl), Some(d), None) => format!(
             " {} — +{} −{}{}{hoff} ",
             fl.path,
             d.additions,
@@ -1195,7 +1732,14 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         ),
         _ => " Diff ".to_string(),
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if app.conflict.is_some() {
+            Style::default().fg(p.conflict)
+        } else {
+            Style::default()
+        })
+        .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
     app.layout.diff = inner;
@@ -1232,8 +1776,15 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     // up front, because each row has to know whether the section above it
     // is the same one.
     let bar_w = app.revert_gutter() as usize;
+    let conflicted = app.conflict.is_some();
     let bars: Vec<Option<bool>> = (app.diff_scroll..app.diff_scroll + h)
-        .map(|i| app.change_bar(i))
+        .map(|i| {
+            if conflicted {
+                app.conflict_bar(i)
+            } else {
+                app.change_bar(i)
+            }
+        })
         .collect();
     let pane_w = (inner.width as usize).saturating_sub(bar_w);
 
@@ -1244,13 +1795,34 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         let cur = app.diff_scroll + n == app.diff_cursor;
         let mut spans: Vec<Span> = Vec::new();
         if bar_w > 0 {
-            spans.push(match bars.get(n).copied().flatten() {
-                Some(true) => Span::styled(
-                    "↺ ",
+            // ↺ puts a change back; ⚑ opens the resolve menu. Two marks,
+            // because they do two very different things to the file.
+            let (mark, color) = if conflicted {
+                ("⚑ ", p.conflict)
+            } else {
+                ("↺ ", p.accent)
+            };
+            // A held comment on this row outranks both markers. It is
+            // the one thing in the column that says something about
+            // *this* line rather than offering to do something to it.
+            let held = app.pending_on_row(app.diff_scroll + n);
+            spans.push(if held {
+                Span::styled(
+                    "💬",
                     Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-                ),
-                Some(false) => Span::styled("┃ ", Style::default().fg(p.divider)),
-                None => Span::raw("  "),
+                )
+            } else {
+                match bars.get(n).copied().flatten() {
+                    Some(true) => Span::styled(
+                        mark,
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Some(false) => Span::styled(
+                        "┃ ",
+                        Style::default().fg(if conflicted { color } else { p.divider }),
+                    ),
+                    None => Span::raw("  "),
+                }
             });
         }
         match entry {
@@ -1563,6 +2135,102 @@ fn draw_path_menu(f: &mut Frame, app: &mut App, area: Rect) {
     app.layout.buttons.extend(rows);
 }
 
+/// The resolve menu for a merge conflict.
+///
+/// Two lines per entry: what it keeps, and a note saying how much. A
+/// conflict is settled once and hard to undo, so the menu says what each
+/// line will do rather than trusting the label to carry it.
+fn draw_conflict_menu(f: &mut Frame, app: &mut App, area: Rect) {
+    let Overlay::ConflictMenu(menu) = &app.overlay else {
+        return;
+    };
+    let p = palette();
+    let title = format!(" ⚑ {} ", menu.title);
+    let widest = menu
+        .items
+        .iter()
+        .map(|it| disp_width(&it.label).max(disp_width(&it.note) + 2) + 4)
+        .max()
+        .unwrap_or(0);
+    let w = (widest.max(disp_width(&title)) as u16 + 4).min(area.width);
+    // Two rows per line, plus the border and the closing hint.
+    let h = (menu.items.len() as u16 * 2 + 3).min(area.height);
+    let (ax, ay) = menu.anchor;
+    let x = ax.min(area.x + area.width.saturating_sub(w));
+    let y = if ay + h <= area.y + area.height {
+        ay
+    } else {
+        (ay + 1).saturating_sub(h).max(area.y)
+    };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.conflict))
+        .style(Style::default().fg(p.text))
+        .title(title);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut rows: Vec<(Rect, ButtonId)> = Vec::new();
+    for (i, item) in menu.items.iter().enumerate() {
+        let top = i as u16 * 2;
+        if top + 1 >= inner.height {
+            break;
+        }
+        let r = Rect {
+            x: inner.x,
+            y: inner.y + top,
+            width: inner.width,
+            height: 2,
+        };
+        let selected = i == menu.sel;
+        let style = if selected {
+            Style::default()
+                .bg(p.row)
+                .fg(p.text)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.text)
+        };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(item.label.clone(), style),
+                Span::styled(format!(" ({})", item.key), Style::default().fg(p.key)),
+            ]),
+            Line::from(Span::styled(
+                format!("  {}", item.note),
+                Style::default().fg(p.dim),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines).style(style), r);
+        // Only the label row is a click target: the note under it belongs
+        // to the same line, and a two-row target is easy to hit by mistake.
+        rows.push((Rect { height: 1, ..r }, ButtonId::ConflictMenuRow(i)));
+    }
+    if inner.height > 0 {
+        let hint = Rect {
+            x: inner.x,
+            y: inner.y + inner.height - 1,
+            width: inner.width,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Esc leaves it alone",
+                Style::default().fg(p.faint),
+            ))),
+            hint,
+        );
+    }
+    app.layout.buttons.extend(rows);
+}
+
 /// The popup behind one blame row: the commit, and the ways to follow it.
 ///
 /// The pane has room for a name, an age and a number. This is where the
@@ -1871,10 +2539,20 @@ fn draw_comment_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!("{}–{}", draft.lo, draft.hi)
     };
+    // The title says which review this joins, so "add to review" is not a
+    // button whose effect has to be guessed at.
+    let held = app.pending.len();
+    let into = match held {
+        0 => " · Ctrl+S starts a review".to_string(),
+        n => format!(" · joins {n} held"),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette().accent))
-        .title(format!(" 💬 Comment · {}:{} ({side}) ", draft.path, range));
+        .title(format!(
+            " 💬 Comment · {}:{} ({side}){into} ",
+            draft.path, range
+        ));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -1917,7 +2595,8 @@ fn draw_comment_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         btn_area,
         0,
         &[
-            ("Post (Ctrl+S)", ButtonId::CommentPost, true),
+            ("✎ Add to review (Ctrl+S)", ButtonId::CommentHold, true),
+            ("Post now (Ctrl+Enter)", ButtonId::CommentPost, false),
             ("Cancel (Esc)", ButtonId::CommentCancel, false),
         ],
     );
@@ -2346,7 +3025,7 @@ fn draw_finder(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let p = palette();
-    let rect = centered(area, 108.min(area.width), 42.min(area.height));
+    let rect = centered(area, 108.min(area.width), 55.min(area.height));
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2474,6 +3153,14 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             ("c", "comment on the selection"),
         ),
         row(
+            ("Ctrl+S (in a comment)", "hold it for one review"),
+            ("Ctrl+Enter", "post that comment on its own"),
+        ),
+        row(
+            ("R", "the review box — summary + verdict"),
+            ("Ctrl+S / Tab (in it)", "submit / change the verdict"),
+        ),
+        row(
             ("Enter / Space", "expand / fold at cursor"),
             ("z", "fold all unchanged"),
         ),
@@ -2492,6 +3179,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         row(
             ("u", "revert the change at the cursor"),
             ("U", "revert every change in the file"),
+        ),
+        row(
+            ("o", "resolve the conflict at the cursor"),
+            ("click ⚑ / [!]", "the same, with the mouse"),
         ),
         row(
             ("r", "refresh — re-scan and reload"),
@@ -2532,6 +3223,22 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(Span::styled(
             "  Local review re-scans the working tree while you sit idle, so an agent's edits appear on their own (☰ → Refresh while idle)",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  Reviewing a PR: c writes a line comment, and Ctrl+S holds it rather than posting it. Held comments show as 💬 in the change bar and in the file panel.",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  R opens the review box under the file list: write the summary, pick Comment / Approve / Request changes on the button, and Ctrl+S sends the whole thing as one review.",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  Merge conflicts sort to the top of the file panel in red. The diff then shows our version on the left and theirs on the right, one section per conflict:",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  } and { walk them · o keeps one side (o ours · t theirs · b both · e edit by hand) · the last one resolved stages the file, and ↑ ↓ by the branch name count commits against the upstream",
             dim,
         )),
         // What gd / gr / K can actually answer right now, and why not.
@@ -2675,6 +3382,15 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             } else if app.find.active() {
                 format!("n/N matches · / search · y copy{undo} · ? help")
+            } else if app.review.focused {
+                "Ctrl+S submit · Tab changes the verdict · Esc leaves the box".into()
+            } else if !app.pending.is_empty() {
+                let n = app.pending.len();
+                format!("{n} held · R the review box · c comment · y copy · m menu")
+            } else if app.conflict.is_some() {
+                // Mid-conflict there is one thing worth doing, so the hint
+                // row says how rather than listing everything else.
+                "} { next conflict · o resolve · e edit by hand · m menu".into()
             } else if app.local {
                 format!("/ find · V select · y copy · x stage{undo} · m menu")
             } else {
@@ -2711,6 +3427,359 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    /// Render the whole frame to a string, the way most tests here read it.
+    fn screen_of(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn changed(path: &str, conflicted: bool) -> ChangedFile {
+        ChangedFile {
+            path: path.into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            previous: None,
+            conflicted,
+        }
+    }
+
+    /// A conflict is impossible to miss: a heading and a red row at the top
+    /// of the file panel, a warning badge in the top bar, and ⚑ markers
+    /// down the change bar of the diff.
+    #[test]
+    fn a_merge_conflict_is_marked_everywhere_it_shows() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.checked_out = true;
+        app.local_branch = Some("main".into());
+        app.merge_op = Some(crate::gitops::MergeOp::Merge);
+        app.files = vec![
+            changed("src/merge.rs", true),
+            changed("src/other.rs", false),
+        ];
+        app.rebuild_entries();
+
+        let text = "keep\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nkeep2\n";
+        let parsed = crate::conflict::Conflicted::parse(text).unwrap();
+        let sides = parsed.sides();
+        app.old_content = Some(sides.ours.clone());
+        app.new_content = Some(sides.theirs.clone());
+        app.diff = Some(FileDiff::compute(Some(&sides.ours), Some(&sides.theirs)));
+        app.conflict = Some(crate::app::ConflictView {
+            file: std::sync::Arc::new(parsed),
+            old_owner: sides.ours_owner,
+            new_owner: sides.theirs_owner,
+        });
+        app.collapse_unchanged = false;
+        app.rebuild_display();
+
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(screen.contains("⚠ MERGE"), "the top bar warns: {screen}");
+        assert!(
+            screen.contains("1 MERGE CONFLICT"),
+            "the panel heading: {screen}"
+        );
+        assert!(screen.contains("[!]"), "the row icon warns: {screen}");
+        assert!(screen.contains("⚑"), "the change bar marks it: {screen}");
+        assert!(
+            screen.contains("HEAD") && screen.contains("feature"),
+            "the title names both branches: {screen}"
+        );
+        assert!(
+            screen.contains("o resolve"),
+            "the status bar says how: {screen}"
+        );
+        // The marker lines themselves are never drawn.
+        assert!(!screen.contains("<<<<<<<"), "{screen}");
+        assert!(!screen.contains("======="), "{screen}");
+    }
+
+    /// The resolve menu opens where it was asked for and lists its keys.
+    #[test]
+    fn the_conflict_menu_lists_each_side_with_its_key() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.checked_out = true;
+        app.files = vec![changed("merge.rs", true)];
+        app.rebuild_entries();
+        let text = "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\n";
+        let parsed = crate::conflict::Conflicted::parse(text).unwrap();
+        let sides = parsed.sides();
+        app.old_content = Some(sides.ours.clone());
+        app.new_content = Some(sides.theirs.clone());
+        app.diff = Some(FileDiff::compute(Some(&sides.ours), Some(&sides.theirs)));
+        app.conflict = Some(crate::app::ConflictView {
+            file: std::sync::Arc::new(parsed),
+            old_owner: sides.ours_owner,
+            new_owner: sides.theirs_owner,
+        });
+        app.rebuild_display();
+        app.open_conflict_menu(0, 20, 6);
+
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(screen.contains("Conflict 1 of 1"), "{screen}");
+        assert!(screen.contains("Take ours — HEAD"), "{screen}");
+        assert!(screen.contains("Take theirs — feature"), "{screen}");
+        assert!(screen.contains("Take both"), "{screen}");
+        assert!(screen.contains("Edit it by hand"), "{screen}");
+        assert!(screen.contains("(o)") && screen.contains("(t)"), "{screen}");
+        // It is clickable: every line records a hit area.
+        assert!(app
+            .layout
+            .buttons
+            .iter()
+            .any(|(_, id)| matches!(id, ButtonId::ConflictMenuRow(0))));
+    }
+
+    /// The ahead / behind counts sit beside the branch name.
+    #[test]
+    fn the_top_bar_counts_commits_against_the_upstream() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.local_branch = Some("feature".into());
+        app.tracking = Some(crate::gitops::Tracking {
+            upstream: "origin/feature".into(),
+            ahead: 3,
+            behind: 2,
+        });
+        let screen = screen_of(&mut app, 110, 12);
+        assert!(screen.contains("↑3"), "commits not pushed: {screen}");
+        assert!(screen.contains("↓2"), "commits not pulled: {screen}");
+        assert!(screen.contains("origin/feature"), "{screen}");
+
+        // Level with the upstream: one quiet mark instead of two counts.
+        app.tracking = Some(crate::gitops::Tracking {
+            upstream: "origin/feature".into(),
+            ahead: 0,
+            behind: 0,
+        });
+        let screen = screen_of(&mut app, 110, 12);
+        assert!(screen.contains("≡ origin/feature"), "{screen}");
+        assert!(!screen.contains("↑"), "{screen}");
+    }
+
+    fn pr_review_app() -> App {
+        let mut app = App::new(crate::app::LaunchMode::Pr, None);
+        app.screen = Screen::Review;
+        app.local = false;
+        app.checked_out = true;
+        app.repo = Some("acme/tool".into());
+        app.pr = Some(crate::github::PrDetail {
+            id: "node".into(),
+            number: 42,
+            title: "Add the widget".into(),
+            head_ref_oid: "a".repeat(40),
+            base_ref_oid: "b".repeat(40),
+            base_ref_name: "main".into(),
+            head_ref_name: "feat".into(),
+            url: String::new(),
+        });
+        app.files = vec![changed("src/a.rs", false), changed("src/b.rs", false)];
+        app.rebuild_entries();
+        let (old, new) = ("one\ntwo\nthree\n", "one\nTWO\nthree\n");
+        app.old_content = Some(old.into());
+        app.new_content = Some(new.into());
+        app.diff = Some(FileDiff::compute(Some(old), Some(new)));
+        app.collapse_unchanged = false;
+        app.rebuild_display();
+        app
+    }
+
+    /// An inline comment offers both exits, and says which review it
+    /// would join.
+    #[test]
+    fn a_comment_can_be_held_or_posted_on_its_own() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = pr_review_app();
+        app.selection = Some(crate::diff::Selection::lines(Side::Right, 2, 2));
+        app.open_comment();
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(screen.contains("Add to review (Ctrl+S)"), "{screen}");
+        assert!(screen.contains("Post now (Ctrl+Enter)"), "{screen}");
+        assert!(screen.contains("Cancel (Esc)"), "{screen}");
+        assert!(
+            screen.contains("Ctrl+S starts a review"),
+            "with none held, this one starts one: {screen}"
+        );
+        for id in [
+            ButtonId::CommentHold,
+            ButtonId::CommentPost,
+            ButtonId::CommentCancel,
+        ] {
+            assert!(
+                app.layout.buttons.iter().any(|(_, b)| *b == id),
+                "{id:?} has no hit area"
+            );
+        }
+
+        // With comments already held, it says which review it joins.
+        app.pending.push(crate::github::ReviewComment {
+            path: "src/a.rs".into(),
+            side: crate::github::CommentSide::Right,
+            line: 1,
+            start_line: None,
+            body: "first".into(),
+        });
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(screen.contains("joins 1 held"), "{screen}");
+    }
+
+    /// The composer sits at the foot of the file panel with the verdict on
+    /// its button, and held comments are marked wherever they were left.
+    #[test]
+    fn the_review_box_shows_what_is_held_and_what_it_will_send() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = pr_review_app();
+        // Nothing held yet: the box still invites a summary.
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(screen.contains("Review"), "{screen}");
+        assert!(screen.contains("Summary of this review"), "{screen}");
+        // The emoji is a wide char, so the test grid reads it as two
+        // cells — assert on the word beside it, not the spacing.
+        assert!(
+            screen.contains("Comment  ▾"),
+            "the default verdict: {screen}"
+        );
+        assert!(screen.contains("c holds a line comment"), "{screen}");
+
+        app.pending.push(crate::github::ReviewComment {
+            path: "src/a.rs".into(),
+            side: crate::github::CommentSide::Right,
+            line: 2,
+            start_line: None,
+            body: "rename this".into(),
+        });
+        app.review.verdict = Verdict::Approve;
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(screen.contains("Review · 1 held"), "{screen}");
+        assert!(screen.contains("1 comment held"), "{screen}");
+        assert!(screen.contains("✕ Discard"), "{screen}");
+        assert!(
+            screen.contains("Approve  ▾"),
+            "the button follows the verdict: {screen}"
+        );
+        // The held comment is marked in the file panel and in the diff.
+        assert!(
+            screen
+                .lines()
+                .any(|l| l.contains("a.rs") && l.contains('💬')),
+            "the file row counts it: {screen}"
+        );
+        assert!(
+            screen
+                .lines()
+                .any(|l| l.contains("💬") && l.contains("two")),
+            "the change bar marks the line it is on: {screen}"
+        );
+        // Every control is clickable.
+        for id in [
+            ButtonId::ReviewBody,
+            ButtonId::ReviewSubmit,
+            ButtonId::ReviewVerdict,
+            ButtonId::ReviewDiscard,
+        ] {
+            assert!(
+                app.layout.buttons.iter().any(|(_, b)| *b == id),
+                "{id:?} has no hit area"
+            );
+        }
+    }
+
+    /// The ▾ offers the other two verdicts.
+    #[test]
+    fn the_verdict_dropdown_lists_all_three() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = pr_review_app();
+        app.activate(ButtonId::ReviewVerdict);
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(screen.contains("Send as"), "{screen}");
+        assert!(screen.contains("Comment"), "{screen}");
+        assert!(screen.contains("Approve"), "{screen}");
+        assert!(screen.contains("Request changes"), "{screen}");
+        assert!(app
+            .layout
+            .buttons
+            .iter()
+            .any(|(_, id)| matches!(id, ButtonId::VerdictRow(2))));
+    }
+
+    /// The prompt says what is about to be sent, comment by comment.
+    #[test]
+    fn the_submit_prompt_lists_every_held_comment() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = pr_review_app();
+        for (line, body) in [(2usize, "rename this"), (3, "and this one too")] {
+            app.pending.push(crate::github::ReviewComment {
+                path: "src/a.rs".into(),
+                side: crate::github::CommentSide::Right,
+                line,
+                start_line: None,
+                body: body.into(),
+            });
+        }
+        app.review.verdict = Verdict::Approve;
+        app.ask_submit_review();
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(screen.contains("Send this review to PR #42"), "{screen}");
+        assert!(screen.contains("Approve  ·"), "{screen}");
+        assert!(screen.contains("2 inline comments"), "{screen}");
+        assert!(screen.contains("src/a.rs:2"), "{screen}");
+        assert!(screen.contains("rename this"), "{screen}");
+        assert!(screen.contains("src/a.rs:3"), "{screen}");
+        assert!(screen.contains("cannot be undone"), "{screen}");
+        assert!(
+            screen.contains("Send (Enter)") && screen.contains("Cancel (Esc)"),
+            "{screen}"
+        );
+    }
+
+    /// A short terminal keeps the file list rather than the composer: a
+    /// two-row file panel would be the worse trade.
+    #[test]
+    fn a_short_terminal_drops_the_review_box() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = pr_review_app();
+        let screen = screen_of(&mut app, 110, 10);
+        assert!(!screen.contains("Summary of this review"), "{screen}");
+        assert!(
+            screen.contains("src/a.rs"),
+            "the review itself still draws: {screen}"
+        );
+        // …and nothing is left claiming a click.
+        assert!(!app
+            .layout
+            .buttons
+            .iter()
+            .any(|(_, id)| *id == ButtonId::ReviewSubmit));
+    }
+
+    /// Local review has no pull request to say anything about.
+    #[test]
+    fn local_review_has_no_review_box() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = pr_review_app();
+        app.local = true;
+        app.pr = None;
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(!screen.contains("Summary of this review"), "{screen}");
+    }
+
     /// The preview takes the pane the diff and the editor share, keeps the
     /// file panel beside it, and puts its own keys in the status bar.
     #[test]
@@ -2725,6 +3794,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         app.preview = Some(crate::preview::Preview::new(
@@ -2765,6 +3835,7 @@ mod tests {
             additions: 1,
             deletions: 1,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         let old = "fn main() {\n    let x = 1;\n}\n";
@@ -3061,6 +4132,7 @@ mod tests {
             additions: 1,
             deletions: 1,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         // A line far wider than the pane: "0123456789" repeated.
@@ -3207,6 +4279,7 @@ mod tests {
                 additions: 1,
                 deletions: 1,
                 previous: None,
+                conflicted: false,
             })
             .collect();
         app.rebuild_entries();
@@ -3295,6 +4368,7 @@ mod tests {
             additions: 1,
             deletions: 1,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
@@ -3354,6 +4428,7 @@ mod tests {
             additions: 1,
             deletions: 1,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
@@ -3400,6 +4475,7 @@ mod tests {
             additions: 1,
             deletions: 1,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
@@ -3446,6 +4522,7 @@ mod tests {
             additions: 1,
             deletions: 1,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
@@ -3522,6 +4599,7 @@ mod tests {
                 additions: 1,
                 deletions: 0,
                 previous: None,
+                conflicted: false,
             },
             ChangedFile {
                 path: "src/ui/render.rs".into(),
@@ -3529,6 +4607,7 @@ mod tests {
                 additions: 1,
                 deletions: 0,
                 previous: None,
+                conflicted: false,
             },
         ];
         app.rebuild_entries();
@@ -3567,6 +4646,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         let old = "let alpha = 1;\n";
@@ -3613,6 +4693,7 @@ mod tests {
             additions: 1,
             deletions: 1,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         let menu = || {
@@ -3685,6 +4766,7 @@ mod tests {
             additions: 1,
             deletions: 1,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
@@ -3724,6 +4806,7 @@ mod tests {
             additions: 1,
             deletions: 1,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
@@ -3756,6 +4839,7 @@ mod tests {
             additions: 1,
             deletions: 1,
             previous: None,
+            conflicted: false,
         }];
         app.rebuild_entries();
         let old = "const alpha = 1;\nconst beta = 2;\n";

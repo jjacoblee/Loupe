@@ -35,10 +35,34 @@ leaving your terminal or touching a browser.
   single- or multi-line review comments straight to the PR via `gh`.
 - **Viewed checkboxes that sync** — mark files viewed here, see them
   checked on github.com, and vice versa.
+- **A whole review, not ten notifications** — `Ctrl+S` in a comment
+  *holds* it instead of posting it. Held comments show as `💬` in the
+  change bar and beside the file name, and survive quitting loupe. `R`
+  opens the review box under the file panel: write the summary, pick
+  **Comment**, **Approve**, or **Request changes** from the button's
+  dropdown, and `Ctrl+S` sends the lot as a single GitHub review — after
+  showing you exactly what is about to go. `Ctrl+Enter` still posts one
+  comment on its own when that is all you meant.
 - **Local review with staging** — in local mode the file panel stages
   instead: `[+]` unstaged, `[±]` partially staged, `[✓]` staged. Review
   your diff and build the commit in one pass; unstaging never touches
   your files.
+- **Merge conflicts, resolved in the diff** — conflicted files sort to
+  the top of the file panel under a red `⚠ N MERGE CONFLICTS` heading,
+  and the top bar turns into a `⚠ MERGE` (or `REBASE`, or `CHERRY-PICK`)
+  badge that says how to finish. Open one and the diff shows **your
+  version on the left and theirs on the right** with the marker lines
+  stripped out, so each conflict is an ordinary changed section: `}` and
+  `{` walk them, long agreed stretches fold away, and search and syntax
+  colors work as usual. `o` — or a click on the `⚑` in the change bar —
+  offers **take ours**, **take theirs**, **take both**, the common
+  ancestor where git wrote one, and *edit it by hand*. Each choice
+  rewrites only that conflict; the last one resolved stages the file so
+  git knows it is settled. A conflict git could not write markers for
+  (one side deleted the file) resolves whole from the index instead.
+- **How far you have drifted** — `↑3 ↓2 origin/main` beside the branch
+  name: commits you have not pushed, and commits waiting for you. `≡`
+  when you are level with the upstream.
 - **Undo a change without leaving the review** — every changed section
   of the diff has a `↺` in the change bar and every file row has one of
   its own. Click the section marker to put just those lines back

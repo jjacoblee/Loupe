@@ -27,6 +27,110 @@ working-tree review, not a branch-vs-main review.
 Local mode announces itself with a green `⎇ LOCAL` badge and the branch
 name in the top bar.
 
+## Ahead of and behind the upstream
+
+Next to the branch name, Loupe shows how far you have drifted from the
+branch you track:
+
+```
+ ⎇ LOCAL  feature  ↑3 ↓2 origin/feature  — uncommitted changes vs HEAD
+```
+
+- `↑3` — three commits here that the upstream does not have. Push them.
+- `↓2` — two commits upstream that you do not have. Pull or rebase.
+- `≡ origin/feature` — level with the upstream, nothing either way.
+
+The upstream is whatever `git` has configured for the branch, and
+`origin/<branch>` when the branch tracks nothing. With neither, the
+counts are left off. They come from `git rev-list --left-right --count`
+against the ref you already have, so nothing is fetched — run `git fetch`
+(or `r` after one) to bring the numbers up to date.
+
+## Merge conflicts
+
+A merge, rebase, cherry-pick, or revert that stops on a conflict is the
+one thing that outranks everything else in the panel, so Loupe puts it
+first and says how to finish.
+
+### Finding them
+
+- The badge becomes `⚠ MERGE` — or `REBASE`, `CHERRY-PICK`, `REVERT` —
+  in orange, with the operation named: *"resolve the conflicts to finish
+  the rebase"*.
+- Conflicted files sort to the top of the file panel, in both the tree
+  and the flat view, under a red `⚠ N MERGE CONFLICTS` heading. They are
+  not repeated in the tree below it.
+- Each one carries a red `[!]` icon and a red `!` status letter. The
+  `+`/`−` counts are left blank: they would describe the marker text git
+  wrote, not a change anyone made.
+- The panel and the diff both get an orange border while a conflict is
+  open.
+
+### Reading them
+
+Open a conflicted file and the diff shows **your version on the left and
+their version on the right**, with the `<<<<<<<`, `=======`, and
+`>>>>>>>` lines stripped out. The title names both branches:
+
+```
+⚑ src/app.py — 2 conflicts · ◀ HEAD │ feature ▶
+```
+
+Every line the two branches agree on is in both sides, so it reads as a
+context row and folds away; every conflict is a changed section. That
+means the whole diff view already works on it:
+
+- `}` and `{` walk from conflict to conflict.
+- `z` folds the agreed stretches; `v` switches to inline.
+- `/` searches, syntax colors are correct on both sides (they are real
+  file text, not marker soup).
+- A `⚑` in the change bar marks the first row of each conflict, with a
+  bar down the rest of it.
+
+The blame pane stands down while a conflict is open: its line numbers
+would point at the working-tree file, which still has the markers in it.
+
+### Resolving them
+
+Press `o` (or click the `⚑`, or the `[!]` in the file panel) for the
+resolve menu:
+
+| Key | What it keeps |
+| --- | --- |
+| `o` | **Ours** — the version on the branch you are on |
+| `t` | **Theirs** — the version being merged in |
+| `b` | **Both** — our lines, then theirs |
+| `a` | **The common ancestor** — only when git wrote one (`diff3` / `zdiff3` conflict style) |
+| `O` / `T` | Ours / theirs for *every* conflict in the file at once |
+| `e` | Open the raw file, markers and all, in the editor |
+| `x` | Mark it resolved (`git add`) — for a resolution you made by hand |
+
+Each choice rewrites **only that conflict**; the others keep their
+markers. When the last one in a file is settled, Loupe stages the file
+with it — git treats a path as conflicted until it is added, so a file
+left unstaged would keep warning you. Press `x` to take it back out.
+
+The file list re-scans itself after each resolution, so a resolved file
+leaves the conflict group on its own and the status line tells you what
+is left and how to finish:
+
+```
+✔ Resolved src/app.py — kept theirs, and staged it. Finish with `git rebase --continue`.
+```
+
+### Conflicts with no markers
+
+Some conflicts cannot be written as markers — one side deleted the file
+and the other changed it, for example. Those still show in the panel with
+the same red warning, and the resolve menu offers the two answers that
+come from the index instead of from the file text: **take our whole
+file** and **take their whole file**. Where the chosen side deleted the
+file, resolving to it removes the file.
+
+Reverting (`u` / `U` / the `↺` markers) is refused on a conflicted file:
+`git checkout HEAD -- <path>` mid-merge throws the merge away for that
+path. `u` opens the resolve menu instead.
+
 ## The staging column
 
 In local mode, the file panel's icon column stages instead of marking

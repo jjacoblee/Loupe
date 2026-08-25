@@ -9,6 +9,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Reviews, not just comments.** Loupe could say something about a line;
+  it had no way to say anything about the pull request, or to approve one.
+
+  - **Comments can be held.** In an inline comment draft, `Ctrl+S` now
+    *adds it to a review* instead of posting it, and `Ctrl+Enter` posts it
+    on its own the way `Ctrl+S` used to. Holding is the default because
+    ten comments posted one at a time are ten notifications to everyone
+    watching the pull request, with nothing tying them together.
+  - **A review box under the file panel.** A summary, and a split button
+    carrying the verdict: **Comment**, **Approve**, or **Request
+    changes**, picked from its `▾` or with `Tab`. `R` gives it the
+    keyboard, `Ctrl+S` submits.
+  - **One request.** The summary, the verdict, and every held comment go
+    up as a single GitHub review — the same thing *Start a review* and
+    *Submit review* do on the web.
+  - **It asks first, and says what goes.** The confirm prompt lists the
+    verdict, the summary, and where each held comment will land. A review
+    notifies every watcher and cannot be taken back, so it is the second
+    thing loupe confirms — reverting is the first.
+  - **Held comments are visible and durable.** A `💬` in the change bar on
+    the lines each one covers, a `💬N` beside the file name, and the count
+    in the box. They are written to
+    `.git/loupe/pending-review-<number>.json` as they are made, so quitting
+    loupe does not lose a review in progress; reopening the pull request
+    picks them back up. `✕ Discard` throws them away, and asks once first.
+  - **Refusals arrive in GitHub's own words.** "Can not approve your own
+    pull request", or which comment fell outside the diff — `gh api`
+    writes the API's JSON to stdout and only a status line to stderr, so
+    both are read. Loupe catches an empty review and a bodiless "request
+    changes" before sending, and warns when the PR head has moved under
+    the held comments.
+
+- **Merge conflict resolution.** A merge, rebase, cherry-pick, or revert
+  that stops on a conflict is now the thing the review is about, rather
+  than a wall of marker lines in a working-tree diff.
+
+  - **Impossible to miss.** Conflicted files sort to the top of the file
+    panel — in the tree view as well as the flat one — under a red
+    `⚠ N MERGE CONFLICTS` heading, each with a red `[!]` icon and a red
+    `!` status letter. The top bar turns into an orange
+    `⚠ MERGE` / `REBASE` / `CHERRY-PICK` / `REVERT` badge naming the
+    operation and what finishes it. The `+`/`−` counts are left blank on
+    those rows: they would describe the marker text git wrote, not a
+    change anyone made.
+  - **The diff shows the disagreement, not the markers.** A conflicted
+    file opens as *our version on the left, their version on the right*,
+    with the `<<<<<<<` / `=======` / `>>>>>>>` lines removed. Every line
+    the two branches agree on is in both sides and reads as context; every
+    conflict is a changed section. So the whole diff view already works on
+    it — `}` and `{` walk the conflicts, `z` folds the agreed stretches,
+    `/` searches, and syntax highlighting is correct on both sides because
+    both sides are real file text. A `⚑` in the change bar marks each one.
+  - **One key resolves one conflict.** `o` — or a click on the `⚑`, or on
+    the `[!]` in the file panel — opens a menu offering **take ours**,
+    **take theirs**, **take both**, the **common ancestor** where git
+    wrote one (`diff3` / `zdiff3`), *ours/theirs everywhere* for the whole
+    file, *edit it by hand*, and *mark it resolved*. Each choice rewrites
+    only that conflict and leaves the others' markers alone.
+  - **Resolving finishes the job.** The last conflict settled in a file
+    stages it, because git treats a path as conflicted until it is added
+    (`x` takes it back out). The file list re-scans itself, the file
+    leaves the conflict group, and the status line says what is left and
+    which command finishes the operation.
+  - **Conflicts markers cannot describe.** A delete/modify conflict has
+    no markers to read. It still warns in the panel, and the menu offers
+    *take our whole file* / *take their whole file*, read from the index
+    stages — removing the file where the chosen side deleted it.
+  - **Reverting is refused mid-conflict.** `git checkout HEAD -- <path>`
+    during a merge throws the merge away for that path, so `u` / `U` and
+    the `↺` markers say so and offer the resolve menu instead. The blame
+    pane stands down too: its line numbers would point at the
+    working-tree file, which still has the markers in it.
+
+- **Ahead and behind the upstream.** `↑3 ↓2 origin/main` beside the
+  branch name in local review: commits you have not pushed, and commits
+  waiting for you. `≡ origin/main` when you are level with it. The
+  upstream is the branch git has configured, falling back to
+  `origin/<branch>`; the counts come from a local `git rev-list`, so
+  nothing is fetched.
+
 - **A markdown preview** (`P`, the `📖 Preview` button, or
   `☰ → Actions → Preview the markdown`). A `.md` file now has a document
   view as well as a diff and a source view, in the pane the diff and the

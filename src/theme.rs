@@ -116,6 +116,17 @@ pub struct Palette {
     /// …and one that did not.
     pub err: Color,
 
+    /// Merge conflicts: the warning icon and the file name in the panel,
+    /// the ⚑ in the change bar, and the panel border while any file is
+    /// conflicted. One strong color, used nowhere else, so a conflict is
+    /// never mistaken for an error message or a removed line.
+    pub conflict: Color,
+    /// The "⚠ MERGE" badge in the review top bar.
+    pub badge_conflict: Color,
+    /// The ↑ ahead / ↓ behind counts beside the branch name.
+    pub ahead: Color,
+    pub behind: Color,
+
     /// Status letters in the file list: added / removed / renamed / other.
     pub st_added: Color,
     pub st_removed: Color,
@@ -190,6 +201,11 @@ pub const DARK: Palette = Palette {
     ok: Color::Rgb(140, 200, 140),
     err: Color::Rgb(255, 140, 140),
 
+    conflict: Color::Rgb(255, 150, 90),
+    badge_conflict: Color::Rgb(150, 60, 20),
+    ahead: Color::Rgb(140, 200, 140),
+    behind: Color::Rgb(230, 190, 100),
+
     st_added: Color::Green,
     st_removed: Color::Red,
     st_renamed: Color::Yellow,
@@ -251,6 +267,11 @@ pub const LIGHT: Palette = Palette {
     key: Color::Rgb(30, 88, 170),
     ok: Color::Rgb(22, 106, 58),
     err: Color::Rgb(176, 32, 42),
+
+    conflict: Color::Rgb(190, 74, 10),
+    badge_conflict: Color::Rgb(168, 68, 12),
+    ahead: Color::Rgb(22, 106, 58),
+    behind: Color::Rgb(150, 100, 8),
 
     st_added: Color::Rgb(26, 122, 56),
     st_removed: Color::Rgb(186, 40, 44),

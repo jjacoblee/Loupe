@@ -1,9 +1,10 @@
 //! GitHub access via the `gh` CLI (uses the user's existing `gh auth login`).
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 pub fn run_gh(args: &[&str]) -> Result<String> {
     let out = Command::new("gh")
@@ -18,6 +19,97 @@ pub fn run_gh(args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The same, with a request body on standard input.
+///
+/// A review carries an array of comment objects, and `gh api -f key=value`
+/// can only express flat strings — so the body goes in as JSON through
+/// `--input -` instead.
+fn run_gh_stdin(args: &[&str], input: &str) -> Result<String> {
+    let mut child = Command::new("gh")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn `gh` — is the GitHub CLI installed and on PATH?")?;
+    child
+        .stdin
+        .take()
+        .context("gh took no stdin")?
+        .write_all(input.as_bytes())
+        .context("writing the request body to gh")?;
+    let out = child.wait_with_output().context("waiting for gh")?;
+    if !out.status.success() {
+        // `gh api` writes the API's JSON to stdout even when it fails, and
+        // only a one-line summary to stderr — so the sentence worth
+        // showing is usually on the *successful* stream.
+        bail!(
+            "{}",
+            gh_message(
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+            )
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The sentence worth showing out of a `gh api` failure.
+///
+/// The API's JSON carries the only part a reader can act on ("Can not
+/// approve your own pull request", or which comment fell outside the
+/// diff), and gh writes it to stdout while stderr gets "gh: Unprocessable
+/// Entity (HTTP 422)". So both streams are searched, and the raw text is
+/// the fallback when neither holds JSON.
+fn gh_message(stdout: &str, stderr: &str) -> String {
+    #[derive(Deserialize)]
+    struct ApiError {
+        message: Option<String>,
+        errors: Option<Vec<ApiSubError>>,
+    }
+    #[derive(Deserialize)]
+    struct ApiSubError {
+        message: Option<String>,
+        field: Option<String>,
+    }
+    let parse = |text: &str| {
+        text.find('{')
+            .and_then(|i| serde_json::from_str::<ApiError>(text[i..].trim()).ok())
+            .filter(|e| e.message.is_some())
+    };
+    match parse(stdout).or_else(|| parse(stderr)) {
+        Some(e) => {
+            let head = e.message.unwrap_or_default();
+            // The per-field errors say which comment GitHub refused and
+            // why — usually a line outside the diff.
+            let detail: Vec<String> = e
+                .errors
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|d| match (d.field, d.message) {
+                    (Some(f), Some(m)) => Some(format!("{f}: {m}")),
+                    (None, Some(m)) => Some(m),
+                    _ => None,
+                })
+                .collect();
+            if detail.is_empty() {
+                head
+            } else {
+                format!("{head} ({})", detail.join("; "))
+            }
+        }
+        // Nothing parseable: whichever stream actually said something.
+        None => {
+            let e = stderr.trim();
+            if e.is_empty() {
+                stdout.trim().to_string()
+            } else {
+                e.to_string()
+            }
+        }
+    }
 }
 
 /// "owner/repo" for the current directory's repository.
@@ -172,10 +264,18 @@ pub struct ChangedFile {
     pub deletions: u64,
     #[serde(rename = "previous_filename")]
     pub previous: Option<String>,
+    /// A merge left this path unmerged in the working tree. Local review
+    /// only — GitHub's file list never says this, so it deserializes to
+    /// false and the local scan fills it in (see `gitops::local_changes`).
+    #[serde(default, skip)]
+    pub conflicted: bool,
 }
 
 impl ChangedFile {
     pub fn status_char(&self) -> char {
+        if self.conflicted {
+            return '!';
+        }
         match self.status.as_str() {
             "added" => 'A',
             "removed" => 'D',
@@ -277,7 +377,7 @@ pub fn checkout_pr(repo: &str, number: u64) -> Result<()> {
     run_gh(&["pr", "checkout", &n, "--repo", repo]).map(|_| ())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommentSide {
     Left,
     Right,
@@ -334,6 +434,154 @@ pub fn post_review_comment(
     }
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     run_gh(&arg_refs).map(|_| ())
+}
+
+// ----------------------------------------------------------------- reviews
+
+/// What submitting a review says about the pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Verdict {
+    /// Notes, no judgement. GitHub's `COMMENT`.
+    #[default]
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+impl Verdict {
+    /// The `event` value the API takes.
+    pub fn api(self) -> &'static str {
+        match self {
+            Verdict::Comment => "COMMENT",
+            Verdict::Approve => "APPROVE",
+            Verdict::RequestChanges => "REQUEST_CHANGES",
+        }
+    }
+
+    /// The button label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Comment => "Comment",
+            Verdict::Approve => "Approve",
+            Verdict::RequestChanges => "Request changes",
+        }
+    }
+
+    /// The mark drawn beside the label, so the three read apart at a
+    /// glance rather than by their words.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Verdict::Comment => "💬",
+            Verdict::Approve => "✓",
+            Verdict::RequestChanges => "✕",
+        }
+    }
+
+    /// What it did, for the status line after it lands.
+    pub fn past(self) -> &'static str {
+        match self {
+            Verdict::Comment => "commented on",
+            Verdict::Approve => "approved",
+            Verdict::RequestChanges => "requested changes on",
+        }
+    }
+
+    /// The three, in the order the dropdown lists them.
+    pub fn all() -> [Verdict; 3] {
+        [Verdict::Comment, Verdict::Approve, Verdict::RequestChanges]
+    }
+}
+
+/// One inline comment of a review: where it goes, and what it says.
+///
+/// Held comments are written to disk between runs, so this is the on-disk
+/// shape as well as the request shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewComment {
+    pub path: String,
+    pub side: CommentSide,
+    /// Last line of the range, 1-based, on `side`.
+    pub line: usize,
+    /// First line of a multi-line range. `None` for a single line.
+    pub start_line: Option<usize>,
+    pub body: String,
+}
+
+impl ReviewComment {
+    /// How the range reads in a list: "src/app.rs:12" or "src/app.rs:12–18".
+    pub fn where_at(&self) -> String {
+        match self.start_line.filter(|s| *s != self.line) {
+            Some(start) => format!("{}:{start}–{}", self.path, self.line),
+            None => format!("{}:{}", self.path, self.line),
+        }
+    }
+
+    /// The request object GitHub takes for one comment.
+    fn json(&self) -> serde_json::Value {
+        let mut o = serde_json::json!({
+            "path": self.path,
+            "line": self.line,
+            "side": self.side.api(),
+            "body": self.body,
+        });
+        // A single-line comment must NOT carry start_line: GitHub rejects a
+        // range whose two ends are the same line.
+        if let Some(start) = self.start_line.filter(|s| *s != self.line) {
+            o["start_line"] = start.into();
+            o["start_side"] = self.side.api().into();
+        }
+        o
+    }
+}
+
+/// The request body for one review.
+///
+/// An empty field is left out rather than sent empty: GitHub reads a
+/// present-but-blank `body` as a body, and an empty `comments` array as an
+/// attempt to review nothing.
+fn review_payload(
+    commit_id: &str,
+    body: &str,
+    verdict: Verdict,
+    comments: &[ReviewComment],
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "commit_id": commit_id,
+        "event": verdict.api(),
+    });
+    if !body.trim().is_empty() {
+        payload["body"] = body.into();
+    }
+    if !comments.is_empty() {
+        payload["comments"] = comments.iter().map(ReviewComment::json).collect();
+    }
+    payload
+}
+
+/// Submit one review: a body, a verdict, and every inline comment at once.
+///
+/// This is the whole point of holding comments back. Posting them one at a
+/// time notifies everyone watching the pull request once per comment and
+/// leaves no summary tying them together; one review is a single
+/// notification with the notes attached to it.
+///
+/// `commit_id` anchors the inline comments — they must fall on lines that
+/// commit's diff actually touches, or GitHub rejects the whole review.
+pub fn submit_review(
+    repo: &str,
+    number: u64,
+    commit_id: &str,
+    body: &str,
+    verdict: Verdict,
+    comments: &[ReviewComment],
+) -> Result<()> {
+    let payload = review_payload(commit_id, body, verdict, comments);
+    let endpoint = format!("repos/{repo}/pulls/{number}/reviews");
+    run_gh_stdin(
+        &["api", "-X", "POST", &endpoint, "--input", "-"],
+        &payload.to_string(),
+    )
+    .map(|_| ())
 }
 
 // ------------------------------------------------------------------ blame
@@ -511,5 +759,129 @@ mod tests {
         merge_pr_nodes(r#"{"errors":[{"message":"nope"}]}"#, &mut out).expect("no panic");
         assert!(out.is_empty());
         assert!(merge_pr_nodes("not json", &mut out).is_err());
+    }
+
+    // --------------------------------------------------------- reviews
+
+    fn rc(path: &str, line: usize, start: Option<usize>) -> ReviewComment {
+        ReviewComment {
+            path: path.into(),
+            side: CommentSide::Right,
+            line,
+            start_line: start,
+            body: "note".into(),
+        }
+    }
+
+    /// One review carries the summary, the verdict, and every comment.
+    #[test]
+    fn a_review_goes_up_as_one_request() {
+        let comments = [rc("a.rs", 12, None), rc("b.rs", 20, Some(15))];
+        let v = review_payload(
+            "c".repeat(40).as_str(),
+            "looks good",
+            Verdict::Approve,
+            &comments,
+        );
+        assert_eq!(v["event"], "APPROVE");
+        assert_eq!(v["body"], "looks good");
+        assert_eq!(v["commit_id"], "c".repeat(40));
+        let cs = v["comments"].as_array().expect("an array");
+        assert_eq!(cs.len(), 2, "both comments ride along");
+        // A single line must NOT carry start_line — GitHub rejects a range
+        // whose two ends are the same line.
+        assert_eq!(cs[0]["line"], 12);
+        assert_eq!(cs[0]["side"], "RIGHT");
+        assert!(cs[0].get("start_line").is_none());
+        // A range carries both ends, and a side for each.
+        assert_eq!(cs[1]["start_line"], 15);
+        assert_eq!(cs[1]["line"], 20);
+        assert_eq!(cs[1]["start_side"], "RIGHT");
+    }
+
+    /// An empty field is left out rather than sent blank.
+    #[test]
+    fn empty_halves_of_a_review_are_omitted() {
+        let none: [ReviewComment; 0] = [];
+        let v = review_payload("abc", "  ", Verdict::Comment, &none);
+        assert!(v.get("body").is_none(), "a blank summary is not a summary");
+        assert!(v.get("comments").is_none(), "nor is an empty list a list");
+        assert_eq!(v["event"], "COMMENT");
+
+        // A range whose ends match is one line, however it was stored.
+        let same = [rc("a.rs", 7, Some(7))];
+        let v = review_payload("abc", "x", Verdict::RequestChanges, &same);
+        assert_eq!(v["event"], "REQUEST_CHANGES");
+        assert!(v["comments"][0].get("start_line").is_none());
+    }
+
+    /// A rejected review has to say why, and gh splits that across two
+    /// streams: the API's JSON on stdout, a bare status line on stderr.
+    #[test]
+    fn the_api_error_is_pulled_out_of_ghs_noise() {
+        // The real shape, as `gh api` emits it.
+        let out = r#"{"message":"Can not approve your own pull request","documentation_url":"https://docs.github.com"}"#;
+        let err = "gh: Unprocessable Entity (HTTP 422)";
+        assert_eq!(
+            gh_message(out, err),
+            "Can not approve your own pull request",
+            "the useful half is on stdout"
+        );
+
+        // Per-field errors name the comment GitHub refused.
+        let out = r#"{"message":"Validation Failed","errors":[{"field":"line","message":"must be part of the diff"}]}"#;
+        assert_eq!(
+            gh_message(out, "gh: HTTP 422"),
+            "Validation Failed (line: must be part of the diff)"
+        );
+
+        // JSON on stderr instead still works.
+        assert_eq!(
+            gh_message("", r#"gh: HTTP 404 {"message":"Not Found"}"#),
+            "Not Found"
+        );
+
+        // Nothing to parse: whichever stream said something.
+        assert_eq!(
+            gh_message("", "  connection refused\n"),
+            "connection refused"
+        );
+        assert_eq!(gh_message("odd output\n", ""), "odd output");
+    }
+
+    /// The whole request path, against the real `gh`: the JSON is built,
+    /// written to gh's stdin, sent, and the refusal is turned back into a
+    /// sentence. The repository does not exist, so nothing can be created
+    /// — a 404 is the expected answer and the point of the test.
+    ///
+    /// Ignored by default: it needs `gh auth login` and the network.
+    /// Run it with `cargo test -- --ignored real_gh`.
+    #[test]
+    #[ignore = "needs gh auth and the network"]
+    fn real_gh_carries_the_review_and_reports_the_refusal() {
+        let comments = [rc("a.rs", 1, None)];
+        let err = submit_review(
+            "jjacoblee/loupe-nonexistent-probe-9z8x7",
+            1,
+            &"0".repeat(40),
+            "probe",
+            Verdict::Comment,
+            &comments,
+        )
+        .expect_err("a repository that does not exist cannot take a review");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Not Found"),
+            "the API's own words reach the reader, not gh's exit code: {msg}"
+        );
+        assert!(!msg.contains("HTTP"), "and without the status noise: {msg}");
+    }
+
+    /// Where a comment lands, as the confirm prompt spells it.
+    #[test]
+    fn a_comment_says_where_it_goes() {
+        assert_eq!(rc("src/a.rs", 12, None).where_at(), "src/a.rs:12");
+        assert_eq!(rc("src/a.rs", 18, Some(12)).where_at(), "src/a.rs:12–18");
+        assert_eq!(rc("src/a.rs", 9, Some(9)).where_at(), "src/a.rs:9");
     }
 }

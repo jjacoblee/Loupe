@@ -94,6 +94,7 @@ or for good with `auto_refresh = false` in your config.
 | Right-click a file or folder | Copy its path (see [Copying a path](#copying-a-path)) |
 | `]` / `[` | Next / previous file |
 | `x` or click the icon column | PR: toggle *viewed* (syncs to GitHub) · Local: stage / unstage the file |
+| Click `[!]` on a conflicted row | Open its resolve menu (see [Merge conflicts](#merge-conflicts)) |
 | Click `↺` at the end of a row | Revert every change in that file (asks first) |
 | `Tree` / `Flat` buttons | Switch between tree and flat list |
 | Drag the divider | Resize the panel |
@@ -133,6 +134,7 @@ cursor.
 | Click a line | Select the whole line (what commenting anchors to) |
 | Drag through text | Select exactly those characters, on the side you started in |
 | `c` or `💬 Comment` | Comment on the selection, or on the cursor line (PR review) |
+| `R` | The review box — summary, verdict, and everything held |
 | `Enter` / `Space` | Expand or fold the run at the cursor |
 | Click `··· N unchanged lines ···` | Expand a folded run |
 | Click `⌃⌃⌃ … click to fold ⌃⌃⌃` | Re-fold that run |
@@ -143,6 +145,7 @@ cursor.
 | `x` | Toggle *viewed* (stages the file in local review) |
 | Click `↺` in the change bar | Put that section of the diff back (asks first) |
 | `u` / `U` | Revert the change at the cursor / every change in the file |
+| `o`, or click `⚑` in the change bar | Resolve the merge conflict there (see [Merge conflicts](#merge-conflicts)) |
 | `y`, `Ctrl+C`, or `⧉ Copy` | Copy the selected lines — or the cursor line — to the clipboard |
 | `B` | Show / hide the blame pane |
 
@@ -168,6 +171,61 @@ only thing Loupe does that git cannot undo for you.
   drawn: there is no working tree of yours to put back.
 - If the file changed on disk since the diff was loaded, the revert
   refuses rather than writing a stale copy over it — press `r` first.
+
+### Reviewing a pull request
+
+A comment can go up on its own, or be held for one review:
+
+| Key / mouse | Action |
+| --- | --- |
+| `Ctrl+S` or `✎ Add to review` | Hold the comment — nothing reaches GitHub yet |
+| `Ctrl+Enter` or `Post now` | Post that one comment immediately |
+| `Esc` or `Cancel` | Keep nothing |
+
+The review box under the file panel is what actually sends them:
+
+| Key / mouse | Action |
+| --- | --- |
+| `R`, or click the box | Give it the keyboard |
+| `Tab` / `Shift+Tab`, or the `▾` | Comment ⇄ Approve ⇄ Request changes |
+| `Ctrl+S`, or the button | Submit — asks first, listing what goes |
+| `✕ Discard` (twice) | Throw the held comments away |
+| `Esc` | Back to the diff |
+
+Held comments show as `💬` in the change bar and `💬N` beside the file
+name. They survive quitting loupe. Full detail is in
+[Reviewing pull requests](reviewing-prs.md#the-review-box).
+
+### Merge conflicts
+
+A conflicted file opens as **our version against theirs**, with the
+marker lines stripped out, so each conflict is an ordinary changed
+section — `}` / `{` walk them, `z` folds the agreed lines, `/` searches.
+A `⚑` marks the first row of each one.
+
+| Key / mouse | Action |
+| --- | --- |
+| `o`, click `⚑`, or click `[!]` in the file panel | Open the resolve menu for that conflict |
+| `u` on a conflicted file | The same menu — reverting is refused mid-merge |
+| `☰ → Merge conflict → Resolve this whole file` | The menu with only the whole-file lines |
+
+In the menu:
+
+| Key | What it keeps |
+| --- | --- |
+| `o` | Ours — the version on the branch you are on |
+| `t` | Theirs — the version being merged in |
+| `b` | Both — our lines, then theirs |
+| `a` | The common ancestor, where git wrote one |
+| `O` / `T` | Ours / theirs for every conflict in the file |
+| `e` | Edit the raw file, markers and all |
+| `x` | Mark it resolved (`git add`) |
+| `Esc` | Leave it alone |
+
+Resolving the last conflict in a file stages it, because git treats a
+path as conflicted until it is added. Full detail, including conflicts
+git cannot write markers for, is in
+[Reviewing local changes](local-changes.md#merge-conflicts).
 
 ### Copying
 

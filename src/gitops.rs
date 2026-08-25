@@ -148,6 +148,9 @@ fn parse_numstat_z(out: &str) -> HashMap<String, (u64, u64)> {
 /// expects from the GitHub API.
 pub fn local_changes(root: &Path) -> Result<Vec<ChangedFile>> {
     let mut files = Vec::new();
+    // Conflicted paths, so the file list can mark them and sort them first.
+    // A failed read just means no marks — never sink the whole scan.
+    let unmerged = unmerged_paths(root).unwrap_or_default();
     if head_oid().is_some() {
         let ns = run_git(&["diff", "HEAD", "--name-status", "-M", "-z"])?;
         // Counts are cosmetic — don't fail the scan over them.
@@ -156,12 +159,28 @@ pub fn local_changes(root: &Path) -> Result<Vec<ChangedFile>> {
             .unwrap_or_default();
         for (status, previous, path) in parse_name_status_z(&ns) {
             let (additions, deletions) = counts.get(&path).copied().unwrap_or((0, 0));
+            let conflicted = unmerged.contains(&path);
             files.push(ChangedFile {
                 path,
                 status,
                 additions,
                 deletions,
                 previous,
+                conflicted,
+            });
+        }
+    }
+    // A conflict git could not merge at all — an add/add on a path neither
+    // side had, say — can be unmerged without showing in `diff HEAD`.
+    for path in &unmerged {
+        if !files.iter().any(|f| &f.path == path) {
+            files.push(ChangedFile {
+                path: path.clone(),
+                status: "modified".into(),
+                additions: 0,
+                deletions: 0,
+                previous: None,
+                conflicted: true,
             });
         }
     }
@@ -184,9 +203,16 @@ pub fn local_changes(root: &Path) -> Result<Vec<ChangedFile>> {
             additions,
             deletions: 0,
             previous: None,
+            conflicted: false,
         });
     }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
+    // Conflicts first, then by path. A merge conflict blocks the commit, so
+    // it is the one thing in the list that has to be seen without scrolling.
+    files.sort_by(|a, b| {
+        b.conflicted
+            .cmp(&a.conflicted)
+            .then_with(|| a.path.cmp(&b.path))
+    });
     Ok(files)
 }
 
@@ -204,6 +230,10 @@ pub enum StageState {
     Partial,
     /// The working tree matches the index: everything is staged.
     Staged,
+    /// A merge left this path unmerged. It cannot be staged as it stands —
+    /// the conflict has to be resolved first — so it gets its own state
+    /// rather than one of the three above.
+    Conflicted,
 }
 
 /// Parse `git status --porcelain=v1 -z -uall`. Each record is `XY <path>`,
@@ -226,6 +256,9 @@ pub fn parse_status_z(out: &str) -> HashMap<String, StageState> {
             it.next();
         }
         let state = match (x, y) {
+            // The six unmerged shapes git defines: DD, AU, UD, UA, DU, AA,
+            // UU. Every one of them has a U on a side, or is DD or AA.
+            ('U', _) | (_, 'U') | ('D', 'D') | ('A', 'A') => StageState::Conflicted,
             ('?', _) | (' ', _) | ('!', _) => StageState::Unstaged,
             (_, ' ') => StageState::Staged,
             _ => StageState::Partial,
@@ -233,6 +266,204 @@ pub fn parse_status_z(out: &str) -> HashMap<String, StageState> {
         map.insert(path.to_string(), state);
     }
     map
+}
+
+// ------------------------------------------------------------- conflicts
+
+/// Paths git left unmerged, from the index rather than the file text. This
+/// is the authority: a conflict git could not express with markers (one
+/// side deleted the file, say) has no markers to find.
+pub fn unmerged_paths(root: &Path) -> Result<Vec<String>> {
+    let r = root.to_string_lossy().into_owned();
+    let out = run_git(&["-C", &r, "diff", "--name-only", "--diff-filter=U", "-z"])?;
+    Ok(out
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Content of one merge stage of an unmerged path: 1 is the common
+/// ancestor, 2 is ours, 3 is theirs. `None` when that stage does not exist
+/// — an add/add conflict has no ancestor, and a delete/modify conflict is
+/// missing whichever side did the deleting.
+pub fn stage_blob(root: &Path, stage: u8, path: &str) -> Option<String> {
+    let r = root.to_string_lossy().into_owned();
+    let spec = format!(":{stage}:{}", checked_pathspec(root, path).ok()?);
+    run_git(&["-C", &r, "show", &spec]).ok()
+}
+
+/// Write `content` over a repository file. The path is checked the same
+/// way every other write is, so a path that could leave the repository is
+/// refused before it reaches the filesystem.
+pub fn write_repo_file(root: &Path, path: &str, content: &str) -> Result<()> {
+    let abs = safe_repo_path(root, path)
+        .with_context(|| format!("refusing to write suspicious path “{path}”"))?;
+    if let Some(dir) = abs.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(&abs, content).with_context(|| format!("writing {path}"))
+}
+
+/// Resolve a whole conflicted path from the index rather than from the
+/// marker text: take stage 2 (ours) or stage 3 (theirs) exactly as git
+/// recorded it, and mark the path resolved.
+///
+/// This is the answer for the conflicts markers cannot describe. When the
+/// chosen side deleted the file, the file is removed instead of written.
+/// Returns true when a file is left on disk.
+pub fn take_side(root: &Path, path: &str, ours: bool) -> Result<bool> {
+    let stage = if ours { 2 } else { 3 };
+    let r = root.to_string_lossy().into_owned();
+    let spec = checked_pathspec(root, path)?;
+    match stage_blob(root, stage, path) {
+        Some(content) => {
+            write_repo_file(root, path, &content)?;
+            run_git(&["-C", &r, "add", "--", spec])?;
+            Ok(true)
+        }
+        None => {
+            // That side deleted the file, so resolving to it deletes it.
+            run_git(&["-C", &r, "rm", "-f", "-q", "--ignore-unmatch", "--", spec])?;
+            if let Some(abs) = safe_repo_path(root, path) {
+                if abs.symlink_metadata().is_ok() {
+                    std::fs::remove_file(&abs).with_context(|| format!("removing {path}"))?;
+                }
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// What git is in the middle of. A conflict outside a merge still has to
+/// be resolved, but the sentence that says how to finish differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOp {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
+impl MergeOp {
+    /// The word for the top bar badge.
+    pub fn badge(self) -> &'static str {
+        match self {
+            MergeOp::Merge => "MERGE",
+            MergeOp::Rebase => "REBASE",
+            MergeOp::CherryPick => "CHERRY-PICK",
+            MergeOp::Revert => "REVERT",
+        }
+    }
+
+    /// The word for it in a sentence.
+    pub fn noun(self) -> &'static str {
+        match self {
+            MergeOp::Merge => "merge",
+            MergeOp::Rebase => "rebase",
+            MergeOp::CherryPick => "cherry-pick",
+            MergeOp::Revert => "revert",
+        }
+    }
+
+    /// The git command that finishes it, once every conflict is resolved.
+    pub fn finish(self) -> &'static str {
+        match self {
+            MergeOp::Merge => "git commit",
+            MergeOp::Rebase => "git rebase --continue",
+            MergeOp::CherryPick => "git cherry-pick --continue",
+            MergeOp::Revert => "git revert --continue",
+        }
+    }
+}
+
+/// Absolute path of the `.git` directory (a file in a worktree or
+/// submodule, so ask git rather than joining `.git` onto the root).
+pub fn git_dir(root: &Path) -> Option<PathBuf> {
+    let r = root.to_string_lossy().into_owned();
+    let out = run_git(&["-C", &r, "rev-parse", "--absolute-git-dir"]).ok()?;
+    Some(PathBuf::from(out.trim()))
+}
+
+/// The operation in progress, read from the state files git leaves in the
+/// git directory. `None` when the tree is not mid-anything.
+pub fn merge_op(root: &Path) -> Option<MergeOp> {
+    let dir = git_dir(root)?;
+    let has = |name: &str| dir.join(name).exists();
+    if has("MERGE_HEAD") {
+        return Some(MergeOp::Merge);
+    }
+    // Both rebase backends: `rebase-merge` is the interactive one,
+    // `rebase-apply` the older patch-based one.
+    if has("rebase-merge") || has("rebase-apply") {
+        return Some(MergeOp::Rebase);
+    }
+    if has("CHERRY_PICK_HEAD") {
+        return Some(MergeOp::CherryPick);
+    }
+    if has("REVERT_HEAD") {
+        return Some(MergeOp::Revert);
+    }
+    None
+}
+
+// -------------------------------------------------------------- tracking
+
+/// How far the branch has drifted from the branch it tracks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tracking {
+    /// The upstream branch, as `origin/main`.
+    pub upstream: String,
+    /// Commits on this branch that the upstream does not have.
+    pub ahead: usize,
+    /// Commits on the upstream that this branch does not have.
+    pub behind: usize,
+}
+
+impl Tracking {
+    pub fn in_sync(&self) -> bool {
+        self.ahead == 0 && self.behind == 0
+    }
+}
+
+/// Parse `git rev-list --left-right --count <a>...<b>`: one line of two
+/// counts, left first.
+fn parse_left_right(out: &str) -> Option<(usize, usize)> {
+    let mut it = out.split_whitespace();
+    let l = it.next()?.parse().ok()?;
+    let r = it.next()?.parse().ok()?;
+    Some((l, r))
+}
+
+/// The upstream of the current branch, and how far HEAD is from it.
+///
+/// The configured upstream comes first. A branch with none falls back to
+/// `origin/<branch>`, which is what a clone almost always has and what the
+/// question "how far behind origin am I?" means anyway. `None` when there
+/// is no branch, no origin, or nothing to compare against.
+pub fn tracking(root: &Path) -> Option<Tracking> {
+    let r = root.to_string_lossy().into_owned();
+    let branch = current_branch()?;
+    let upstream = run_git(&["-C", &r, "rev-parse", "--abbrev-ref", "@{upstream}"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let guess = format!("refs/remotes/origin/{branch}");
+            run_git(&["-C", &r, "rev-parse", "--verify", "--quiet", &guess])
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|_| format!("origin/{branch}"))
+        })?;
+    let range = format!("{upstream}...HEAD");
+    let out = run_git(&["-C", &r, "rev-list", "--left-right", "--count", &range]).ok()?;
+    // Left is the upstream side, so left is what we are behind by.
+    let (behind, ahead) = parse_left_right(&out)?;
+    Some(Tracking {
+        upstream,
+        ahead,
+        behind,
+    })
 }
 
 /// Index state of every changed path in the working tree.
@@ -610,6 +841,195 @@ mod tests {
         assert!(revert_path(&root, Some(&head), "../escape.txt").is_err());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn status_z_reports_every_unmerged_shape_as_a_conflict() {
+        // The seven codes git defines for an unmerged path.
+        let out = "DD a\0AU b\0UD c\0UA d\0DU e\0AA f\0UU g\0 M plain\0";
+        let m = parse_status_z(out);
+        for path in ["a", "b", "c", "d", "e", "f", "g"] {
+            assert_eq!(
+                m.get(path),
+                Some(&StageState::Conflicted),
+                "{path} should be conflicted"
+            );
+        }
+        assert_eq!(m.get("plain"), Some(&StageState::Unstaged));
+    }
+
+    #[test]
+    fn left_right_counts_parse() {
+        assert_eq!(parse_left_right("2\t5\n"), Some((2, 5)));
+        assert_eq!(parse_left_right("0\t0"), Some((0, 0)));
+        assert_eq!(parse_left_right(""), None);
+        assert_eq!(parse_left_right("nonsense"), None);
+    }
+
+    /// A merge conflict against a real repository. Everything this feature
+    /// stands on — the unmerged list, the index stages, the merge state,
+    /// and the whole-file resolve — is git behavior, so the only honest
+    /// test is one that makes git produce a conflict.
+    #[test]
+    fn a_real_merge_conflict_is_found_and_resolved() {
+        let root = std::env::temp_dir().join(format!("loupe-conflict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let r = root.to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", r.as_str()];
+            full.extend_from_slice(args);
+            run_git(&full).unwrap();
+        };
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["config", "user.email", "loupe@test"]);
+        git(&["config", "user.name", "loupe"]);
+        // Pin the conflict style: a developer with diff3 configured and one
+        // without must get the same test.
+        git(&["config", "merge.conflictStyle", "merge"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(root.join("only-theirs.txt"), "start\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(root.join("a.txt"), "one\nTHEIRS\nthree\n").unwrap();
+        std::fs::write(root.join("only-theirs.txt"), "theirs\n").unwrap();
+        git(&["commit", "-qam", "theirs"]);
+
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(root.join("a.txt"), "one\nOURS\nthree\n").unwrap();
+        std::fs::remove_file(root.join("only-theirs.txt")).unwrap();
+        git(&["commit", "-qam", "ours"]);
+
+        // The merge is expected to fail — that is the point.
+        let merged = run_git(&["-C", &r, "merge", "feature"]);
+        assert!(merged.is_err(), "the merge should conflict");
+
+        assert_eq!(merge_op(&root), Some(MergeOp::Merge));
+        let mut unmerged = unmerged_paths(&root).unwrap();
+        unmerged.sort();
+        assert_eq!(unmerged, vec!["a.txt", "only-theirs.txt"]);
+
+        // The file list marks them and puts them first.
+        let files = local_changes(&root).unwrap();
+        assert!(
+            files[0].conflicted && files[1].conflicted,
+            "conflicts sort to the front: {files:?}"
+        );
+        assert_eq!(files[0].status_char(), '!');
+
+        // The three index stages, as the diff and the whole-file resolve
+        // read them.
+        assert_eq!(
+            stage_blob(&root, 1, "a.txt").as_deref(),
+            Some("one\ntwo\nthree\n")
+        );
+        assert_eq!(
+            stage_blob(&root, 2, "a.txt").as_deref(),
+            Some("one\nOURS\nthree\n")
+        );
+        assert_eq!(
+            stage_blob(&root, 3, "a.txt").as_deref(),
+            Some("one\nTHEIRS\nthree\n")
+        );
+        // We deleted this one, so our side of it does not exist.
+        assert_eq!(stage_blob(&root, 2, "only-theirs.txt"), None);
+
+        // The working-tree file carries the markers the diff is built from.
+        let text = std::fs::read_to_string(root.join("a.txt")).unwrap();
+        assert!(
+            text.contains("<<<<<<<") && text.contains(">>>>>>>"),
+            "{text}"
+        );
+
+        // Taking their whole file writes their content and stages it.
+        assert!(take_side(&root, "a.txt", false).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "one\nTHEIRS\nthree\n"
+        );
+        assert_eq!(
+            stage_states(&root).unwrap().get("a.txt"),
+            Some(&StageState::Staged),
+            "a resolved file is no longer conflicted"
+        );
+
+        // Taking our side of the delete/modify conflict removes the file.
+        assert!(!take_side(&root, "only-theirs.txt", true).unwrap());
+        assert!(!root.join("only-theirs.txt").exists());
+        assert!(
+            unmerged_paths(&root).unwrap().is_empty(),
+            "nothing is left unmerged"
+        );
+
+        // The merge is still in progress until it is committed.
+        assert_eq!(merge_op(&root), Some(MergeOp::Merge));
+        git(&["commit", "-qm", "merged"]);
+        assert_eq!(merge_op(&root), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ahead and behind, against a real remote-tracking ref.
+    #[test]
+    fn ahead_and_behind_count_against_the_upstream() {
+        let root = std::env::temp_dir().join(format!("loupe-track-{}", std::process::id()));
+        let up = std::env::temp_dir().join(format!("loupe-track-up-{}", std::process::id()));
+        for d in [&root, &up] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        std::fs::create_dir_all(&up).unwrap();
+        let u = up.to_string_lossy().into_owned();
+        let ugit = |args: &[&str]| {
+            let mut full = vec!["-C", u.as_str()];
+            full.extend_from_slice(args);
+            run_git(&full).unwrap();
+        };
+        ugit(&["init", "-q", "-b", "main", "."]);
+        ugit(&["config", "user.email", "loupe@test"]);
+        ugit(&["config", "user.name", "loupe"]);
+        std::fs::write(up.join("f.txt"), "1\n").unwrap();
+        ugit(&["add", "-A"]);
+        ugit(&["commit", "-qm", "one"]);
+
+        let r = root.to_string_lossy().into_owned();
+        run_git(&["clone", "-q", &u, &r]).unwrap();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", r.as_str()];
+            full.extend_from_slice(args);
+            run_git(&full).unwrap();
+        };
+        git(&["config", "user.email", "loupe@test"]);
+        git(&["config", "user.name", "loupe"]);
+
+        // `tracking` reads the current branch, which comes from the process
+        // working directory — so run this half from inside the clone.
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        let t = tracking(&root).expect("a fresh clone tracks its origin");
+        assert_eq!(t.upstream, "origin/main");
+        assert!(t.in_sync(), "{t:?}");
+
+        // Two of ours, one of theirs.
+        for n in ["2", "3"] {
+            std::fs::write(root.join("f.txt"), format!("{n}\n")).unwrap();
+            git(&["commit", "-qam", n]);
+        }
+        std::fs::write(up.join("g.txt"), "x\n").unwrap();
+        ugit(&["add", "-A"]);
+        ugit(&["commit", "-qm", "upstream moved"]);
+        git(&["fetch", "-q", "origin"]);
+
+        let t = tracking(&root).expect("still tracking");
+        assert_eq!((t.ahead, t.behind), (2, 1));
+        assert!(!t.in_sync());
+
+        std::env::set_current_dir(cwd).unwrap();
+        for d in [&root, &up] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]

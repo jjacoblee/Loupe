@@ -2,6 +2,7 @@ mod app;
 mod blame;
 mod clipboard;
 mod config;
+mod conflict;
 mod diff;
 mod editor;
 mod github;
