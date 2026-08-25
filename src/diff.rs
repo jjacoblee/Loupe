@@ -89,6 +89,25 @@ pub fn line_width(s: &str) -> usize {
         .sum()
 }
 
+/// Char index at display column `col`, expanding tabs the way the
+/// renderer does — the inverse of [`line_width`] over a prefix, and what
+/// turns a mouse click into a position in the text.
+pub fn char_at_col(s: &str, col: usize) -> usize {
+    let mut w = 0usize;
+    for (i, ch) in s.chars().enumerate() {
+        let cw = if ch == '\t' {
+            TAB_WIDTH
+        } else {
+            ch.width().unwrap_or(0)
+        };
+        if w + cw > col {
+            return i;
+        }
+        w += cw;
+    }
+    s.chars().count()
+}
+
 impl FileDiff {
     pub fn compute(old: Option<&str>, new: Option<&str>) -> Self {
         let old_s = old.unwrap_or("");
@@ -215,6 +234,128 @@ impl FileDiff {
         }
     }
 
+    /// Every run of changed rows, as `[start, end)` row ranges. One run is
+    /// what the diff view calls a *section*: the unit `{` / `}` jump between,
+    /// and the unit a revert puts back. Runs are maximal — a removal
+    /// immediately followed by an addition is one section, because that is
+    /// how it reads on screen.
+    ///
+    /// The renderer asks per row and uses [`Self::section_at`] instead; this
+    /// is the whole-file view of the same model, which is what the tests
+    /// reason about.
+    #[cfg(test)]
+    pub fn sections(&self) -> Vec<(usize, usize)> {
+        let n = self.rows.len();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < n {
+            if self.rows[i].kind == RowKind::Context {
+                i += 1;
+                continue;
+            }
+            let s = i;
+            while i < n && self.rows[i].kind != RowKind::Context {
+                i += 1;
+            }
+            out.push((s, i));
+        }
+        out
+    }
+
+    /// The section `row` belongs to, or None when it is a context row.
+    /// Scans outwards from the row rather than walking the whole file —
+    /// the renderer asks this once per visible line, every frame.
+    pub fn section_at(&self, row: usize) -> Option<(usize, usize)> {
+        if self.rows.get(row)?.kind == RowKind::Context {
+            return None;
+        }
+        let mut s = row;
+        while s > 0 && self.rows[s - 1].kind != RowKind::Context {
+            s -= 1;
+        }
+        let mut e = row + 1;
+        while e < self.rows.len() && self.rows[e].kind != RowKind::Context {
+            e += 1;
+        }
+        Some((s, e))
+    }
+
+    /// Added and removed line counts within one section — what the confirm
+    /// prompt says is at stake.
+    pub fn section_counts(&self, (s, e): (usize, usize)) -> (usize, usize) {
+        let mut adds = 0;
+        let mut dels = 0;
+        for row in self.rows.get(s..e).unwrap_or_default() {
+            match row.kind {
+                RowKind::Added => adds += 1,
+                RowKind::Removed => dels += 1,
+                RowKind::Modified => {
+                    adds += 1;
+                    dels += 1;
+                }
+                RowKind::Context => {}
+            }
+        }
+        (adds, dels)
+    }
+
+    /// The new side of the file with one section put back the way it was:
+    /// every other line stays exactly as it is now, and inside `[s, e)` the
+    /// old text replaces the new.
+    ///
+    /// Rebuilt from the row model rather than spliced by line number,
+    /// because the rows already hold every line of both sides — so what is
+    /// written can never drift out of step with what is on screen.
+    ///
+    /// `None` means the file should no longer exist: reverting the whole of
+    /// a file the change created leaves nothing to write.
+    pub fn revert_section(
+        &self,
+        (s, e): (usize, usize),
+        old: Option<&str>,
+        new: Option<&str>,
+    ) -> Option<String> {
+        let mut out = String::new();
+        let mut wrote = false;
+        // Which side the last line came from decides whether the result
+        // ends in a newline — the row texts have theirs stripped.
+        let mut last_old = false;
+        for (i, row) in self.rows.iter().enumerate() {
+            let inside = i >= s && i < e;
+            let text = if inside {
+                row.old_text.as_deref()
+            } else {
+                row.new_text.as_deref()
+            };
+            let Some(t) = text else { continue };
+            if wrote {
+                out.push('\n');
+            }
+            out.push_str(t);
+            wrote = true;
+            last_old = inside;
+        }
+        if !wrote {
+            // Nothing left at all: a file the change added, reverted whole.
+            // An empty file that existed before is still a file.
+            return old.map(|_| String::new());
+        }
+        let source = if last_old { old } else { new };
+        if source.is_some_and(|c| c.ends_with('\n')) {
+            out.push('\n');
+        }
+        Some(out)
+    }
+
+    /// The fold that hides `row`, keyed by its start row — what a jump has
+    /// to expand before it can land there.
+    pub fn fold_start_for(&self, row: usize) -> Option<usize> {
+        self.fold_ranges()
+            .into_iter()
+            .find(|(s, e)| row >= *s && row < *e)
+            .map(|(s, _)| s)
+    }
+
     /// Number of visual lines in the given view mode.
     pub fn len(&self, side_by_side: bool) -> usize {
         if side_by_side {
@@ -303,25 +444,105 @@ impl FileDiff {
     }
 }
 
-/// A line-range selection on one side of the diff, in file line numbers.
+/// A position in one side of the diff: a 1-based file line, and a char
+/// index within that line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pos {
+    pub line: usize,
+    pub col: usize,
+}
+
+impl Pos {
+    pub fn new(line: usize, col: usize) -> Self {
+        Pos { line, col }
+    }
+}
+
+/// A selection on one side of the diff.
+///
+/// Two things want a selection and they want different granularities:
+/// review comments anchor to whole lines (GitHub has nowhere to put a
+/// half-line comment), while copying wants exactly the characters the
+/// pointer went over. So the selection carries character positions and a
+/// `linewise` flag — clicking a line or using `V` sets it, dragging
+/// through text clears it — and each caller reads the part it needs.
 #[derive(Debug, Clone, Copy)]
 pub struct Selection {
     pub side: Side,
-    pub anchor: usize,
-    pub end: usize,
+    pub anchor: Pos,
+    pub end: Pos,
+    /// Whole lines, however the columns happen to fall.
+    pub linewise: bool,
 }
 
 impl Selection {
-    pub fn range(&self) -> (usize, usize) {
+    /// A whole-line selection, the shape `V` and a plain click produce.
+    pub fn lines(side: Side, anchor: usize, end: usize) -> Self {
+        Selection {
+            side,
+            anchor: Pos::new(anchor, 0),
+            end: Pos::new(end, 0),
+            linewise: true,
+        }
+    }
+
+    /// The two ends in document order.
+    pub fn ordered(&self) -> (Pos, Pos) {
         if self.anchor <= self.end {
             (self.anchor, self.end)
         } else {
             (self.end, self.anchor)
         }
     }
+
+    /// The line span, which is what commenting anchors to.
+    pub fn range(&self) -> (usize, usize) {
+        let (lo, hi) = self.ordered();
+        (lo.line, hi.line)
+    }
+
     pub fn contains(&self, side: Side, line: usize) -> bool {
         let (lo, hi) = self.range();
         self.side == side && line >= lo && line <= hi
+    }
+
+    /// The selected char range within one line, given how long that line
+    /// is — `None` when the line is outside the selection. This is what
+    /// the renderer paints and what the clipboard copies, so the two can
+    /// never disagree about what "selected" means.
+    pub fn cols_on(&self, side: Side, line: usize, len: usize) -> Option<(usize, usize)> {
+        if !self.contains(side, line) {
+            return None;
+        }
+        if self.linewise {
+            return Some((0, len));
+        }
+        let (lo, hi) = self.ordered();
+        let start = if line == lo.line { lo.col } else { 0 };
+        let end = if line == hi.line { hi.col } else { len };
+        Some((start.min(len), end.min(len)))
+    }
+
+    /// The selected text, taken from the lines of the side it is on.
+    /// Empty when the selection covers no characters at all.
+    pub fn text(&self, content: &str) -> String {
+        let (lo, hi) = self.range();
+        let mut out: Vec<String> = Vec::new();
+        for (i, text) in content
+            .lines()
+            .enumerate()
+            .skip(lo.saturating_sub(1))
+            .take(hi + 1 - lo)
+        {
+            let line = i + 1;
+            let chars: Vec<char> = text.chars().collect();
+            match self.cols_on(self.side, line, chars.len()) {
+                Some((a, b)) if b > a => out.push(chars[a..b].iter().collect()),
+                Some(_) => out.push(String::new()),
+                None => {}
+            }
+        }
+        out.join("\n")
     }
 }
 
@@ -422,6 +643,106 @@ mod tests {
     }
 
     #[test]
+    fn sections_group_adjacent_changed_rows() {
+        // Two runs of changes, far enough apart to stay separate; the
+        // removal + addition in the middle is ONE section, not two.
+        let old = "a\nb\nc\nd\ne\nf\ng\n";
+        let new = "a\nB\nc\nd\ne\nGONE\nADDED\ng\n";
+        let d = FileDiff::compute(Some(old), Some(new));
+        let sections = d.sections();
+        assert_eq!(sections.len(), 2, "{:?}", d.rows);
+        // Every row of a section is a changed row, and the rows either side
+        // of it are context.
+        for (s, e) in sections.iter().copied() {
+            assert!(d.rows[s..e].iter().all(|r| r.kind != RowKind::Context));
+            assert_eq!(d.rows[s - 1].kind, RowKind::Context);
+            assert_eq!(d.rows[e].kind, RowKind::Context);
+            // Any row inside it finds the same section back.
+            for row in s..e {
+                assert_eq!(d.section_at(row), Some((s, e)));
+            }
+        }
+        // A context row belongs to no section — there is nothing to revert.
+        assert_eq!(d.section_at(0), None);
+        assert_eq!(d.section_counts(sections[0]), (1, 1));
+    }
+
+    #[test]
+    fn reverting_a_section_puts_back_only_that_section() {
+        let old = "a\nb\nc\nd\ne\nf\ng\n";
+        let new = "a\nB\nc\nd\ne\nF1\nF2\ng\n";
+        let d = FileDiff::compute(Some(old), Some(new));
+        let sections = d.sections();
+        assert_eq!(sections.len(), 2);
+
+        // The first section back to the old text; the second one untouched.
+        assert_eq!(
+            d.revert_section(sections[0], Some(old), Some(new)).unwrap(),
+            "a\nb\nc\nd\ne\nF1\nF2\ng\n"
+        );
+        // …and the other way round.
+        assert_eq!(
+            d.revert_section(sections[1], Some(old), Some(new)).unwrap(),
+            "a\nB\nc\nd\ne\nf\ng\n"
+        );
+        // Reverting every section in turn arrives back at the old file.
+        let mut content = new.to_string();
+        for _ in 0..sections.len() {
+            let d = FileDiff::compute(Some(old), Some(&content));
+            let first = d.sections()[0];
+            content = d.revert_section(first, Some(old), Some(&content)).unwrap();
+        }
+        assert_eq!(content, old);
+    }
+
+    #[test]
+    fn reverting_keeps_the_files_own_line_endings() {
+        // No trailing newline on the new side: the rebuilt file must not
+        // grow one.
+        let d = FileDiff::compute(Some("a\nb\n"), Some("a\nB"));
+        let s = d.sections()[0];
+        assert_eq!(
+            d.revert_section(s, Some("a\nb\n"), Some("a\nB")).unwrap(),
+            "a\nb\n",
+            "the reverted last line brings the old side's newline with it"
+        );
+        // CRLF survives the round trip.
+        let d = FileDiff::compute(Some("a\r\nb\r\n"), Some("a\r\nB\r\n"));
+        let s = d.sections()[0];
+        assert_eq!(
+            d.revert_section(s, Some("a\r\nb\r\n"), Some("a\r\nB\r\n"))
+                .unwrap(),
+            "a\r\nb\r\n"
+        );
+    }
+
+    #[test]
+    fn reverting_a_whole_new_file_leaves_nothing_to_write() {
+        let d = FileDiff::compute(None, Some("x\ny\n"));
+        let s = d.sections()[0];
+        assert_eq!(s, (0, 2), "an added file is one section");
+        assert_eq!(
+            d.revert_section(s, None, Some("x\ny\n")),
+            None,
+            "there is no old file to go back to — it should be deleted"
+        );
+        // A file that was emptied rather than created still exists.
+        let d = FileDiff::compute(Some(""), Some("x\n"));
+        let s = d.sections()[0];
+        assert_eq!(
+            d.revert_section(s, Some(""), Some("x\n")),
+            Some(String::new())
+        );
+        // A deleted file comes back whole.
+        let d = FileDiff::compute(Some("x\ny\n"), None);
+        let s = d.sections()[0];
+        assert_eq!(
+            d.revert_section(s, Some("x\ny\n"), None),
+            Some("x\ny\n".into())
+        );
+    }
+
+    #[test]
     fn max_width_measures_widest_side_with_tabs() {
         let d = FileDiff::compute(Some("ab\n\tx\n"), Some("ab\nlonger line here\n"));
         // "\tx" is TAB_WIDTH + 1 = 5; the new side's 16 chars win.
@@ -435,5 +756,63 @@ mod tests {
         let added: Vec<_> = d.rows.iter().filter(|r| r.kind == RowKind::Added).collect();
         assert_eq!(added.len(), 1);
         assert_eq!(added[0].new_ln, Some(2));
+    }
+
+    #[test]
+    fn a_line_selection_covers_whole_lines() {
+        let sel = Selection::lines(Side::Right, 2, 3);
+        assert_eq!(sel.range(), (2, 3));
+        assert!(sel.contains(Side::Right, 2));
+        assert!(!sel.contains(Side::Left, 2));
+        assert_eq!(sel.cols_on(Side::Right, 2, 7), Some((0, 7)));
+        assert_eq!(sel.cols_on(Side::Right, 4, 7), None);
+        assert_eq!(sel.text("aaa\nbbb\nccc\nddd\n"), "bbb\nccc");
+    }
+
+    #[test]
+    fn a_character_selection_covers_exactly_what_was_dragged() {
+        let content = "const alpha = 1;\nconst beta = 2;\nconst gamma = 3;\n";
+        // From "alpha" on line 1 through "beta" on line 2.
+        let sel = Selection {
+            side: Side::Left,
+            anchor: Pos::new(1, 6),
+            end: Pos::new(2, 10),
+            linewise: false,
+        };
+        assert_eq!(sel.cols_on(Side::Left, 1, 16), Some((6, 16)));
+        assert_eq!(sel.cols_on(Side::Left, 2, 15), Some((0, 10)));
+        assert_eq!(sel.text(content), "alpha = 1;\nconst beta");
+
+        // Dragged the other way: the same text, not an empty selection.
+        let backwards = Selection {
+            anchor: sel.end,
+            end: sel.anchor,
+            ..sel
+        };
+        assert_eq!(backwards.text(content), sel.text(content));
+
+        // Within one line.
+        let one = Selection {
+            side: Side::Left,
+            anchor: Pos::new(2, 6),
+            end: Pos::new(2, 10),
+            linewise: false,
+        };
+        assert_eq!(one.text(content), "beta");
+
+        // A column past the end of a shorter line clamps instead of
+        // panicking — dragging down a ragged block does this constantly.
+        let ragged = Selection {
+            side: Side::Left,
+            anchor: Pos::new(1, 200),
+            end: Pos::new(3, 200),
+            linewise: false,
+        };
+        assert_eq!(ragged.cols_on(Side::Left, 1, 16), Some((16, 16)));
+        assert_eq!(ragged.text(content), "\nconst beta = 2;\nconst gamma = 3;");
+
+        // The side matters: this selection is on the old side, so the new
+        // side shows nothing highlighted.
+        assert_eq!(sel.cols_on(Side::Right, 1, 16), None);
     }
 }

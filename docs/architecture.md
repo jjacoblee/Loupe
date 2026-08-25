@@ -18,6 +18,9 @@ threading model, and the invariants that are easy to break by accident.
 | `highlight.rs` | Syntax highlighting via syntect + two-face: themes, caching, incremental editor highlighting |
 | `theme.rs` | Light/dark appearance: terminal background detection and the two UI color palettes |
 | `config.rs` | TOML config discovery, parsing, and merging (global + per-repo) |
+| `search.rs` | Fuzzy path matching, the pattern-based definition scanner, and `git grep` |
+| `lsp.rs` | Language servers: process lifecycle, JSON-RPC over stdio, symbols/definition/references/hover |
+| `clipboard.rs` | Copying out: a clipboard command when there is one, OSC 52 when there isn't |
 
 There is no shell anywhere: `git` and `gh` are always invoked with
 argv-style `Command` arguments, never through `sh -c`.
@@ -89,6 +92,32 @@ Tab expansion and `FileDiff::max_width` share `diff::TAB_WIDTH` — the
 horizontal-scroll clamp and the renderer must agree on tab width or
 scrolling drifts on tab-indented files.
 
+## Reverting
+
+`FileDiff::section_at` groups rows into *sections* — maximal runs of
+non-context rows, the same unit `{` / `}` jumps between — and
+`revert_section` rebuilds the whole new side with one section taken from
+the old text instead. Rebuilding from the row model rather than splicing
+by line number is what keeps the bytes written in step with what is on
+screen; the trailing newline follows whichever side supplied the last
+line.
+
+A section revert writes that text to the working tree and nothing else,
+after checking the file on disk still matches what the diff was computed
+from (otherwise the row model is stale and the write is refused). A
+whole-file revert goes through `gitops::revert_path`:
+`git checkout <rev> -- <path>`, which moves the index as well as the file
+— so a reverted file stops showing as changed instead of lingering as a
+staged edit with an empty diff — or, when the path does not exist at
+`<rev>`, `git rm -f --ignore-unmatch` plus an unlink. Either way the file
+is reloaded through the same `load_file_data` the silent refresh uses, so
+the reader keeps their place.
+
+`App::revert_gutter` is zero unless the working tree is what is under
+review, and all the diff geometry measures from `App::diff_body` (the
+pane minus that gutter), so a read-only review lays out exactly as it did
+before the change bar existed.
+
 ## Syntax highlighting
 
 The stock syntect syntax set is missing TypeScript, TSX, TOML, Dockerfile
@@ -120,6 +149,115 @@ for mouse→cursor mapping.
 *before* `textarea.input()` — its internal scroll handling would desync
 the shadow viewport.
 
+Replacing the whole buffer (which is what formatting does) costs *two* of
+`tui-textarea`'s undo steps — the delete and the insert — so a single
+undo would leave the file looking empty. `Editor::pre_format` holds the
+previous text and `undo_format` puts it back whole, which is what the
+message on screen promises.
+
+## Finding things
+
+Three tiers, in rising order of cost and falling order of availability:
+
+1. **Fuzzy path matching and the definition scanner** (`search.rs`) — in
+   memory, no subprocess, always available. The scanner is a pattern
+   matcher, not a parser: it is allowed to miss an exotic definition, but
+   it must never invent one, because a wrong symbol sends the reader to
+   the wrong line.
+2. **`git grep`** — one subprocess per query, debounced by 140 ms so
+   typing a word costs one process rather than one per keystroke. Git
+   already knows what is tracked, ignored and binary, and can read a
+   *commit* rather than the working tree — which matters, because in PR
+   review the file on disk may belong to another branch.
+3. **A language server** (`lsp.rs`) — whatever is on `PATH`, started on
+   demand, one per language, kept for the session.
+
+Each tier degrades into the one above it, and says so rather than going
+quiet: no server for Kotlin means `@` still lists definitions, from
+patterns.
+
+## Language servers
+
+Hand-rolled JSON-RPC over stdio (`Content-Length` framing, `serde_json`
+for the bodies) rather than a protocol crate — it is about two hundred
+lines and adds no dependency.
+
+**Every call blocks**, so every call runs on a worker thread through the
+job engine. The registry is cloneable and internally locked, one lock per
+language, so a slow question about Rust doesn't hold up a question about
+TypeScript.
+
+Three things are easy to get wrong here, and all three are load-bearing:
+
+- **The buffer, not the path.** Documents are opened with
+  `textDocument/didOpen` carrying the text on screen. Pointing the server
+  at the file would answer a question about code the reader isn't looking
+  at.
+- **Server-to-client requests must be answered.** `gopls` will not finish
+  starting until `workspace/configuration` comes back, so the message
+  pump replies to requests as well as reading responses.
+- **`window.workDoneProgress` must be declared**, or the server never
+  sends `$/progress` — and without progress there is no way to tell "no
+  references" from "not indexed yet". A cold `rust-analyzer` answers
+  `documentSymbol` in 25 ms and `references` with an empty list until its
+  index is built; `request_when_ready` re-asks while progress is
+  outstanding.
+
+**Diagnostics are pushed, not requested**, which is why `handle_incoming`
+exists: one place that reads every incoming message, absorbs
+notifications and server-to-client requests, and hands back only
+responses. `Lsp::poll` drains it from the main loop with `try_lock`
+throughout — a redraw must never wait on a language server, and a skipped
+tick costs nothing because the next one picks the messages up.
+
+The editor pushes its buffer 220 ms after typing stops (`sync_open`, also
+`try_lock`, and it never *starts* a server). Editor requests go through
+`EditorJob`: non-modal like the finder's, and generation-guarded, because
+an answer about text you have already typed past is worse than no answer.
+
+`typescript-language-server` needs pointing at a `tsserver.js`
+(`tsserver` itself speaks its own protocol, not LSP). Loupe prefers the
+project's own `node_modules` copy so a pinned TypeScript is what does the
+analysis.
+
+## Copying, and why it needs code at all
+
+Mouse reporting is what makes the file tree, the fold banners and the
+diff lines clickable — and it takes the terminal's own click-drag
+selection away in exchange. Most terminals hand it back while a modifier
+is held (Option on macOS, Shift elsewhere), which covers "grab what's on
+screen" but not "copy the lines this PR deleted": those are on the old
+side of the diff, and the selection model already knows which side you
+picked. So `y` copies from the *selected side*, which is the only way to
+get deleted code out — it exists nowhere on disk.
+
+One `Selection` serves both readers at different granularities:
+character positions plus a `linewise` flag. A click or `V` sets it (whole
+lines, which is the only thing GitHub can anchor a comment to); dragging
+clears it and the selection becomes exactly the characters covered.
+`Selection::cols_on` is what the renderer paints *and* what the clipboard
+copies, so the highlight can never promise something different from what
+you get.
+
+`clipboard.rs` tries a clipboard command first (`pbcopy`, `wl-copy`,
+`xclip`, `xsel`, `clip.exe`), then falls back to OSC 52, which asks the
+terminal itself and is the only thing that works over SSH — where the
+commands above would set the clipboard of the wrong machine. No
+clipboard crate: the fallback needs base64 and nothing else.
+
+## Files outside the changeset
+
+A search result, or a jump to a definition, can land in a file the change
+never touches. There is nothing to diff it against, so it opens in the
+**editor** rather than the diff view — a file shown as a file. The review
+state is not disturbed at all, which is what makes closing it free:
+no reload, no restored scroll position, nothing to get wrong.
+
+When the branch under review isn't checked out, the working tree belongs
+to some other branch; the text then comes from the commit and the editor
+is marked read-only, because saving would write over an unrelated
+branch's file.
+
 ## Talking to git and GitHub
 
 - All GitHub access goes through the `gh` CLI — the user's existing
@@ -142,13 +280,19 @@ the shadow viewport.
 
 ## Testing
 
-`cargo test` runs the full suite (no network, no GitHub): diff engine and
+`cargo test` runs the full suite (no network, no GitHub — but two tests
+*do* start a real language server when one is installed, and skip
+themselves when it isn't; they are the only check that the handshake
+still works against a real implementation): diff engine and
 folding semantics, tree building, highlight (including incremental ==
 fresh equivalence), `-z` porcelain parsers verified against real git
 output, config parsing and merge precedence, CLI parsing, scroll and
-resize clamps — plus `TestBackend` render tests that assert syntax colors
-actually reach the diff cells, and two tests that drive a **real
-temporary git repository** to keep the staging plumbing honest. Clippy is
+resize clamps, fuzzy ranking, the definition scanner, LSP message
+framing and every shape a `definition` answer can take — plus
+`TestBackend` render tests that assert syntax colors and search
+highlights actually reach the diff cells, and tests that drive a **real
+temporary git repository** to keep the staging and `git grep` plumbing
+honest. Clippy is
 kept at zero warnings across all targets.
 
 ## Performance ground rules

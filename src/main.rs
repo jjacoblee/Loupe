@@ -1,10 +1,13 @@
 mod app;
+mod clipboard;
 mod config;
 mod diff;
 mod editor;
 mod github;
 mod gitops;
 mod highlight;
+mod lsp;
+mod search;
 mod theme;
 mod ui;
 mod wizard;
@@ -34,6 +37,7 @@ USAGE: loupe [--pr | --local | --auto] [--theme <name>] [--light | --dark]
   --light    force light colors for this session
   --dark     force dark colors (the default is to ask the terminal)
   --themes   list syntax-theme names
+  --lsp      report which language servers loupe can find
   --help     show this help
 
   set-theme [--light] <name>
@@ -74,6 +78,8 @@ enum CliCmd {
     },
     Help,
     Themes,
+    /// Report which language servers are installed.
+    Lsp,
     /// Save a theme into one of the two slots (`light` picks which).
     SetTheme {
         name: String,
@@ -108,6 +114,7 @@ fn parse_cli<I: Iterator<Item = String>>(args: I) -> Result<CliCmd, String> {
             // the arguments are parsed normally and resolved at the end.
             "set-theme" => set_theme = true,
             "--themes" => return Ok(CliCmd::Themes),
+            "--lsp" => return Ok(CliCmd::Lsp),
             "appearance" => return Ok(CliCmd::Appearance),
             "--help" | "-h" => return Ok(CliCmd::Help),
             other => match other.strip_prefix("--theme=") {
@@ -185,6 +192,45 @@ fn theme_or_exit(name: &str) -> two_face::theme::EmbeddedThemeName {
     }
 }
 
+/// `loupe --lsp`: what is installed, what isn't, and what to run to fix
+/// that. Loupe never installs anything itself, so this is the whole
+/// story of why `gd` did or didn't work.
+fn report_language_servers() {
+    println!("Language servers loupe can drive (it starts what you already have):\n");
+    let mut missing = Vec::new();
+    for (spec, found) in lsp::doctor() {
+        let exts: Vec<String> = spec.exts.iter().map(|e| format!(".{e}")).collect();
+        match found {
+            Some(path) => println!(
+                "  ✓ {:<12} {}\n      {}",
+                spec.lang,
+                path.display(),
+                exts.join(" ")
+            ),
+            None => {
+                println!(
+                    "  ✗ {:<12} {} not found on PATH\n      {}",
+                    spec.lang,
+                    spec.cmd,
+                    exts.join(" ")
+                );
+                missing.push(spec);
+            }
+        }
+    }
+    if !missing.is_empty() {
+        println!("\nTo add the missing ones:");
+        for spec in &missing {
+            println!("  {:<12} {}", spec.lang, spec.install);
+        }
+    }
+    println!(
+        "\nInside loupe: gd goes to a definition, gr lists references, K shows a type.\n\
+         Anything else falls back to pattern matching, which still finds most definitions.\n\
+         Set `language_servers = false` in your config to turn this off entirely."
+    );
+}
+
 /// Everything resolved before the terminal is touched. The appearance and
 /// the theme cannot be settled here: deciding those means asking the
 /// terminal for its background color, which needs raw mode.
@@ -192,6 +238,10 @@ struct Startup {
     mode: LaunchMode,
     org: Option<String>,
     file_panel_width: Option<u16>,
+    /// `language_servers` — off means loupe never starts one.
+    language_servers: bool,
+    /// `format_on_save` — run the server's formatter on every save.
+    format_on_save: bool,
     wizard: bool,
     /// Forced by `--light`/`--dark` or the `appearance` config key; `None`
     /// means "ask the terminal".
@@ -286,6 +336,10 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Ok(CliCmd::Lsp) => {
+            report_language_servers();
+            return Ok(());
+        }
         Ok(CliCmd::Appearance) => {
             report_appearance();
             return Ok(());
@@ -338,6 +392,8 @@ fn main() -> Result<()> {
             .unwrap_or(LaunchMode::Auto),
         org: cfg.org,
         file_panel_width: cfg.file_panel_width,
+        language_servers: cfg.language_servers.unwrap_or(true),
+        format_on_save: cfg.format_on_save.unwrap_or(false),
         // First launch (no global config yet) — or an explicit `loupe setup`
         // — runs the wizard before anything else.
         wizard: force_setup || !config::global_path().is_some_and(|p| p.is_file()),
@@ -379,6 +435,8 @@ fn run_tui(startup: Startup) -> Result<()> {
             startup.mode,
             startup.org,
             startup.file_panel_width,
+            startup.language_servers,
+            startup.format_on_save,
         )
     })();
 
@@ -392,8 +450,12 @@ fn run(
     mode: LaunchMode,
     org: Option<String>,
     file_panel_width: Option<u16>,
+    language_servers: bool,
+    format_on_save: bool,
 ) -> Result<()> {
     let mut app = App::new(mode, org);
+    app.lsp_enabled = language_servers;
+    app.format_on_save = format_on_save;
     if let Some(w) = file_panel_width {
         // The real clamp happens at draw time, once the area is known.
         app.file_panel_w = w.max(app::FILE_PANEL_MIN);
@@ -406,7 +468,7 @@ fn run(
         // While a foreground job runs the spinner animates, so keep drawing;
         // otherwise only redraw when state actually changed — an idle loupe
         // costs ~zero CPU.
-        if app.poll_jobs() || app.busy() || app.refreshing() {
+        if app.poll_jobs() || app.busy() || app.refreshing() || app.searching() {
             dirty = true;
         }
 
@@ -416,12 +478,15 @@ fn run(
         }
 
         if app.should_quit {
+            // Language servers are children of this process; don't leave
+            // them running after the terminal is handed back.
+            app.lsp.shutdown();
             return Ok(());
         }
 
         // Short timeout while busy keeps the spinner animating and picks up
         // job results promptly; longer otherwise to stay idle-friendly.
-        let timeout = Duration::from_millis(if app.busy() || app.refreshing() {
+        let timeout = Duration::from_millis(if app.busy() || app.refreshing() || app.searching() {
             80
         } else {
             250
@@ -478,6 +543,8 @@ mod tests {
             mode: LaunchMode::Auto,
             org: None,
             file_panel_width: None,
+            language_servers: true,
+            format_on_save: false,
             wizard: false,
             appearance: None,
             dark_theme: by(dark),

@@ -160,6 +160,54 @@ the divider between the panels, press `<` / `>`, or double-click the
 divider to return to the default of 34. The width is re-clamped on every
 draw, so a narrow terminal can never squeeze the diff out of existence.
 
+### `language_servers` — go to definition, references, hover
+
+```toml
+language_servers = true   # the default
+```
+
+Loupe drives a language server for `gd`, `gr` and `K`. It ships none and
+installs none: it looks on your `PATH` for the one your language already
+uses, starts it the first time you ask a question about a file it
+handles, and stops it when Loupe exits.
+
+| Language | Binary | Install |
+| --- | --- | --- |
+| TypeScript / JavaScript | `typescript-language-server` | `npm install -g typescript-language-server typescript` |
+| Go | `gopls` | `go install golang.org/x/tools/gopls@latest` |
+| Rust | `rust-analyzer` | `rustup component add rust-analyzer` |
+
+Run `loupe --lsp` to see which of those are installed and what to run
+for the rest. Note that `tsserver` alone is not enough — it speaks its
+own protocol rather than LSP, and `typescript-language-server` is the
+wrapper that bridges the two. Loupe pairs it with the `tsserver.js` from
+your project's `node_modules` when there is one, so a project pinned to
+an older TypeScript is analyzed by that version.
+
+The server always receives **the text on your screen**, not the file on
+disk. In PR review those differ — the working tree may be on another
+branch entirely — and answering from the wrong copy would be worse than
+not answering.
+
+Set this to `false` and Loupe never starts a subprocess for any of it;
+`@` (symbols in this file) keeps working from pattern matching, and
+`gd` / `gr` / `K` say why they can't.
+
+### `format_on_save` — run the formatter when the editor saves
+
+```toml
+format_on_save = false   # the default
+```
+
+With this on, `Ctrl+S` in the editor runs `textDocument/formatting`
+first — prettier, gofmt or rustfmt, whichever the language server drives
+— and saves the result.
+
+It is off by default on purpose: Loupe is a review tool, and reformatting
+a file in the middle of a review would add changes to the diff that
+nobody asked for. `Ctrl+T` (or the `⇥ Format` button) formats on demand
+whatever this is set to, and `Ctrl+Z` undoes a format in one keystroke.
+
 ## Command line
 
 ```
@@ -176,6 +224,7 @@ loupe setup
   --light    force light colors for this session
   --dark     force dark colors (the default is to ask the terminal)
   --themes   list syntax-theme names
+  --lsp      report which language servers loupe can find
   --help,-h  show usage
 
   set-theme [--light] <name>

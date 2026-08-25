@@ -285,6 +285,49 @@ pub fn unstage_file(root: &Path, path: &str, previous: Option<&str>) -> Result<(
     run_git(&args).map(|_| ())
 }
 
+// ------------------------------------------------------------------ revert
+
+/// True when `path` exists in the tree at `rev`.
+fn exists_at(root: &Path, rev: &str, path: &str) -> bool {
+    let r = root.to_string_lossy().into_owned();
+    let spec = format!("{rev}:{path}");
+    Command::new("git")
+        .args(["-C", &r, "cat-file", "-e", &spec])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Put `path` back the way it looks at `rev` — index and working tree both —
+/// or remove it when it does not exist there.
+///
+/// `git checkout <rev> -- <path>` is the whole trick: it rewrites the index
+/// entry as well as the file, so a reverted file stops showing up as changed
+/// instead of lingering as a staged edit whose diff is empty. `rev` is None
+/// in a repository with no commits, where every file is a new one.
+///
+/// This throws work away for good — the caller is expected to have asked
+/// first.
+pub fn revert_path(root: &Path, rev: Option<&str>, path: &str) -> Result<()> {
+    let r = root.to_string_lossy().into_owned();
+    let spec = checked_pathspec(root, path)?;
+    match rev.filter(|rev| !rev.is_empty() && exists_at(root, rev, path)) {
+        Some(rev) => run_git(&["-C", &r, "checkout", rev, "--", spec]).map(|_| ()),
+        None => {
+            // Nothing to go back to: the change created this file, so undoing
+            // it means removing it — from the index too when it is staged.
+            // `--ignore-unmatch` keeps an untracked file from being an error.
+            run_git(&["-C", &r, "rm", "-f", "-q", "--ignore-unmatch", "--", spec])?;
+            match safe_repo_path(root, path) {
+                Some(abs) if abs.symlink_metadata().is_ok() => {
+                    std::fs::remove_file(&abs).with_context(|| format!("removing {path}"))
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
 /// True when `url` points at the GitHub repository `repo` ("owner/name") —
 /// https, ssh, and scp-style remote URLs all end in the same two segments.
 fn url_matches_repo(url: &str, repo: &str) -> bool {
@@ -457,6 +500,87 @@ mod tests {
             Some(&StageState::Unstaged)
         );
         assert!(root.join("first.txt").is_file(), "unstaging never deletes");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Reverting against a real repository: the four shapes a changed file
+    /// can have (edited, staged, deleted, brand new) all have to end with
+    /// `git status` clean for that path.
+    #[test]
+    fn revert_puts_files_back_in_a_real_repo() {
+        let root = std::env::temp_dir().join(format!("loupe-revert-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let r = root.to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", r.as_str()];
+            full.extend_from_slice(args);
+            run_git(&full).unwrap();
+        };
+        git(&["init", "-q", "."]);
+        git(&["config", "user.email", "loupe@test"]);
+        git(&["config", "user.name", "loupe"]);
+        std::fs::write(root.join("edited.txt"), "one\n").unwrap();
+        std::fs::write(root.join("staged.txt"), "two\n").unwrap();
+        std::fs::write(root.join("gone.txt"), "three\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        let head = run_git(&["-C", &r, "rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // An unstaged edit, a staged edit, a deletion, and an untracked file.
+        std::fs::write(root.join("edited.txt"), "one\nEDIT\n").unwrap();
+        std::fs::write(root.join("staged.txt"), "two\nEDIT\n").unwrap();
+        stage_file(&root, "staged.txt", None).unwrap();
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        std::fs::write(root.join("brand-new.txt"), "fresh\n").unwrap();
+        assert_eq!(stage_states(&root).unwrap().len(), 4);
+
+        for path in ["edited.txt", "staged.txt", "gone.txt", "brand-new.txt"] {
+            revert_path(&root, Some(&head), path).unwrap();
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("edited.txt")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("staged.txt")).unwrap(),
+            "two\n",
+            "a staged edit is undone in the index too"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("gone.txt")).unwrap(),
+            "three\n",
+            "a deleted file comes back"
+        );
+        assert!(
+            !root.join("brand-new.txt").exists(),
+            "a file the change created is removed, not emptied"
+        );
+        assert!(
+            stage_states(&root).unwrap().is_empty(),
+            "nothing is left showing as changed: {:?}",
+            stage_states(&root).unwrap()
+        );
+
+        // A staged new file goes out of the index as well as off the disk.
+        std::fs::write(root.join("added.txt"), "x\n").unwrap();
+        stage_file(&root, "added.txt", None).unwrap();
+        revert_path(&root, Some(&head), "added.txt").unwrap();
+        assert!(!root.join("added.txt").exists());
+        assert!(stage_states(&root).unwrap().is_empty());
+
+        // With no commit to go back to, everything is a new file.
+        std::fs::write(root.join("nocommit.txt"), "x\n").unwrap();
+        revert_path(&root, None, "nocommit.txt").unwrap();
+        assert!(!root.join("nocommit.txt").exists());
+
+        // And a path that tries to leave the repository is refused outright.
+        assert!(revert_path(&root, Some(&head), "../escape.txt").is_err());
 
         let _ = std::fs::remove_dir_all(&root);
     }

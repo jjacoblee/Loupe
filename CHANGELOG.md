@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Right-click a file-panel row to copy its path**: a small menu opens
+  at the pointer with *Copy relative path* (`r`) — `src/app.rs`, the way
+  git spells it — and *Copy full path* (`f`), the same path from the
+  root of the disk. Folder rows work too. Paths are the one thing in the
+  file panel that dragging cannot copy, because the panel shows them
+  shortened and split across tree rows, and they are what a shell
+  command or an agent prompt wants. The menu also opens while the editor
+  is up, since copying a path changes nothing on screen.
+
+- **Reverting changes from inside the review**: a `↺` in the change bar
+  beside every changed section of the diff, and one at the end of every
+  file row. Clicking a section marker — or `u` — puts that run of lines
+  back and leaves the rest of the file, and the index, alone; the file
+  marker — or `U` — reverts the whole file through
+  `git checkout <old> -- <path>`, index included, and deletes a file the
+  change had created. Both confirm first (this is the one thing git
+  can't undo for you), a file that moved on disk since it was loaded is
+  refused rather than overwritten, and a read-only PR review offers
+  neither and spends none of the width.
+- **Search**, in three shapes behind one overlay (`Ctrl+P`, or the
+  `🔍 Find` button): fuzzy file matching over the changeset — `Tab`
+  widens it to the whole repository — `#` to grep inside those files via
+  a single `git grep`, and `@` to list what a file defines. Results
+  carry the source line, mark which hits are definitions, and say which
+  files are part of the change. Searches read the commit under review
+  rather than the working tree, so what you find is what you're reading.
+- **`/` searches the open diff** incrementally, highlighting every match
+  in place; `n` / `N` step through them and wrap, and jumping into a
+  collapsed section expands it on the way. `Esc` unwinds one layer at a
+  time — selection, then search, then back.
+- **Opening a file that isn't in the change** — from a search result or
+  a jump to a definition — opens it in the editor rather than a diff of
+  the file against itself. The review underneath is untouched, so `Esc`
+  needs no reload and loses nothing. A file read from the commit
+  (because the branch isn't checked out) opens read-only and says so.
+- **Copying**, with character-level selection: drag through the diff to
+  select exactly the characters you want — mid-word, across lines, on
+  either side — and `y`, `Ctrl+C`, or the `⧉ Copy` button puts precisely
+  that on the clipboard. Dragging past the edge scrolls and keeps
+  selecting; the selection stays pinned to the side it started on, since
+  the two panes are different documents. A plain click still selects the
+  whole line, which is what review comments anchor to, and `V` still
+  starts a keyboard line selection. Copying uses
+  `pbcopy`/`wl-copy`/`xclip`/`xsel` when available and falls back to
+  OSC 52 so it works over SSH; `Ctrl+C` copies in the editor too.
+- **Language servers** for go-to-definition (`gd`), find-all-references
+  (`gr`) and hover (`K`), driving whatever is already installed —
+  `typescript-language-server`, `gopls` or `rust-analyzer`. Loupe
+  bundles nothing and installs nothing: it starts the server on demand,
+  sends it the buffer on screen rather than the file on disk (in PR
+  review those differ), waits out a cold index instead of reporting a
+  wrong empty answer, and falls back to pattern matching where there is
+  no server. `loupe --lsp` reports what was found and how to install the
+  rest; `language_servers = false` turns it all off.
 - **Light-terminal support**: Loupe now asks the terminal for its
   background color at startup (OSC 11, with a `COLORFGBG` fallback and a
   device-attributes sentinel so a terminal that ignores the query costs
@@ -42,7 +96,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Theme CLI**: `loupe --theme <name>` for a one-session override and
   `loupe set-theme <name>` to persist a theme from the shell.
 
+### Fixed
+
+- The top bar no longer paints its buttons over the PR title or branch
+  name on a narrow terminal: the row now reserves space for what is on
+  its left and drops the leftmost buttons when there isn't room. The
+  one-column gaps between buttons are painted too, so the text
+  underneath stops showing through them a letter at a time.
+- The finder overlay sizes itself to its results instead of always
+  taking the full height.
+
+- **The editor is connected to the language server too**, not just the
+  diff view:
+  - **Diagnostics as you type**, without saving — `●`/`▲` in the gutter,
+    the offending span colored, the message in the status bar for the
+    cursor line and a count for the file otherwise. The buffer is pushed
+    to the server 220 ms after you stop typing, so what it checks is what
+    is on screen rather than what is on disk.
+  - **Completion** (`Ctrl+Space`, and automatically after `.`, `:` or
+    `>`): a popup under the cursor, narrowing as you type without another
+    round trip, `Tab`/`Enter` to accept, `Esc` to dismiss.
+  - **`Ctrl+G`** for the type and docs at the cursor and **`Ctrl+]`** to
+    go to the definition — the diff view's `K` and `gd` can't work in an
+    editor, where plain letters are text.
+  - **`Ctrl+T`** (or the `⇥ Format` button) formats the file;
+    `format_on_save = true` does it on every save. Off by default, since
+    reformatting mid-review adds diff noise nobody asked for.
+
+### Fixed
+
+- The help overlay said undo was `Ctrl+Z` / `Ctrl+Y`. `tui-textarea`
+  binds `Ctrl+U` / `Ctrl+R`; `Ctrl+Z` is now also bound to undo, and the
+  documented keys match what the editor actually does.
+- Undoing a format takes one keystroke. Replacing the whole buffer costs
+  two of the editor's undo steps, so a single undo used to leave the file
+  looking empty.
+
 ### Changed
+
+- `n` / `p` no longer step through files — they are next / previous
+  search match, as in vim. `]` / `[`, which always did the same job,
+  remain the file keys.
 
 - Default theme is now **catppuccin-mocha** on a dark terminal and
   **catppuccin-latte** on a light one (was one-half-dark unconditionally;
@@ -51,6 +145,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   background, so a light theme looks light before you commit to it.
 - Themes switch at runtime — the syntax theme is no longer baked in at
   startup.
+
 
 ## [0.1.0] - 2026-08-23
 

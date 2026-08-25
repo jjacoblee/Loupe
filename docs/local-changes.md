@@ -53,6 +53,17 @@ Details worth knowing:
 Staging toggles are optimistic and re-read the real index in the
 background; on failure the icon reverts and the error is shown.
 
+## Putting changes back
+
+Each changed section of the diff carries a `↺` in the change bar at the
+left of the pane; each file row carries one at its right-hand end. The
+section marker (or `u`) rewrites just those lines in the working tree and
+leaves the index alone; the file marker (or `U`) runs
+`git checkout HEAD -- <path>`, which puts the index back too and drops
+the file out of the list. An untracked file has no `HEAD` version to
+restore, so reverting it deletes it — the prompt says which of the two is
+about to happen, and nothing moves until you confirm.
+
 ## What's different from PR review
 
 - The diff compares your working tree against `HEAD`; the index moving
@@ -70,5 +81,6 @@ background; on failure the icon reverts and the error is shown.
 2. Walk the file list top to bottom, reading each diff. Fix small things
    in place with the editor.
 3. Stage each file as you finish reviewing it — `x`, or click the icon.
+   Something you didn't mean to keep? `↺` beside it puts it back.
 4. Quit (`q`) and `git commit`: the index already contains exactly what
    you reviewed.

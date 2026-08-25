@@ -40,3 +40,16 @@
 # panels (or press < / >) to change it while running; double-click the
 # divider to come back to the default of 34.
 #file_panel_width = 34
+
+# Language servers. Loupe never installs or bundles one; it looks on your
+# PATH for typescript-language-server, gopls or rust-analyzer and starts
+# one on demand for `gd` (go to definition), `gr` (find references) and
+# `K` (hover). A language with no server falls back to pattern matching.
+# `loupe --lsp` reports what was found. Set false to never start one.
+#language_servers = true
+
+# Run the language server's formatter (prettier, gofmt, rustfmt — whatever
+# it drives) every time the editor saves. Off by default: reformatting a
+# file mid-review would add changes to the diff nobody asked for. Ctrl+T
+# formats on demand either way, and Ctrl+Z undoes it in one keystroke.
+#format_on_save = false

@@ -1,8 +1,8 @@
 //! All rendering. Every clickable region drawn here is recorded into
 //! `app.layout` so the mouse handlers can hit-test against it.
 
-use crate::app::{App, ButtonId, FileEntry, Overlay, Screen, ViewMode};
-use crate::diff::{DisplayEntry, Row, RowKind, Side, TAB_WIDTH};
+use crate::app::{App, ButtonId, FileEntry, FinderMode, Overlay, Screen, ViewMode, FINDER_ROWS};
+use crate::diff::{DisplayEntry, Row, RowKind, Selection, Side, TAB_WIDTH};
 use crate::gitops::StageState;
 use crate::highlight::HlLine;
 use crate::theme::palette;
@@ -47,8 +47,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_checkout_prompt(f, app, area, n);
         }
         Overlay::Comment(_) => draw_comment_overlay(f, app, area),
-        Overlay::Help => draw_help(f, area),
+        Overlay::Revert(_) => draw_revert_prompt(f, app, area),
+        Overlay::Help => draw_help(f, app, area),
         Overlay::ThemePicker(_) => draw_theme_picker(f, app, area),
+        Overlay::Finder(_) => draw_finder(f, app, area),
+        Overlay::Hover(_) => draw_hover(f, app, area),
+        Overlay::PathMenu(_) => draw_path_menu(f, app, area),
     }
 }
 
@@ -109,18 +113,42 @@ fn disp_width(s: &str) -> usize {
 
 /// Render a row of clickable "buttons", right-aligned in `area`,
 /// recording each button's rect.
-fn buttons_right(f: &mut Frame, app: &mut App, area: Rect, buttons: &[(&str, ButtonId, bool)]) {
-    let total: u16 = buttons
-        .iter()
-        .map(|(l, _, _)| {
-            l.chars()
-                .map(|c| c.width().unwrap_or(0) as u16)
-                .sum::<u16>()
-                + 3
-        })
-        .sum();
+/// Draw a right-aligned row of buttons, keeping `reserve` columns free on
+/// the left for whatever is already written there (a PR title, a branch
+/// name). Without that reservation a narrow terminal paints the buttons
+/// straight over it and the row stops being readable at all.
+fn buttons_right(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    reserve: u16,
+    buttons: &[(&str, ButtonId, bool)],
+) {
+    let width = |l: &str| l.chars().map(|c| c.width().unwrap_or(0) as u16).sum::<u16>();
+    let budget = area.width.saturating_sub(reserve);
+    // The rightmost buttons are the ones people reach for (Help, Back),
+    // so when they don't all fit, drop from the left.
+    let mut first = 0;
+    let mut total: u16 = buttons.iter().map(|(l, _, _)| width(l) + 3).sum();
+    while total > budget && first + 1 < buttons.len() {
+        total -= width(buttons[first].0) + 3;
+        first += 1;
+    }
+    let buttons = &buttons[first..];
     let p = palette();
     let mut x = area.x + area.width.saturating_sub(total);
+    // Wipe the strip first: the buttons are separated by a blank column
+    // each, and without this the text underneath (a PR title, a branch
+    // name) shows through those gaps one letter at a time.
+    f.render_widget(
+        Paragraph::new(" ".repeat(total as usize)),
+        Rect {
+            x,
+            y: area.y,
+            width: area.x + area.width - x,
+            height: 1,
+        },
+    );
     for (label, id, active) in buttons {
         let w: u16 = label
             .chars()
@@ -166,6 +194,9 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 fn draw_topbar_prlist(f: &mut Frame, app: &mut App, area: Rect) {
     let p = palette();
     let repo = app.repo.clone().unwrap_or_else(|| "…".into());
+    // " 🔍 loupe " plus a space, then the repo name — the part of this
+    // row the buttons must not paint over.
+    let reserve = 12 + disp_width(&repo) as u16;
     let title = Line::from(vec![
         Span::styled(
             " 🔍 loupe ",
@@ -186,6 +217,7 @@ fn draw_topbar_prlist(f: &mut Frame, app: &mut App, area: Rect) {
         f,
         app,
         area,
+        reserve,
         &[
             ("⎇ Local changes", ButtonId::LocalChanges, false),
             ("⟳ Refresh", ButtonId::Refresh, false),
@@ -218,6 +250,10 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
             .unwrap_or((0, String::new()));
         (format!(" PR #{num} "), p.badge_pr, title, "")
     };
+    // The badge and the PR title (or branch) are what the buttons have to
+    // leave room for; the trailing note is expendable.
+    let shown_title = tail_truncate(&title, (area.width / 3) as usize);
+    let reserve = disp_width(&badge) as u16 + 1 + disp_width(&shown_title) as u16 + 1;
     let left = Line::from(vec![
         Span::styled(
             badge,
@@ -228,7 +264,7 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
         ),
         Span::raw(" "),
         Span::styled(
-            tail_truncate(&title, (area.width / 3) as usize),
+            shown_title,
             Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ),
         Span::styled(note, Style::default().fg(p.dim)),
@@ -240,7 +276,9 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
             f,
             app,
             area,
+            reserve,
             &[
+                ("⇥ Format", ButtonId::EditorFormat, false),
                 ("💾 Save", ButtonId::EditorSave, true),
                 ("✕ Close", ButtonId::EditorClose, false),
                 ("? Help", ButtonId::Help, false),
@@ -260,8 +298,15 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
                 app.view == ViewMode::Inline,
             ),
             ("⇕ Fold", ButtonId::FoldToggle, app.collapse_unchanged),
+            ("🔍 Find", ButtonId::Find, false),
             ("✎ Edit", ButtonId::Edit, false),
         ];
+        // Mouse reporting eats the terminal's own selection, so copying
+        // has to be offered here too, not only as a key — but only once
+        // there is something to copy, because the row is already full.
+        if has_sel {
+            buttons.push(("⧉ Copy", ButtonId::Copy, true));
+        }
         // No PR — nothing to comment on.
         if !app.local {
             buttons.push(("💬 Comment", ButtonId::Comment, has_sel));
@@ -272,7 +317,7 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
         buttons.push(("🎨", ButtonId::Theme, false));
         buttons.push(("← PRs", ButtonId::BackToPrs, false));
         buttons.push(("? Help", ButtonId::Help, false));
-        buttons_right(f, app, area, &buttons);
+        buttons_right(f, app, area, reserve, &buttons);
     }
 }
 
@@ -437,6 +482,7 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
             f,
             app,
             toggle_area,
+            0,
             &[
                 ("Tree", ButtonId::ViewTree, app.tree_view),
                 ("Flat", ButtonId::ViewFlat, !app.tree_view),
@@ -513,8 +559,16 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                 };
                 let counts = format!(" +{} −{}", file.additions, file.deletions);
                 let indent = *depth as usize;
-                let name_w =
-                    (inner.width as usize).saturating_sub(indent + 6 + counts.chars().count());
+                // ↺ at the end of the row throws the whole file's changes
+                // away (after asking). Only when there is a working tree to
+                // put back — a read-only PR keeps the columns for the name.
+                let revert_w = if app.can_revert() {
+                    crate::app::REVERT_W as usize
+                } else {
+                    0
+                };
+                let name_w = (inner.width as usize)
+                    .saturating_sub(indent + 6 + counts.chars().count() + revert_w);
                 let name_t = tail_truncate(name, name_w);
                 let pad = name_w.saturating_sub(disp_width(&name_t));
                 let base = if selected {
@@ -523,13 +577,17 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default()
                 };
                 let name_fg = if done { p.viewed } else { p.text };
-                lines.push(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(" ".repeat(indent), base),
                     Span::styled(format!("{cb} "), base.patch(cb_style)),
                     Span::styled(format!("{sc} "), base.fg(sc_color)),
                     Span::styled(format!("{name_t}{}", " ".repeat(pad)), base.fg(name_fg)),
                     Span::styled(counts, base.fg(p.dim)),
-                ]));
+                ];
+                if revert_w > 0 {
+                    spans.push(Span::styled(" ↺", base.fg(p.accent)));
+                }
+                lines.push(Line::from(spans));
             }
         }
     }
@@ -554,6 +612,13 @@ fn diff_bg(kind: RowKind, side: Side) -> Option<Color> {
 /// left (horizontal scroll); the result is clipped to `width` and padded.
 /// `base` carries the row background/modifiers; segment foregrounds come
 /// from the highlighter.
+/// Body text as syntax-colored spans.
+///
+/// Two overlays ride on top of the syntax colors, both as char ranges
+/// within the *line* (not the segment): `sel` is the selection, `marks`
+/// are search hits. A search hit wins where they overlap — it is the
+/// thing being hunted for, and it is transient.
+#[allow(clippy::too_many_arguments)]
 fn hl_body<'a>(
     text: &str,
     hl: Option<&HlLine>,
@@ -561,18 +626,44 @@ fn hl_body<'a>(
     width: usize,
     base: Style,
     fallback_fg: Color,
+    marks: &[(usize, usize)],
+    sel: Option<(usize, usize)>,
 ) -> Vec<Span<'a>> {
+    let p = palette();
     let mut spans: Vec<Span> = Vec::new();
     // `col` counts columns of the *whole* line (including scrolled-off
-    // ones); `w` counts columns actually emitted.
+    // ones); `w` counts columns actually emitted; `ci` counts chars, which
+    // is what the overlays are measured in.
     let mut col = 0usize;
     let mut w = 0usize;
+    let mut ci = 0usize;
     let mut push_seg = |seg: &str, fg: Color, spans: &mut Vec<Span<'a>>| {
         if w >= width {
+            // Still count the chars: a later segment's overlays depend on it.
+            ci += seg.chars().count();
             return;
         }
+        // Runs of one style are coalesced into a single span — no
+        // per-character Span allocation in the render hot path.
         let mut out = String::new();
+        // 0 = plain, 1 = selected, 2 = search hit.
+        let mut out_kind = 0u8;
+        macro_rules! flush {
+            () => {
+                if !out.is_empty() {
+                    let mut st = base.fg(fg);
+                    match out_kind {
+                        1 => st = st.bg(p.selected).add_modifier(Modifier::BOLD),
+                        2 => st = st.bg(p.matched),
+                        _ => {}
+                    }
+                    spans.push(Span::styled(std::mem::take(&mut out), st));
+                }
+            };
+        }
         for ch in seg.chars() {
+            let idx = ci;
+            ci += 1;
             let cw = if ch == '\t' {
                 TAB_WIDTH
             } else {
@@ -585,6 +676,17 @@ fn hl_body<'a>(
             col += cw;
             if start + cw <= skip {
                 continue; // entirely left of the window
+            }
+            let kind = if marks.iter().any(|(s, e)| idx >= *s && idx < *e) {
+                2
+            } else if sel.is_some_and(|(s, e)| idx >= s && idx < e) {
+                1
+            } else {
+                0
+            };
+            if kind != out_kind {
+                flush!();
+                out_kind = kind;
             }
             if start < skip {
                 // A tab or wide char straddling the left edge: show the
@@ -604,9 +706,7 @@ fn hl_body<'a>(
             }
             w += cw;
         }
-        if !out.is_empty() {
-            spans.push(Span::styled(out, base.fg(fg)));
-        }
+        flush!();
     };
     match hl {
         Some(segs) if !segs.is_empty() => {
@@ -622,14 +722,16 @@ fn hl_body<'a>(
     spans
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cell<'a>(
     row: &Row,
     side: Side,
     skip: usize,
     width: usize,
-    selected: bool,
+    sel: Option<Selection>,
     cursor: bool,
     hl: Option<&HlLine>,
+    query: &str,
 ) -> Vec<Span<'a>> {
     let p = palette();
     let (ln, text) = match side {
@@ -652,7 +754,13 @@ fn cell<'a>(
             vec![Span::styled(filler, style)]
         }
         Some(t) => {
-            let bg = if selected {
+            let len = t.chars().count();
+            let cols = ln.and_then(|n| sel.and_then(|s| s.cols_on(side, n, len)));
+            // A whole-line selection keeps painting the whole row, padding
+            // included — that is what a selected *line* has always looked
+            // like. A character selection paints only its characters.
+            let linewise = cols.is_some() && sel.is_some_and(|s| s.linewise);
+            let bg = if linewise {
                 Some(p.selected)
             } else {
                 diff_bg(row.kind, side).or(if cursor { Some(p.cursor) } else { None })
@@ -663,15 +771,25 @@ fn cell<'a>(
                 ln_style = ln_style.bg(bg);
                 base = base.bg(bg);
             }
-            if selected {
+            if linewise {
                 base = base.add_modifier(Modifier::BOLD);
             }
             if cursor {
                 ln_style = ln_style.add_modifier(Modifier::UNDERLINED);
                 base = base.add_modifier(Modifier::UNDERLINED);
             }
+            let marks = crate::search::find_ranges(t, query);
             let mut spans = vec![Span::styled(ln_str, ln_style)];
-            spans.extend(hl_body(t, hl, skip, body_w, base, p.text));
+            spans.extend(hl_body(
+                t,
+                hl,
+                skip,
+                body_w,
+                base,
+                p.text,
+                &marks,
+                cols.filter(|_| !linewise),
+            ));
             spans
         }
     }
@@ -757,41 +875,57 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let hskip = app.diff_hscroll;
 
-    let is_selected = |side: Side, ln: Option<usize>| -> bool {
-        match (app.selection, ln) {
-            (Some(sel), Some(n)) => sel.contains(side, n),
-            _ => false,
-        }
-    };
+    // The active `/` search, highlighted wherever it appears on screen.
+    let find_query = app.find.query.clone();
+    let find: &str = &find_query;
+
+    let sel = app.selection;
+
+    // The change bar: two columns down the left edge carrying a ↺ on the
+    // first row of every changed section. Computed for the visible window
+    // up front, because each row has to know whether the section above it
+    // is the same one.
+    let bar_w = app.revert_gutter() as usize;
+    let bars: Vec<Option<bool>> = (app.diff_scroll..app.diff_scroll + h)
+        .map(|i| app.change_bar(i))
+        .collect();
+    let pane_w = (inner.width as usize).saturating_sub(bar_w);
 
     let mut lines: Vec<Line> = Vec::with_capacity(h);
     for (n, entry) in app.display.iter().skip(app.diff_scroll).take(h).enumerate() {
         // The keyboard cursor row, underlined the way the editor marks its
         // own cursor line.
         let cur = app.diff_scroll + n == app.diff_cursor;
+        let mut spans: Vec<Span> = Vec::new();
+        if bar_w > 0 {
+            spans.push(match bars.get(n).copied().flatten() {
+                Some(true) => Span::styled(
+                    "↺ ",
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                ),
+                Some(false) => Span::styled("┃ ", Style::default().fg(p.divider)),
+                None => Span::raw("  "),
+            });
+        }
         match entry {
             DisplayEntry::Fold { count, .. } => {
-                lines.push(fold_line(inner.width as usize, *count, cur));
+                spans.extend(fold_line(pane_w, *count, cur).spans);
             }
             DisplayEntry::Unfold { count, .. } => {
-                lines.push(unfold_line(inner.width as usize, *count, cur));
+                spans.extend(unfold_line(pane_w, *count, cur).spans);
             }
             DisplayEntry::Line(i) if sbs => {
                 let row = &diff.rows[*i];
-                let lw = (inner.width as usize).saturating_sub(1) / 2;
-                let rw = (inner.width as usize).saturating_sub(1) - lw;
-                let lsel = is_selected(Side::Left, row.old_ln)
-                    && matches!(row.kind, RowKind::Removed | RowKind::Modified);
-                let rsel = is_selected(Side::Right, row.new_ln);
+                let lw = pane_w.saturating_sub(1) / 2;
+                let rw = pane_w.saturating_sub(1) - lw;
                 let lhl = row.old_ln.and_then(|n| app.old_hl.get(n - 1));
                 let rhl = row.new_ln.and_then(|n| app.new_hl.get(n - 1));
-                let mut spans = cell(row, Side::Left, hskip, lw, lsel, cur, lhl);
+                spans.extend(cell(row, Side::Left, hskip, lw, sel, cur, lhl, find));
                 spans.push(Span::styled("│", Style::default().fg(p.divider)));
-                spans.extend(cell(row, Side::Right, hskip, rw, rsel, cur, rhl));
-                lines.push(Line::from(spans));
+                spans.extend(cell(row, Side::Right, hskip, rw, sel, cur, rhl, find));
             }
             DisplayEntry::Line(i) => {
-                let w = inner.width as usize;
+                let w = pane_w;
                 let entry = &diff.inline[*i];
                 let row = &diff.rows[entry.row];
                 let (mark, ln_old, ln_new, text, side) = match entry.side {
@@ -811,15 +945,18 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                         )
                     }
                 };
-                let sel = match side {
-                    Side::Left => is_selected(Side::Left, row.old_ln),
-                    Side::Right => is_selected(Side::Right, row.new_ln),
+                let ln_here = match side {
+                    Side::Left => row.old_ln,
+                    Side::Right => row.new_ln,
                 };
+                let text_len = text.map(|t| t.chars().count()).unwrap_or(0);
+                let cols = ln_here.and_then(|n| sel.and_then(|s| s.cols_on(side, n, text_len)));
+                let linewise = cols.is_some() && sel.is_some_and(|s| s.linewise);
                 let hl = match side {
                     Side::Left => row.old_ln.and_then(|n| app.old_hl.get(n - 1)),
                     Side::Right => row.new_ln.and_then(|n| app.new_hl.get(n - 1)),
                 };
-                let bg = if sel {
+                let bg = if linewise {
                     Some(p.selected)
                 } else {
                     match mark {
@@ -847,18 +984,29 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                     gs = gs.bg(bg);
                     base = base.bg(bg);
                 }
-                if sel {
+                if linewise {
                     base = base.add_modifier(Modifier::BOLD);
                 }
                 if cur {
                     gs = gs.add_modifier(Modifier::UNDERLINED);
                     base = base.add_modifier(Modifier::UNDERLINED);
                 }
-                let mut spans = vec![Span::styled(gutter, gs)];
-                spans.extend(hl_body(text.unwrap_or(""), hl, hskip, body_w, base, p.text));
-                lines.push(Line::from(spans));
+                let body = text.unwrap_or("");
+                let marks = crate::search::find_ranges(body, find);
+                spans.push(Span::styled(gutter, gs));
+                spans.extend(hl_body(
+                    body,
+                    hl,
+                    hskip,
+                    body_w,
+                    base,
+                    p.text,
+                    &marks,
+                    cols.filter(|_| !linewise),
+                ));
             }
         }
+        lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -907,12 +1055,166 @@ fn draw_checkout_prompt(f: &mut Frame, app: &mut App, area: Rect, number: u64) {
         f,
         app,
         btn_area,
+        0,
         &[
             ("Checkout & review (c)", ButtonId::CheckoutYes, true),
             ("Review only (o)", ButtonId::CheckoutReviewOnly, false),
             ("Cancel (Esc)", ButtonId::CheckoutCancel, false),
         ],
     );
+}
+
+/// "Are you sure?" for a revert. The one dialog in loupe that guards
+/// something unrecoverable, so it says plainly what goes and that git
+/// cannot bring it back.
+fn draw_revert_prompt(f: &mut Frame, app: &mut App, area: Rect) {
+    let Overlay::Revert(prompt) = &app.overlay else {
+        return;
+    };
+    let p = palette();
+    let whole_file = matches!(prompt.target, crate::app::RevertTarget::File { .. });
+    let title = if whole_file {
+        " Revert this file? "
+    } else {
+        " Revert this change? "
+    };
+    let question = if whole_file {
+        "Are you sure you want to revert the changes in this file?".to_string()
+    } else {
+        "Are you sure you want to revert this section of the diff?".to_string()
+    };
+    let what = if prompt.deletes {
+        format!("{} will be deleted — it is a new file.", prompt.path)
+    } else if whole_file {
+        format!(
+            "{} goes back to the version it was changed from (+{} −{}).",
+            prompt.path, prompt.adds, prompt.dels
+        )
+    } else {
+        format!(
+            "Putting back {} in {}.",
+            crate::app::lines_phrase(prompt.adds, prompt.dels),
+            prompt.path
+        )
+    };
+    let scope = if whole_file {
+        "The working tree and the index are both put back."
+    } else {
+        "Only the working tree is touched; nothing staged is unstaged."
+    };
+    let rect = centered(area, 72, 8);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.err))
+        .style(Style::default().fg(p.text))
+        .title(title);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let text = vec![
+        Line::from(Span::styled(
+            question,
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(what, Style::default().fg(p.dim))),
+        Line::from(Span::styled(scope, Style::default().fg(p.dim))),
+        Line::from(Span::styled(
+            "This cannot be undone.",
+            Style::default().fg(p.err).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    f.render_widget(Paragraph::new(text), inner);
+
+    let btn_area = Rect {
+        x: inner.x,
+        y: inner.y + inner.height - 1,
+        width: inner.width,
+        height: 1,
+    };
+    buttons_right(
+        f,
+        app,
+        btn_area,
+        0,
+        &[
+            ("↺ Revert (Enter)", ButtonId::RevertYes, true),
+            ("Cancel (Esc)", ButtonId::RevertCancel, false),
+        ],
+    );
+}
+
+/// The file-panel right-click menu. It is drawn at the pointer rather
+/// than centred, because it is about one row and the answer to "which
+/// row?" is where the pointer is.
+fn draw_path_menu(f: &mut Frame, app: &mut App, area: Rect) {
+    let Overlay::PathMenu(menu) = &app.overlay else {
+        return;
+    };
+    let p = palette();
+    let what = if menu.is_dir { "📁" } else { "📄" };
+    let title = format!(" {what} {} ", tail_truncate(&menu.path, 40));
+    // Two columns of padding, plus " (r)" after the longest label.
+    let widest = menu
+        .items
+        .iter()
+        .map(|it| disp_width(it.label) + 4)
+        .max()
+        .unwrap_or(0);
+    let w = (widest.max(disp_width(&title)) as u16 + 4).min(area.width);
+    let h = (menu.items.len() as u16 + 2).min(area.height);
+    let (ax, ay) = menu.anchor;
+    // Keep the whole menu on screen. It opens down and to the right of the
+    // pointer, and flips above it when there is no room below.
+    let x = ax.min(area.x + area.width.saturating_sub(w));
+    let y = if ay + h <= area.y + area.height {
+        ay
+    } else {
+        (ay + 1).saturating_sub(h).max(area.y)
+    };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().fg(p.text))
+        .title(title);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut rows: Vec<(Rect, ButtonId)> = Vec::new();
+    for (i, item) in menu.items.iter().enumerate() {
+        if i as u16 >= inner.height {
+            break;
+        }
+        let r = Rect {
+            x: inner.x,
+            y: inner.y + i as u16,
+            width: inner.width,
+            height: 1,
+        };
+        let selected = i == menu.sel;
+        let style = if selected {
+            Style::default()
+                .bg(p.row)
+                .fg(p.text)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.text)
+        };
+        let line = Line::from(vec![
+            Span::styled(item.label.to_string(), style),
+            Span::styled(format!(" ({})", item.key), Style::default().fg(p.key)),
+        ]);
+        f.render_widget(Paragraph::new(line).style(style), r);
+        rows.push((r, ButtonId::PathMenuRow(i)));
+    }
+    app.layout.buttons.extend(rows);
 }
 
 fn draw_comment_overlay(f: &mut Frame, app: &mut App, area: Rect) {
@@ -975,6 +1277,7 @@ fn draw_comment_overlay(f: &mut Frame, app: &mut App, area: Rect) {
         f,
         app,
         btn_area,
+        0,
         &[
             ("Post (Ctrl+S)", ButtonId::CommentPost, true),
             ("Cancel (Esc)", ButtonId::CommentCancel, false),
@@ -1110,6 +1413,7 @@ fn draw_theme_picker(f: &mut Frame, app: &mut App, area: Rect) {
         f,
         app,
         btn_area,
+        0,
         &[
             (flip, ButtonId::AppearanceToggle, false),
             (&format!("Use {name} (Enter)"), ButtonId::ThemeApply, true),
@@ -1118,9 +1422,296 @@ fn draw_theme_picker(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
+/// Text with some characters emphasized — the fuzzy match's own letters,
+/// or the literal range a grep hit landed on. Runs of one style coalesce.
+fn emphasize<'a>(
+    text: &str,
+    matched: &[usize],
+    range: Option<(usize, usize)>,
+    base: Style,
+    hit: Style,
+    width: usize,
+) -> Vec<Span<'a>> {
+    let mut spans = Vec::new();
+    let mut out = String::new();
+    let mut on = false;
+    let mut w = 0usize;
+    for (i, ch) in text.chars().enumerate() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > width {
+            break;
+        }
+        let is_hit = matched.contains(&i)
+            || range.map(|(s, e)| i >= s && i < e).unwrap_or(false);
+        if is_hit != on && !out.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut out),
+                if on { hit } else { base },
+            ));
+        }
+        on = is_hit;
+        out.push(ch);
+        w += cw;
+    }
+    if !out.is_empty() {
+        spans.push(Span::styled(out, if on { hit } else { base }));
+    }
+    if w < width {
+        spans.push(Span::styled(" ".repeat(width - w), base));
+    }
+    spans
+}
+
+/// What the language server knows about the symbol under the cursor.
+/// Deliberately small and dismissible — it answers a question, it isn't a
+/// place to live.
+fn draw_hover(f: &mut Frame, app: &App, area: Rect) {
     let p = palette();
-    let rect = centered(area, 84, 27);
+    let Overlay::Hover(h) = &app.overlay else {
+        return;
+    };
+    let widest = h
+        .lines
+        .iter()
+        .map(|l| disp_width(l))
+        .max()
+        .unwrap_or(20)
+        .clamp(24, area.width.saturating_sub(8) as usize);
+    let height = (h.lines.len() as u16 + 2).min(area.height.saturating_sub(4)).max(3);
+    let rect = centered(area, widest as u16 + 4, height);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .title(format!(" {} ", h.word))
+        .title_bottom(" any key closes ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let lines: Vec<Line> = h
+        .lines
+        .iter()
+        .take(inner.height as usize)
+        .enumerate()
+        .map(|(i, l)| {
+            // The first line is the signature; the rest is prose.
+            let style = if i == 0 {
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(p.dim)
+            };
+            Line::from(Span::styled(l.clone(), style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The finder overlay: one input, one list, three modes.
+fn draw_finder(f: &mut Frame, app: &mut App, area: Rect) {
+    let p = palette();
+    let w = area.width.saturating_sub(6).clamp(40, 110);
+    // Grow with the results rather than always taking the full height: an
+    // overlay mostly made of blank rows reads as "nothing found".
+    let listed = match &app.overlay {
+        Overlay::Finder(f) => f.rows.len().clamp(1, FINDER_ROWS),
+        _ => FINDER_ROWS,
+    };
+    let h = (listed as u16 + 5).min(area.height.saturating_sub(2));
+    let rect = centered(area, w, h);
+    f.render_widget(Clear, rect);
+    let Overlay::Finder(fd) = &app.overlay else {
+        return;
+    };
+    let mode = fd.mode;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .title(format!(" 🔍 {} ", mode.title()))
+        .title_bottom(" Enter opens · ↑↓ moves · Tab changes scope · Esc closes ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height < 4 {
+        return;
+    }
+
+    // Input line: the mode prefix, then what was typed, then the caret.
+    let typed: String = fd.input.chars().take(fd.cursor).collect();
+    let rest: String = fd.input.chars().skip(fd.cursor).collect();
+    let mut input_spans = vec![Span::styled(
+        format!(" {}", mode.prefix()),
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+    )];
+    input_spans.push(Span::styled(typed, Style::default().fg(p.text)));
+    input_spans.push(Span::styled(
+        "▏",
+        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+    ));
+    input_spans.push(Span::styled(rest, Style::default().fg(p.text)));
+    if fd.regex && mode == FinderMode::Grep {
+        input_spans.push(Span::styled(
+            "   .* regex",
+            Style::default().fg(p.stage_partial),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(input_spans)),
+        Rect {
+            height: 1,
+            ..inner
+        },
+    );
+    let note = match app.search_spinner() {
+        Some(frame) => format!(" {frame} {}", fd.note),
+        None => format!(" {}", fd.note),
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(note, Style::default().fg(p.faint))),
+        Rect {
+            y: inner.y + 1,
+            height: 1,
+            ..inner
+        },
+    );
+
+    // Results.
+    let list_h = inner.height.saturating_sub(3) as usize;
+    let end = fd.rows.len().min(fd.scroll + list_h);
+    let path_w = (inner.width as usize / 3).clamp(12, 44);
+    let mut hits: Vec<(Rect, ButtonId)> = Vec::new();
+    let mut lines: Vec<Line> = Vec::new();
+    for idx in fd.scroll..end {
+        let row = &fd.rows[idx];
+        let selected = idx == fd.sel;
+        let mut base = Style::default().fg(if row.in_changeset { p.text } else { p.dim });
+        let mut hit = Style::default()
+            .fg(p.key)
+            .add_modifier(Modifier::BOLD);
+        if selected {
+            base = base.bg(p.row).fg(p.text);
+            hit = hit.bg(p.row);
+        }
+        let mut spans = vec![Span::styled(
+            if selected { " ▸ " } else { "   " },
+            base,
+        )];
+        let tag_w = if row.tag.is_empty() { 0 } else { row.tag.len() + 2 };
+        let avail = (inner.width as usize).saturating_sub(3 + tag_w);
+        match row.line {
+            // A line inside a file: where, then what.
+            Some(line) => {
+                let where_ = format!("{}:{} ", tail_truncate(&row.path, path_w), line);
+                let ww = disp_width(&where_);
+                spans.push(Span::styled(
+                    where_,
+                    if selected {
+                        Style::default().fg(p.dir).bg(p.row)
+                    } else {
+                        Style::default().fg(p.dir)
+                    },
+                ));
+                spans.extend(emphasize(
+                    &row.text,
+                    &row.matched,
+                    row.range,
+                    base,
+                    hit,
+                    avail.saturating_sub(ww),
+                ));
+            }
+            None => spans.extend(emphasize(
+                &row.text,
+                &row.matched,
+                row.range,
+                base,
+                hit,
+                avail,
+            )),
+        }
+        if !row.tag.is_empty() {
+            spans.push(Span::styled(
+                format!(" {} ", row.tag),
+                Style::default()
+                    .fg(if row.tag == "def" { p.badge_fg } else { p.faint })
+                    .bg(if row.tag == "def" {
+                        p.badge_local
+                    } else {
+                        p.btn_bg
+                    }),
+            ));
+        }
+        lines.push(Line::from(spans));
+        hits.push((
+            Rect {
+                x: inner.x,
+                y: inner.y + 2 + (idx - fd.scroll) as u16,
+                width: inner.width,
+                height: 1,
+            },
+            ButtonId::FinderRow(idx),
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   No results.",
+            Style::default().fg(p.dim),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            y: inner.y + 2,
+            height: inner.height.saturating_sub(3),
+            ..inner
+        },
+    );
+
+    // Mode tabs and the scope switch, on the bottom row.
+    let repo_scope = fd.repo_scope;
+    let btn_area = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
+    app.layout.buttons.extend(hits);
+    let scope = if repo_scope {
+        "◍ Whole repo"
+    } else {
+        "◌ Changed files"
+    };
+    // References and the symbol picker are arrived at, not chosen, so they
+    // offer a way back instead of the tab strip.
+    let mut buttons = if mode.is_tab() {
+        vec![
+            (
+                "Files",
+                ButtonId::FinderMode(FinderMode::Files),
+                mode == FinderMode::Files,
+            ),
+            (
+                "# Text",
+                ButtonId::FinderMode(FinderMode::Grep),
+                mode == FinderMode::Grep,
+            ),
+            (
+                "@ Symbols",
+                ButtonId::FinderMode(FinderMode::Symbols),
+                mode == FinderMode::Symbols,
+            ),
+            (scope, ButtonId::FinderScope, repo_scope),
+        ]
+    } else {
+        vec![(
+            "◂ Files",
+            ButtonId::FinderMode(FinderMode::Files),
+            false,
+        )]
+    };
+    buttons.push(("✕", ButtonId::FinderClose, false));
+    buttons_right(f, app, btn_area, 0, &buttons);
+}
+
+fn draw_help(f: &mut Frame, app: &App, area: Rect) {
+    let p = palette();
+    let rect = centered(area, 108.min(area.width), 36.min(area.height));
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1152,6 +1743,21 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ])
     };
 
+    let servers = app
+        .lsp
+        .status()
+        .into_iter()
+        .map(|(lang, state)| {
+            // The install hint is too long for one line here; --lsp has it.
+            let short = match state.split_whitespace().next() {
+                Some("not") if state.contains("not installed") => "not installed",
+                _ => Box::leak(state.into_boxed_str()),
+            };
+            format!("{lang} {short}")
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+
     let lines = vec![
         Line::from(Span::styled("Mouse — the main way around", head)),
         row(
@@ -1164,13 +1770,20 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ),
         row(
             ("click ··· / ⌃⌃⌃", "expand / fold a run"),
-            ("right-click", "clear selection"),
+            ("right-click a file", "copy its path"),
         ),
         row(
             ("click [ ] / [+]", "viewed / stage file"),
+            ("right-click the diff", "clear selection"),
+        ),
+        row(
+            ("click ↺ in the diff", "put that change back"),
+            ("click ↺ in the files", "put the whole file back"),
+        ),
+        row(
+            ("wheel", "scroll · Shift for sideways"),
             ("drag the divider", "resize the panel"),
         ),
-        row(("wheel", "scroll"), ("Shift+wheel", "scroll sideways")),
         Line::from(""),
         Line::from(Span::styled("Move (the cursor row is underlined)", head)),
         row(
@@ -1191,7 +1804,25 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ),
         row(
             ("0 / $", "first / last column"),
-            ("n / p", "next / previous file"),
+            ("] / [", "next / previous file"),
+        ),
+        Line::from(""),
+        Line::from(Span::styled("Find", head)),
+        row(
+            ("/", "search this file, as you type"),
+            ("n / N", "next / previous match"),
+        ),
+        row(
+            ("Ctrl+P", "go to file (fuzzy)"),
+            ("#", "find in files (grep)"),
+        ),
+        row(
+            ("@", "definitions in this file"),
+            ("Tab (in find)", "changed files ⇄ whole repo"),
+        ),
+        row(
+            ("gd / gr", "definition / references"),
+            ("K", "what is this? (type + docs)"),
         ),
         Line::from(""),
         Line::from(Span::styled("Act", head)),
@@ -1205,26 +1836,44 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ),
         row(
             ("e / i", "edit at the cursor line"),
-            ("v", "split / inline view"),
+            ("t", "theme picker (live preview)"),
         ),
-        row(("x", "mark viewed / stage file"), ("r", "reload the file")),
+        row(
+            ("y or Ctrl+C", "copy the selected lines"),
+            ("x", "mark viewed / stage file"),
+        ),
+        row(
+            ("u", "revert the change at the cursor"),
+            ("U", "revert every change in the file"),
+        ),
+        row(("r", "reload the file"), ("Esc", "clear selection, then search")),
         row(
             ("` (backtick)", "swap PR ⇄ local view"),
-            ("< / >", "narrow / widen panel"),
+            ("v", "split / inline view"),
         ),
         row(
-            ("t", "theme picker (live preview)"),
             ("t then a", "switch light / dark"),
+            ("?", "this help"),
         ),
         row(
             ("b / q", "back to the PR list / quit"),
-            ("Esc", "clear selection, then back"),
+            ("< / >", "narrow / widen panel"),
         ),
         Line::from(""),
         Line::from(Span::styled(
-            "  Editor: Ctrl+S save · Esc close (twice to discard) · Ctrl+Z undo · Ctrl+Y redo",
+            "  Editor: Ctrl+S save · Ctrl+C copy · Ctrl+Z or Ctrl+U undo · Ctrl+R redo · Esc close",
             dim,
         )),
+        Line::from(Span::styled(
+            "  Editor + language server: Ctrl+Space complete · Ctrl+G what is this? · Ctrl+] definition · Ctrl+T format",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  Selecting with the mouse across the whole screen: hold Option (macOS) or Shift",
+            dim,
+        )),
+        // What gd / gr / K can actually answer right now, and why not.
+        Line::from(Span::styled(format!("  Language servers: {servers}"), dim)),
     ];
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -1250,20 +1899,106 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(Paragraph::new(line), area);
         return;
     }
+    // The `/` prompt lives in the status line, vim-style: it is a mode,
+    // not a dialog, so it must not cover the text being searched.
+    if app.find.typing {
+        let n = app.find.rows.len();
+        let count = if app.find.query.is_empty() {
+            String::new()
+        } else if n == 0 {
+            "  no matches".to_string()
+        } else {
+            format!("  {n} match{}", if n == 1 { "" } else { "es" })
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!("/{}", app.find.query),
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "▏",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                count,
+                Style::default().fg(if n == 0 && !app.find.query.is_empty() {
+                    p.err
+                } else {
+                    p.faint
+                }),
+            ),
+            Span::styled(
+                "   Enter keeps it · Esc cancels",
+                Style::default().fg(p.faint),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    // In the editor, what the language server says about the cursor line
+    // outranks the last status message — it is about the code, not about
+    // what loupe just did.
+    if let Some(editor) = &app.editor {
+        if let Some(d) = editor.diagnostics_here().first() {
+            let color = if d.is_error() { p.err } else { p.stage_partial };
+            let code = match &d.code {
+                Some(c) => format!("  {c}"),
+                None => String::new(),
+            };
+            let hints = " Ctrl+S save · Ctrl+G what is this? · ? help";
+            let msg_w = area.width.saturating_sub(hints.chars().count() as u16 + 1) as usize;
+            let line = Line::from(vec![
+                Span::styled(
+                    truncate_pad(
+                        &format!("{} {}{code}", if d.is_error() { "✗" } else { "▲" }, d.message),
+                        msg_w,
+                    ),
+                    Style::default().fg(color),
+                ),
+                Span::styled(hints, Style::default().fg(p.faint)),
+            ]);
+            f.render_widget(Paragraph::new(line), area);
+            return;
+        }
+        // Nothing wrong on this line, but something is wrong somewhere:
+        // say how much, so a problem off screen isn't invisible.
+        if !editor.diagnostics.is_empty() && app.status.is_empty() {
+            let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
+            for d in &editor.diagnostics {
+                *counts.entry(d.label()).or_default() += 1;
+            }
+            let summary = counts
+                .iter()
+                .map(|(what, n)| format!("{n} {what}{}", if *n == 1 { "" } else { "s" }))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let worst_is_error = editor.diagnostics.iter().any(|d| d.is_error());
+            let line = Line::from(Span::styled(
+                format!(" {summary} in this file"),
+                Style::default().fg(if worst_is_error { p.err } else { p.stage_partial }),
+            ));
+            f.render_widget(Paragraph::new(line), area);
+            return;
+        }
+    }
     let style = if app.status_err {
         Style::default().fg(p.err)
     } else {
         Style::default().fg(p.ok)
     };
-    let hints = match app.screen {
-        Screen::PrList => "l local changes · r refresh · ? help · q quit",
+    // `u` only appears when there is a working tree to put back.
+    let undo = if app.can_revert() { " · u revert" } else { "" };
+    let hints: String = match app.screen {
+        Screen::PrList => "l local changes · r refresh · ? help · q quit".into(),
         Screen::Review => {
             if app.editor.is_some() {
-                "Ctrl+S save · Esc close · ? help"
+                "Ctrl+S save · Esc close · ? help".into()
+            } else if app.find.active() {
+                format!("n/N matches · / search · y copy{undo} · ? help")
             } else if app.local {
-                "j/k move · V select · x stage · ` PR view · ? help"
+                format!("/ find · V select · y copy · x stage{undo} · ? help")
             } else {
-                "j/k move · V select · c comment · ` local · ? help"
+                format!("/ find · V select · y copy · c comment{undo} · ? help")
             }
         }
     };
@@ -1498,6 +2233,19 @@ mod tests {
                 Box::new(|a: &mut App| a.overlay = Overlay::CheckoutPrompt(7)),
             ),
             (
+                "revert prompt",
+                Box::new(|a: &mut App| {
+                    a.overlay = Overlay::None;
+                    a.checked_out = true;
+                    a.ask_revert_file(0);
+                    assert!(
+                        matches!(a.overlay, Overlay::Revert(_)),
+                        "the revert prompt must actually open: {}",
+                        a.status
+                    );
+                }),
+            ),
+            (
                 "comment overlay",
                 Box::new(|a: &mut App| {
                     a.overlay = Overlay::None;
@@ -1607,19 +2355,15 @@ mod tests {
             .find(|y| row_text(&buf, *y).contains(" + 0123456789"))
             .expect("the added line is on screen");
         let before = row_text(&buf, y);
-        let gutter: String = before
-            .chars()
-            .take(12 + app.file_panel_w as usize)
-            .collect();
+        // The change bar sits left of the line-number gutter; neither moves.
+        let fixed = crate::app::REVERT_W as usize + 12 + app.file_panel_w as usize;
+        let gutter: String = before.chars().take(fixed).collect();
 
         app.diff_hscroll = 10;
         let buf = render(&mut app);
         let after = row_text(&buf, y);
         assert_eq!(
-            after
-                .chars()
-                .take(12 + app.file_panel_w as usize)
-                .collect::<String>(),
+            after.chars().take(fixed).collect::<String>(),
             gutter,
             "the line-number gutter must not move"
         );
@@ -1630,7 +2374,7 @@ mod tests {
         let buf = render(&mut app);
         let shifted = row_text(&buf, y);
         assert_ne!(shifted, before);
-        let body_start = (app.file_panel_w as usize) + 1 + 12;
+        let body_start = (app.file_panel_w as usize) + 1 + crate::app::REVERT_W as usize + 12;
         // Trim the pane's right border off the tail of each slice.
         let trim = |s: &str| s.trim_end_matches(['│', ' ']).to_string();
         let orig_body = trim(&before.chars().skip(body_start + 3).collect::<String>());
@@ -1655,7 +2399,8 @@ mod tests {
         app.diff_cursor = 2;
 
         let buf = render(&mut app);
-        let body = app.file_panel_w + 2;
+        // First body column: past the panel border and the change bar.
+        let body = app.file_panel_w + 2 + crate::app::REVERT_W;
         let underlined: Vec<u16> = (1..8)
             .filter(|y| buf[(body, *y)].modifier.contains(Modifier::UNDERLINED))
             .collect();
@@ -1669,6 +2414,57 @@ mod tests {
             .collect();
         assert_eq!(moved.len(), 1);
         assert_ne!(moved, underlined, "the underline follows the cursor");
+    }
+
+    /// The revert affordances have to be *visible*, and clickable where they
+    /// look clickable: a ↺ beside the first row of every changed section,
+    /// one at the end of every file row, and neither on a review that cannot
+    /// change anything.
+    #[test]
+    fn revert_markers_are_drawn_in_the_diff_and_the_file_list() {
+        let mut app = wide_app();
+        app.view = ViewMode::SideBySide;
+        app.diff = Some(FileDiff::compute(
+            Some("a\nb\nc\nd\ne\nf\ng\n"),
+            Some("a\nB\nc\nd\ne\nF1\nF2\ng\n"),
+        ));
+        app.collapse_unchanged = false;
+        app.rebuild_display();
+
+        // Where each ↺ landed, split by panel.
+        let marks = |buf: &ratatui::buffer::Buffer, app: &App| -> (usize, usize) {
+            let (mut files, mut diff) = (0, 0);
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    if buf[(x, y)].symbol() == "↺" {
+                        if x < app.file_panel_w {
+                            files += 1;
+                        } else {
+                            diff += 1;
+                        }
+                    }
+                }
+            }
+            (files, diff)
+        };
+
+        let buf = render(&mut app);
+        let (files, diff) = marks(&buf, &app);
+        assert_eq!(files, 1, "one ↺ per file row");
+        assert_eq!(diff, 2, "one ↺ per changed section");
+        // The diff's markers sit in the change bar, left of the line numbers.
+        let bar_x = app.layout.diff.x;
+        let in_bar = (0..buf.area.height)
+            .filter(|y| buf[(bar_x, *y)].symbol() == "↺")
+            .count();
+        assert_eq!(in_bar, 2, "the markers are in the change bar column");
+
+        // A PR opened read-only has no working tree to put back: the columns
+        // go back to the code.
+        app.local = false;
+        app.checked_out = false;
+        let buf = render(&mut app);
+        assert_eq!(marks(&buf, &app), (0, 0));
     }
 
     /// Local review shows a staging column: [+] to stage, [±] partly staged,
@@ -1850,4 +2646,301 @@ mod tests {
             "PR mode offers the swap-to-local button: {top:?}"
         );
     }
+
+    /// The finder has to render its results *and* record a hit area per
+    /// row — this is a mouse-first tool, and a list you can only reach
+    /// with the keyboard is half a feature.
+    #[test]
+    fn finder_overlay_lists_results_and_is_clickable() {
+        let _guard = crate::theme::test_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.files = vec![
+            ChangedFile {
+                path: "src/app.rs".into(),
+                status: "modified".into(),
+                additions: 1,
+                deletions: 0,
+                previous: None,
+            },
+            ChangedFile {
+                path: "src/ui/render.rs".into(),
+                status: "modified".into(),
+                additions: 1,
+                deletions: 0,
+                previous: None,
+            },
+        ];
+        app.rebuild_entries();
+        app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
+        app.rebuild_display();
+        app.open_finder(crate::app::FinderMode::Files);
+
+        let buf = render(&mut app);
+        let all: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
+        assert!(all.contains("Go to file"), "the overlay names its mode");
+        assert!(all.contains("src/app.rs"), "results are listed: {all:?}");
+        assert!(all.contains("@ Symbols"), "the mode tabs are drawn");
+        assert!(
+            app.layout
+                .buttons
+                .iter()
+                .any(|(_, id)| matches!(id, ButtonId::FinderRow(0))),
+            "every visible row is a click target"
+        );
+
+        // The top bar offers the same thing to the mouse.
+        assert!(row_text(&buf, 0).contains("Find"));
+    }
+
+    /// A search you can\'t see is not a search: the matched text carries
+    /// the highlight background, on top of whatever the row already had.
+    #[test]
+    fn search_matches_are_highlighted_in_the_diff() {
+        let _guard = crate::theme::test_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.files = vec![ChangedFile {
+            path: "test.rs".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 0,
+            previous: None,
+        }];
+        app.rebuild_entries();
+        let old = "let alpha = 1;\n";
+        let new = "let alpha = 2;\n";
+        app.diff = Some(FileDiff::compute(Some(old), Some(new)));
+        app.old_content = Some(old.into());
+        app.new_content = Some(new.into());
+        app.rebuild_display();
+
+        let plain = render(&mut app);
+        app.find.query = "alpha".into();
+        app.recompute_matches();
+        assert_eq!(app.find.rows.len(), 1);
+        let marked = render(&mut app);
+
+        let hit = palette().matched;
+        let count = |buf: &ratatui::buffer::Buffer| {
+            let mut n = 0;
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    if buf[(x, y)].bg == hit {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        assert_eq!(count(&plain), 0, "nothing is highlighted before a search");
+        // "alpha" on both sides of a side-by-side view.
+        assert_eq!(count(&marked), 10, "both copies of the match are marked");
+    }
+
+    /// The right-click menu opens at the pointer, names the row it is
+    /// about, and every line of it is clickable.
+    #[test]
+    fn the_path_menu_draws_at_the_pointer() {
+        let _guard = crate::theme::test_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.files = vec![ChangedFile {
+            path: "src/app.rs".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            previous: None,
+        }];
+        app.rebuild_entries();
+        let menu = || {
+            Box::new(crate::app::PathMenu {
+                path: "src/app.rs".into(),
+                is_dir: false,
+                items: vec![
+                    crate::app::PathMenuItem {
+                        key: 'r',
+                        label: "Copy relative path",
+                        text: "src/app.rs".into(),
+                    },
+                    crate::app::PathMenuItem {
+                        key: 'f',
+                        label: "Copy full path",
+                        text: "/repo/src/app.rs".into(),
+                    },
+                ],
+                sel: 0,
+                anchor: (4, 5),
+            })
+        };
+
+        app.overlay = Overlay::PathMenu(menu());
+        let buf = render(&mut app);
+        assert!(
+            row_text(&buf, 5).contains("src/app.rs"),
+            "the title names the row: {:?}",
+            row_text(&buf, 5)
+        );
+        assert!(
+            row_text(&buf, 6).contains("Copy relative path"),
+            "{:?}",
+            row_text(&buf, 6)
+        );
+        assert!(row_text(&buf, 7).contains("Copy full path"));
+        let rows = app
+            .layout
+            .buttons
+            .iter()
+            .filter(|(_, id)| matches!(id, ButtonId::PathMenuRow(_)))
+            .count();
+        assert_eq!(rows, 2, "each line is clickable");
+
+        // A row near the bottom edge flips the menu above the pointer
+        // rather than letting it fall off the screen.
+        let mut low = menu();
+        low.anchor = (4, 19);
+        app.overlay = Overlay::PathMenu(low);
+        let buf = render(&mut app);
+        assert!(
+            row_text(&buf, 17).contains("Copy relative path"),
+            "{:?}",
+            row_text(&buf, 17)
+        );
+    }
+
+    /// Copying has to be reachable with the mouse too — the whole reason
+    /// it needs building is that mouse reporting took the terminal's own
+    /// selection away.
+    #[test]
+    fn selecting_lines_offers_a_copy_button() {
+        let _guard = crate::theme::test_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.files = vec![ChangedFile {
+            path: "test.rs".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            previous: None,
+        }];
+        app.rebuild_entries();
+        app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
+        app.rebuild_display();
+
+        // Nothing selected: the row is crowded enough without an inert
+        // button on it, and `y` still works.
+        let buf = render(&mut app);
+        assert!(!row_text(&buf, 0).contains("Copy"));
+
+        // Select a line and it appears.
+        app.selection = Some(crate::diff::Selection::lines(Side::Right, 1, 1));
+        let buf = render(&mut app);
+        assert!(row_text(&buf, 0).contains("Copy"), "{:?}", row_text(&buf, 0));
+        assert!(app
+            .layout
+            .buttons
+            .iter()
+            .any(|(_, id)| matches!(id, ButtonId::Copy)));
+    }
+
+    /// A crowded top bar must not paint over the branch or PR title.
+    #[test]
+    fn a_narrow_top_bar_drops_buttons_instead_of_covering_the_title() {
+        let _guard = crate::theme::test_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.local_branch = Some("a-long-branch-name".into());
+        app.files = vec![ChangedFile {
+            path: "test.rs".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            previous: None,
+        }];
+        app.rebuild_entries();
+        app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
+        app.rebuild_display();
+
+        let backend = TestBackend::new(60, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let top = row_text(&buf, 0);
+        assert!(top.contains("LOCAL"), "the badge survives: {top:?}");
+        assert!(
+            top.contains("a-long-branch"),
+            "the branch is still readable: {top:?}"
+        );
+        assert!(top.contains("Help"), "the last button is kept: {top:?}");
+    }
+
+    /// The highlight has to show exactly what a copy would take —
+    /// otherwise the selection is a guess and the clipboard is a surprise.
+    #[test]
+    fn a_character_selection_highlights_only_those_characters() {
+        let _guard = crate::theme::test_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.files = vec![ChangedFile {
+            path: "a.ts".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            previous: None,
+        }];
+        app.rebuild_entries();
+        let old = "const alpha = 1;\nconst beta = 2;\n";
+        let new = "const alpha = 1;\nconst BETA = 2;\n";
+        app.old_content = Some(old.into());
+        app.new_content = Some(new.into());
+        app.diff = Some(FileDiff::compute(Some(old), Some(new)));
+        app.collapse_unchanged = false;
+        app.rebuild_display();
+
+        let selected = |buf: &ratatui::buffer::Buffer, y: u16| -> usize {
+            let bg = palette().selected;
+            (0..buf.area.width).filter(|x| buf[(*x, y)].bg == bg).count()
+        };
+
+        // A whole-line selection still paints the whole row, padding
+        // included — unchanged from before.
+        app.selection = Some(crate::diff::Selection::lines(Side::Left, 2, 2));
+        let buf = render(&mut app);
+        // Top bar, pane border, file line 1, file line 2.
+        let line2 = 3u16;
+        assert!(
+            selected(&buf, line2) > 40,
+            "a line selection fills its half of the row"
+        );
+
+        // Five characters of that line: five cells, and they are the right
+        // five ("const" at the start of the old side).
+        app.selection = Some(crate::diff::Selection {
+            side: Side::Left,
+            anchor: crate::diff::Pos::new(2, 0),
+            end: crate::diff::Pos::new(2, 5),
+            linewise: false,
+        });
+        let buf = render(&mut app);
+        assert_eq!(selected(&buf, line2), 5, "exactly the dragged characters");
+        let bg = palette().selected;
+        let text: String = (0..buf.area.width)
+            .filter(|x| buf[(*x, line2)].bg == bg)
+            .map(|x| buf[(x, line2)].symbol())
+            .collect();
+        assert_eq!(text, "const");
+
+        // And nothing at all on the other side of the diff.
+        let right_half: usize = (buf.area.width / 2..buf.area.width)
+            .filter(|x| buf[(*x, line2)].bg == bg)
+            .count();
+        assert_eq!(right_half, 0, "the new side is not selected");
+    }
 }
+

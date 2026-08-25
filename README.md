@@ -39,6 +39,11 @@ leaving your terminal or touching a browser.
   instead: `[+]` unstaged, `[±]` partially staged, `[✓]` staged. Review
   your diff and build the commit in one pass; unstaging never touches
   your files.
+- **Undo a change without leaving the review** — every changed section
+  of the diff has a `↺` in the change bar and every file row has one of
+  its own. Click the section marker to put just those lines back
+  (working tree only — what you staged stays staged), or the file marker
+  to take the whole file back to where it started. Both ask first.
 - **Editor-grade diffs** — side-by-side or inline, syntax highlighting
   from bat's extended syntax set (32 themes), unchanged stretches folded
   away, pinned gutters with horizontal scrolling for wide lines,
@@ -47,9 +52,30 @@ leaving your terminal or touching a browser.
   `Ctrl+D`/`Ctrl+U`, `gg`/`G`, `{`/`}`, `H`/`M`/`L` and friends, with
   `V` line selections for commenting — clicking a line places the same
   cursor, so mouse and keyboard never disagree.
-- **Edit in place** — double-click a new-side line to open an editor
-  with live incremental highlighting; `Ctrl+S` refreshes the diff. You
-  commit when you're ready.
+- **Find anything** — `/` searches the open diff as you type (`n`/`N`
+  step the matches); `Ctrl+P` fuzzy-matches a file; `#` greps every
+  changed file — or the whole repository — in one `git grep`, with
+  definitions sorted to the top; `@` lists what's defined in the file.
+  A hit in a file the PR doesn't touch opens in the editor, and `Esc`
+  puts you back in the diff exactly where you were.
+- **Copy out of either side** — drag through the diff to select exactly
+  the characters you want, on the old side or the new, and `y` copies
+  them. The removed text is still there to take even though it exists
+  nowhere on disk. Works over SSH.
+- **Real code intelligence, from the tools you already have** — `gd`
+  goes to a definition, `gr` lists every reference, `K` shows the type
+  and its docs. Loupe drives whichever language server is on your PATH
+  (`typescript-language-server`, `gopls`, `rust-analyzer`), starts it on
+  demand, and hands it *the text on your screen* rather than the file on
+  disk — which matters when the working tree is on another branch.
+  Nothing is bundled or installed; `loupe --lsp` says what it found, and
+  a language without a server falls back to pattern matching.
+- **Edit in place, with the language server attached** — double-click a
+  new-side line to open an editor with live incremental highlighting,
+  completion (`Ctrl+Space`), type-and-docs at the cursor (`Ctrl+G`),
+  go-to-definition (`Ctrl+]`), formatting (`Ctrl+T`), and diagnostics
+  that appear as you type rather than after you push. `Ctrl+S` refreshes
+  the diff; you commit when you're ready.
 - **Fast and non-blocking** — every fetch runs in the background with a
   cancellable spinner; idle CPU is ~zero; PR content is treated as
   untrusted input throughout.

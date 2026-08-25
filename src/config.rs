@@ -37,6 +37,17 @@ pub struct Config {
     /// Starting width of the file panel, in columns. Clamped to what the
     /// terminal can actually give; the divider can still be dragged.
     pub file_panel_width: Option<u16>,
+    /// Whether loupe may start language servers it finds on PATH, for
+    /// go-to-definition, find-references and hover. Default true; nothing
+    /// is ever installed, and a missing server just falls back to pattern
+    /// matching. `loupe --lsp` reports what was found.
+    pub language_servers: Option<bool>,
+    /// Run the language server's formatter (prettier, gofmt, rustfmt —
+    /// whatever it drives) every time the editor saves. Off by default:
+    /// reformatting a file mid-review would add changes to the diff that
+    /// nobody asked for. `Ctrl+T` (or the ⇥ Format button) formats on
+    /// demand either way.
+    pub format_on_save: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -97,6 +108,8 @@ impl Config {
             light_theme: over.light_theme.or(self.light_theme),
             appearance: over.appearance.or(self.appearance),
             file_panel_width: over.file_panel_width.or(self.file_panel_width),
+            language_servers: over.language_servers.or(self.language_servers),
+            format_on_save: over.format_on_save.or(self.format_on_save),
         }
     }
 }
@@ -207,6 +220,8 @@ mod tests {
             "light_theme = \"github\"\n",
             "appearance = \"light\"\n",
             "file_panel_width = 40\n",
+            "language_servers = false\n",
+            "format_on_save = true\n",
         ))
         .unwrap();
         assert_eq!(
@@ -218,6 +233,8 @@ mod tests {
                 light_theme: Some("github".into()),
                 appearance: Some(ConfigAppearance::Light),
                 file_panel_width: Some(40),
+                language_servers: Some(false),
+                format_on_save: Some(true),
             }
         );
     }

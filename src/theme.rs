@@ -75,6 +75,8 @@ pub struct Palette {
     pub empty: Color,
     /// Background of a selected diff line.
     pub selected: Color,
+    /// Background of text matching the active search.
+    pub matched: Color,
     /// Background of the keyboard cursor row (the underline does the real
     /// work; this only makes it easier to find at a glance).
     pub cursor: Color,
@@ -144,6 +146,7 @@ pub const DARK: Palette = Palette {
     removed: Color::Rgb(58, 22, 22),
     empty: Color::Rgb(24, 24, 28),
     selected: Color::Rgb(28, 66, 120),
+    matched: Color::Rgb(122, 92, 20),
     cursor: Color::Rgb(38, 38, 48),
     row: Color::Rgb(40, 40, 60),
 
@@ -191,6 +194,7 @@ pub const LIGHT: Palette = Palette {
     removed: Color::Rgb(255, 223, 219),
     empty: Color::Rgb(240, 240, 244),
     selected: Color::Rgb(200, 222, 250),
+    matched: Color::Rgb(252, 222, 138),
     cursor: Color::Rgb(234, 237, 243),
     row: Color::Rgb(214, 227, 246),
 

@@ -7,11 +7,14 @@
 //! cancellable) and `q` to quit. Viewed-state syncs to GitHub run as
 //! fire-and-forget background jobs with optimistic local state.
 
-use crate::diff::{DisplayEntry, FileDiff, RowKind, Selection, Side};
+use crate::clipboard;
+use crate::diff::{DisplayEntry, FileDiff, Pos, RowKind, Selection, Side};
 use crate::editor::Editor;
 use crate::github::{self, ChangedFile, CommentSide, PrDetail, PrSummary};
 use crate::gitops::{self, StageState};
 use crate::highlight::{self, HlLine};
+use crate::lsp::{self, Lsp};
+use crate::search;
 use crate::theme::Appearance;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -20,7 +23,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tui_textarea::TextArea;
 
 /// How loupe was launched (see `--pr` / `--local` in main.rs).
@@ -61,6 +64,450 @@ pub enum Overlay {
     Comment(Box<CommentDraft>),
     Help,
     ThemePicker(ThemePicker),
+    Finder(Box<Finder>),
+    /// What the language server says a symbol is (`K`).
+    Hover(Box<HoverPanel>),
+    /// "Are you sure?" for a revert — the one thing loupe does that
+    /// destroys work, so it is the one thing that asks first.
+    Revert(Box<RevertPrompt>),
+    /// The right-click menu on a file-panel row.
+    PathMenu(Box<PathMenu>),
+}
+
+/// One line of the file-panel right-click menu.
+pub struct PathMenuItem {
+    /// The key that runs this line without selecting it first.
+    pub key: char,
+    pub label: &'static str,
+    /// What the line puts on the clipboard.
+    pub text: String,
+}
+
+/// The right-click menu on a file-panel row: the ways to copy the path of
+/// the file or directory under the pointer. A path is the one thing in the
+/// file panel that the diff selection cannot copy, because the panel shows
+/// it shortened and split across tree rows.
+pub struct PathMenu {
+    /// The repo-relative path the menu is about, for its title.
+    pub path: String,
+    /// True when the row is a directory rather than a file.
+    pub is_dir: bool,
+    pub items: Vec<PathMenuItem>,
+    pub sel: usize,
+    /// The cell that was clicked. The menu is drawn next to it.
+    pub anchor: (u16, u16),
+}
+
+/// What a revert is about to undo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevertTarget {
+    /// Every change in one file, index and working tree both.
+    File { idx: usize },
+    /// One run of changed rows in the open diff, as a `[start, end)` range
+    /// of [`FileDiff::rows`](crate::diff::FileDiff) — what the diff view
+    /// calls a section.
+    Section { start: usize, end: usize },
+}
+
+/// The confirm prompt, with everything it needs to say on it. The counts
+/// are captured when the prompt opens so the message and the work can never
+/// describe different things.
+pub struct RevertPrompt {
+    pub target: RevertTarget,
+    pub path: String,
+    pub adds: usize,
+    pub dels: usize,
+    /// The file goes away entirely: the change created it, so there is no
+    /// earlier version to put back.
+    pub deletes: bool,
+}
+
+/// The hover panel: a symbol's type and documentation, as plain text.
+pub struct HoverPanel {
+    pub word: String,
+    pub lines: Vec<String>,
+}
+
+// ------------------------------------------------------------------ finder
+
+/// Which question the finder is answering. The mode is picked by a prefix
+/// character typed into the same input — the way a command palette does
+/// it — so one overlay covers all three without three key bindings and
+/// three sets of muscle memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinderMode {
+    /// Fuzzy match on file paths (no prefix).
+    Files,
+    /// `#` — text across files, via `git grep`.
+    Grep,
+    /// `@` — definitions in the open file.
+    Symbols,
+    /// Everywhere a symbol is used, from the language server (`gr`).
+    /// Not typed into — the list arrives, typing filters it.
+    Refs,
+    /// "Which of these did you mean?" — the symbols on one line, when a
+    /// keyboard request has to choose between them.
+    Pick,
+}
+
+impl FinderMode {
+    pub fn prefix(self) -> &'static str {
+        match self {
+            FinderMode::Files => "",
+            FinderMode::Grep => "#",
+            FinderMode::Symbols => "@",
+            FinderMode::Refs | FinderMode::Pick => "",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            FinderMode::Files => "Go to file",
+            FinderMode::Grep => "Find in files",
+            FinderMode::Symbols => "Symbols in this file",
+            FinderMode::Refs => "References",
+            FinderMode::Pick => "Which symbol?",
+        }
+    }
+
+    /// Whether the mode is one the user can type their way into (the tabs
+    /// along the bottom); `Refs` and `Pick` are arrived at, not chosen.
+    pub fn is_tab(self) -> bool {
+        matches!(self, FinderMode::Files | FinderMode::Grep | FinderMode::Symbols)
+    }
+}
+
+/// A symbol loupe can ask a language server about: what it is, and where
+/// it sits in the file being shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub path: String,
+    /// 1-based line in the file on `side`.
+    pub line: usize,
+    /// 1-based character column.
+    pub col: usize,
+    pub word: String,
+    /// Which side of the diff the line came from — the old side is a
+    /// legitimate target, and answering from the *old* text is the honest
+    /// thing to do when the cursor is on a removed line.
+    pub side: Side,
+}
+
+/// The three questions loupe asks a language server about a symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LspAction {
+    Definition,
+    References,
+    Hover,
+}
+
+impl LspAction {
+    fn verb(self) -> &'static str {
+        match self {
+            LspAction::Definition => "definition of",
+            LspAction::References => "references to",
+            LspAction::Hover => "type of",
+        }
+    }
+}
+
+/// One row of results.
+pub struct FinderRow {
+    pub path: String,
+    /// 1-based line, when the row points inside a file.
+    pub line: Option<usize>,
+    /// The text shown: the path for a file row, the source line otherwise.
+    pub text: String,
+    /// Char indices within `text` that the fuzzy match landed on.
+    pub matched: Vec<usize>,
+    /// Char range of a literal match within `text`.
+    pub range: Option<(usize, usize)>,
+    /// Short tag shown on the right of the row.
+    pub tag: &'static str,
+    /// Whether this path is part of the changeset under review.
+    pub in_changeset: bool,
+    /// Index into the finder's `targets`, for a row that picks a symbol
+    /// rather than a place — filtering reorders rows, so the link has to
+    /// travel with the row itself.
+    pub pick: Option<usize>,
+}
+
+/// The command palette: type to filter, Enter to go there.
+pub struct Finder {
+    pub mode: FinderMode,
+    pub input: String,
+    /// Insertion point, as a char index into `input`.
+    pub cursor: usize,
+    pub rows: Vec<FinderRow>,
+    pub sel: usize,
+    pub scroll: usize,
+    /// Search the whole repository rather than just the changeset.
+    pub repo_scope: bool,
+    /// Treat the query as a regular expression (grep mode).
+    pub regex: bool,
+    /// A line of explanation under the input — result counts, why the
+    /// list is empty, what to install.
+    pub note: String,
+    /// A query waiting out the debounce before it costs a subprocess.
+    pending: Option<(String, Instant)>,
+    /// Paths in the changeset — the default haystack, and what marks a
+    /// result as "part of this change".
+    changeset: Vec<String>,
+    /// Every path in the repository, once someone asks for that scope.
+    repo_files: Option<Vec<String>>,
+    /// Definitions in the open file.
+    symbols: Vec<search::Symbol>,
+    symbol_path: String,
+    /// Rows produced by something other than typing (references, or the
+    /// symbols on one line); the input filters them rather than replacing
+    /// them.
+    preset: Vec<FinderRow>,
+    /// Targets parallel to `preset`, for [`FinderMode::Pick`].
+    targets: Vec<Target>,
+    /// What to do with the pick once it's made.
+    pending_action: Option<LspAction>,
+}
+
+/// How long a keystroke has to be the last one before grep runs. Long
+/// enough that typing a word costs one subprocess, short enough that it
+/// still feels live.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(140);
+
+/// How long typing has to pause before the buffer is pushed to the
+/// language server. Short enough that diagnostics feel live, long enough
+/// that a fast typist doesn't send a copy of the file per keystroke.
+const SYNC_DEBOUNCE: Duration = Duration::from_millis(220);
+
+/// Rows the finder shows at once (the overlay is sized to match).
+pub const FINDER_ROWS: usize = 14;
+
+impl Finder {
+    fn new(mode: FinderMode, changeset: Vec<String>, symbols: Vec<search::Symbol>, symbol_path: String) -> Self {
+        Finder {
+            mode,
+            input: String::new(),
+            cursor: 0,
+            rows: Vec::new(),
+            sel: 0,
+            scroll: 0,
+            repo_scope: false,
+            regex: false,
+            note: String::new(),
+            pending: None,
+            changeset,
+            repo_files: None,
+            symbols,
+            symbol_path,
+            preset: Vec::new(),
+            targets: Vec::new(),
+            pending_action: None,
+        }
+    }
+
+    fn insert(&mut self, ch: char) {
+        let at = self
+            .input
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len());
+        self.input.insert(at, ch);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let at = self
+            .input
+            .char_indices()
+            .nth(self.cursor - 1)
+            .map(|(i, _)| i);
+        if let Some(at) = at {
+            self.input.remove(at);
+            self.cursor -= 1;
+        }
+    }
+
+    /// Ctrl+W: rub out the word before the cursor.
+    fn delete_word(&mut self) {
+        while self.cursor > 0 && self.char_before().is_some_and(|c| c.is_whitespace()) {
+            self.backspace();
+        }
+        while self.cursor > 0 && self.char_before().is_some_and(|c| !c.is_whitespace()) {
+            self.backspace();
+        }
+    }
+
+    fn char_before(&self) -> Option<char> {
+        self.input.chars().nth(self.cursor.checked_sub(1)?)
+    }
+
+    fn move_sel(&mut self, delta: i32) {
+        if self.rows.is_empty() {
+            self.sel = 0;
+            return;
+        }
+        let last = self.rows.len() as i32 - 1;
+        self.sel = (self.sel as i32 + delta).clamp(0, last) as usize;
+        if self.sel < self.scroll {
+            self.scroll = self.sel;
+        } else if self.sel >= self.scroll + FINDER_ROWS {
+            self.scroll = self.sel + 1 - FINDER_ROWS;
+        }
+    }
+
+    /// The haystack for file matching: the changeset, or the whole repo
+    /// once its file list has arrived.
+    fn file_haystack(&self) -> &[String] {
+        match (&self.repo_files, self.repo_scope) {
+            (Some(all), true) => all,
+            _ => &self.changeset,
+        }
+    }
+
+    /// Recompute the rows that can be produced without a subprocess.
+    /// Grep is not one of them — it sets `pending` instead.
+    fn rebuild(&mut self) {
+        self.rows.clear();
+        self.sel = 0;
+        self.scroll = 0;
+        match self.mode {
+            FinderMode::Files => {
+                let query = self.input.trim().to_string();
+                let changeset = self.changeset.clone();
+                let mut scored: Vec<(i32, FinderRow)> = Vec::new();
+                for path in self.file_haystack() {
+                    let row = |score: i32, matched: Vec<usize>| {
+                        let in_changeset = changeset.iter().any(|p| p == path);
+                        (
+                            score,
+                            FinderRow {
+                                path: path.clone(),
+                                line: None,
+                                text: path.clone(),
+                                matched,
+                                range: None,
+                                tag: if in_changeset { "changed" } else { "" },
+                                in_changeset,
+                                pick: None,
+                            },
+                        )
+                    };
+                    if query.is_empty() {
+                        scored.push(row(0, Vec::new()));
+                    } else if let Some((score, matched)) = search::fuzzy(&query, path) {
+                        scored.push(row(score, matched));
+                    }
+                }
+                if !query.is_empty() {
+                    // Changed files first at equal score: in review, the
+                    // file you touched is nearly always the one you meant.
+                    scored.sort_by(|a, b| {
+                        b.0.cmp(&a.0)
+                            .then(b.1.in_changeset.cmp(&a.1.in_changeset))
+                            .then(a.1.path.len().cmp(&b.1.path.len()))
+                    });
+                }
+                self.rows = scored
+                    .into_iter()
+                    .take(search::RESULT_LIMIT)
+                    .map(|(_, r)| r)
+                    .collect();
+                self.note = if self.repo_scope && self.repo_files.is_none() {
+                    "Loading the repository file list…".into()
+                } else {
+                    format!(
+                        "{} of {} files · Tab {}",
+                        self.rows.len(),
+                        self.file_haystack().len(),
+                        if self.repo_scope {
+                            "back to changed files"
+                        } else {
+                            "search the whole repo"
+                        }
+                    )
+                };
+            }
+            FinderMode::Symbols => {
+                let query = self.input.trim().to_string();
+                let path = self.symbol_path.clone();
+                let mut scored: Vec<(i32, FinderRow)> = Vec::new();
+                for sym in &self.symbols {
+                    let (score, matched) = if query.is_empty() {
+                        (0, Vec::new())
+                    } else {
+                        match search::fuzzy(&query, &sym.name) {
+                            Some(v) => v,
+                            None => continue,
+                        }
+                    };
+                    scored.push((
+                        score,
+                        FinderRow {
+                            path: path.clone(),
+                            line: Some(sym.line),
+                            text: sym.name.clone(),
+                            matched,
+                            range: None,
+                            tag: sym.kind,
+                            in_changeset: true,
+                            pick: None,
+                        },
+                    ));
+                }
+                if !query.is_empty() {
+                    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+                }
+                self.rows = scored.into_iter().map(|(_, r)| r).collect();
+                self.note = if self.symbols.is_empty() {
+                    "No definitions found in this file.".into()
+                } else {
+                    format!("{} of {} symbols", self.rows.len(), self.symbols.len())
+                };
+            }
+            FinderMode::Grep => {
+                let query = self.input.trim().to_string();
+                if query.chars().count() < 2 {
+                    self.pending = None;
+                    self.note = "Type at least two characters.".into();
+                } else {
+                    self.pending = Some((query, Instant::now()));
+                    self.note = "Searching…".into();
+                }
+            }
+            // A list that already exists: typing narrows it down.
+            FinderMode::Refs | FinderMode::Pick => {
+                let query = self.input.trim().to_lowercase();
+                let total = self.preset.len();
+                self.rows = self
+                    .preset
+                    .iter()
+                    .filter(|r| {
+                        query.is_empty()
+                            || r.text.to_lowercase().contains(&query)
+                            || r.path.to_lowercase().contains(&query)
+                    })
+                    .map(|r| FinderRow {
+                        path: r.path.clone(),
+                        line: r.line,
+                        text: r.text.clone(),
+                        matched: r.matched.clone(),
+                        range: r.range,
+                        tag: r.tag,
+                        in_changeset: r.in_changeset,
+                        pick: r.pick,
+                    })
+                    .collect();
+                if self.mode == FinderMode::Pick {
+                    self.note = "Enter picks the symbol · Esc cancels".into();
+                } else if !query.is_empty() {
+                    self.note = format!("{} of {total} shown", self.rows.len());
+                }
+            }
+        }
+    }
 }
 
 /// State of the in-app theme picker (`t` / the 🎨 Theme button). Selecting
@@ -154,6 +601,8 @@ pub enum ButtonId {
     CommentCancel,
     EditorSave,
     EditorClose,
+    /// ⇥ Format in the editor top bar (also Ctrl+T).
+    EditorFormat,
     Theme,
     ThemeApply,
     ThemeCancel,
@@ -162,6 +611,21 @@ pub enum ButtonId {
     AppearanceToggle,
     /// The PR ⇄ local toggle in the review top bar (also the ` key).
     SwapView,
+    /// 🔍 in the review top bar — opens the finder.
+    Find,
+    /// ⧉ in the review top bar — copies the selected lines.
+    Copy,
+    /// A result row in the finder.
+    FinderRow(usize),
+    /// The finder's mode tabs and its changeset/repo scope switch.
+    FinderMode(FinderMode),
+    FinderScope,
+    FinderClose,
+    /// The two buttons on the revert confirm prompt.
+    RevertYes,
+    RevertCancel,
+    /// A line of the file-panel right-click menu.
+    PathMenuRow(usize),
 }
 
 /// Clickable regions recorded during the last draw.
@@ -200,6 +664,11 @@ pub const FILE_PANEL_DEFAULT: u16 = 34;
 pub const FILE_PANEL_MIN: u16 = 16;
 /// Columns the diff pane must keep, whatever the file panel is dragged to.
 pub const DIFF_MIN_W: u16 = 24;
+/// Width of the change bar down the left of the diff — the ↺ marker on each
+/// changed section, and the click target that reverts it. Only reserved
+/// when reverting is possible at all (see [`App::revert_gutter`]), so a
+/// read-only review still gets the full width for code.
+pub const REVERT_W: u16 = 2;
 /// Lines of context kept between the cursor and the edge of the diff pane.
 const SCROLLOFF: usize = 3;
 /// Columns one Left/Right key press scrolls the diff body.
@@ -207,6 +676,18 @@ const HSCROLL_STEP: i32 = 8;
 /// Columns one sideways wheel notch scrolls it — smaller, because a
 /// trackpad swipe delivers a stream of them.
 const HSCROLL_WHEEL: i32 = 4;
+
+/// How a revert prompt names what is at stake: "3 added and 1 removed
+/// lines", in whichever halves are non-zero.
+pub fn lines_phrase(adds: usize, dels: usize) -> String {
+    let s = |n: usize| if n == 1 { "" } else { "s" };
+    match (adds, dels) {
+        (0, 0) => "nothing".into(),
+        (a, 0) => format!("{a} added line{}", s(a)),
+        (0, d) => format!("{d} removed line{}", s(d)),
+        (a, d) => format!("{a} added and {d} removed line{}", s(a.max(d))),
+    }
+}
 
 /// True if `path` itself is a symlink (without following it).
 fn is_symlink(path: &std::path::Path) -> bool {
@@ -318,6 +799,9 @@ enum BgKind {
     Viewed { path: String, viewed: bool },
     /// `git add` / unstage; `before` is the state to restore on failure.
     Stage { path: String, before: StageState },
+    /// A plain re-read of the index after something changed the working
+    /// tree under it. Nothing to roll back if it fails.
+    Rescan,
 }
 
 /// Everything that belongs to one side of the PR ⇄ local toggle. Swapping
@@ -417,14 +901,163 @@ pub struct LocalOpenedData {
     stage: HashMap<String, StageState>,
 }
 
+/// A finished revert: what it undid, and the file reloaded from disk when
+/// the file it touched is the one on screen.
+pub struct RevertedData {
+    /// "3 lines in src/app.rs" — the message half.
+    what: String,
+    /// Whether the working tree still has the file (false when it was one
+    /// the change had created).
+    gone: bool,
+    /// A whole file, rather than one section of it — the local file list
+    /// has to be rescanned either way, since the file just left it.
+    whole_file: bool,
+    file: Option<Box<FileLoadedData>>,
+}
+
 pub enum Outcome {
     BranchPr(Option<u64>),
+    /// Changes thrown away — one section, or a whole file.
+    Reverted(Box<RevertedData>),
     LocalOpened(Box<LocalOpenedData>),
     Prs { repo: String, prs: Vec<PrSummary> },
     PrOpened(Box<PrOpenedData>),
     FileLoaded(Box<FileLoadedData>),
     CommentPosted { path: String, lo: usize, hi: usize },
     EditorSaved(Box<EditorSavedData>),
+    ExternalOpened(Box<ExternalFile>),
+    /// A file outside the changeset was written; nothing else changed.
+    ExternalSaved(String),
+    /// Answers from a language server.
+    Locations(Box<LocationsData>),
+    Hover(Box<HoverData>),
+}
+
+/// A file opened from a search result (or a jump to a definition) that
+/// isn't part of the changeset. There is no diff to show for it — it is
+/// just a file — so it opens in the editor, over the review, and closing
+/// it leaves the review exactly as it was.
+pub struct ExternalFile {
+    path: String,
+    abs_path: PathBuf,
+    content: String,
+    /// Line to land on.
+    line: Option<usize>,
+    /// The working tree is on another branch, so this text came from the
+    /// commit under review and must not be written back over the file.
+    read_only: bool,
+}
+
+/// One place a symbol is used, with the source line to show for it.
+pub struct Place {
+    loc: lsp::Loc,
+    text: String,
+}
+
+pub struct LocationsData {
+    action: LspAction,
+    word: String,
+    places: Vec<Place>,
+}
+
+pub struct HoverData {
+    word: String,
+    text: Option<String>,
+}
+
+/// Read a file the way the current review reads files: from the commit
+/// under review, falling back to the working tree.
+fn read_source(root: &std::path::Path, rev: Option<&str>, path: &str) -> Option<String> {
+    let from_disk =
+        || gitops::safe_repo_path(root, path).and_then(|p| std::fs::read_to_string(p).ok());
+    match rev {
+        Some(rev) => gitops::show_file(rev, path).or_else(from_disk),
+        None => from_disk(),
+    }
+}
+
+/// What the editor is asking its language server for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorRequest {
+    Complete,
+    Hover,
+    Definition,
+    Format,
+}
+
+impl EditorRequest {
+    /// Whether the user asked for this by pressing a key — completion
+    /// also fires on its own while typing, and an unavailable server
+    /// must not shout about it once per character.
+    fn is_explicit(self) -> bool {
+        self != EditorRequest::Complete
+    }
+}
+
+/// A language-server request made from the editor.
+///
+/// Like [`SearchJob`] and unlike a [`ForegroundJob`], this never blocks
+/// input — you must be able to keep typing while a completion is in
+/// flight — and a result from a keystroke you have already typed past is
+/// dropped by generation number rather than applied late.
+struct EditorJob {
+    rx: Receiver<Result<EditorOutcome>>,
+    gen: u64,
+}
+
+enum EditorOutcome {
+    Completions(Vec<lsp::Completion>),
+    Hover { word: String, text: Option<String> },
+    Definition { word: String, locs: Vec<lsp::Loc> },
+    /// `None` when the server does not format this language.
+    Formatted(Option<Vec<lsp::TextEdit>>),
+}
+
+/// A finder query running in the background. Unlike every other job this
+/// one is *replaceable*: each keystroke can start a new one, and results
+/// from a query the user has already typed past are dropped by generation
+/// number rather than being applied late.
+struct SearchJob {
+    rx: Receiver<Result<SearchOutcome>>,
+    gen: u64,
+    started: Instant,
+}
+
+enum SearchOutcome {
+    Grep {
+        hits: Vec<search::Hit>,
+        truncated: bool,
+        query: String,
+    },
+    /// The repository's file list, for whole-repo file matching.
+    Files(Vec<String>),
+    /// A language server's answer for the open file's symbols, replacing
+    /// the pattern-matched ones already on screen.
+    Symbols(Vec<lsp::Sym>),
+}
+
+/// Incremental search within the open diff (`/`), the vim-shaped half of
+/// the feature: a prompt in the status bar, matches highlighted in place,
+/// `n`/`N` to step. Kept separate from [`Finder`] because it searches
+/// *what is on screen* rather than what is on disk.
+#[derive(Default)]
+pub struct Find {
+    pub query: String,
+    /// True while the prompt is open and taking keystrokes.
+    pub typing: bool,
+    /// Where the cursor was when the prompt opened, so Esc can undo the
+    /// incremental jumping around.
+    origin: (usize, usize),
+    /// Diff rows containing a match, ascending.
+    pub rows: Vec<usize>,
+    /// Index into `rows` of the current match.
+    pub at: usize,
+}
+
+impl Find {
+    pub fn active(&self) -> bool {
+        !self.query.is_empty()
+    }
 }
 
 // ------------------------------------------------------------------ app
@@ -513,6 +1146,36 @@ pub struct App {
     /// A quiet result that landed while a modal job was running; applied
     /// once the modal job finishes so the two can't fight over the state.
     pending_quiet: Option<QuietOutcome>,
+    /// Language servers, started on demand and shared with worker
+    /// threads (see [`crate::lsp`]).
+    pub lsp: Lsp,
+    /// `language_servers` in the config; off means loupe never starts one.
+    pub lsp_enabled: bool,
+    /// (display row, char column) of the last click on a diff line — an
+    /// unambiguous "this symbol" for the request that follows it.
+    click_word: Option<(usize, usize)>,
+    /// In-flight editor request (see [`EditorJob`]).
+    editor_job: Option<EditorJob>,
+    editor_gen: u64,
+    /// When the buffer last changed, for the idle push to the server.
+    editor_touched: Option<Instant>,
+    /// Diagnostics version last seen, so a redraw only happens when the
+    /// servers actually said something new.
+    diag_seen: u64,
+    /// Run the language server's formatter on save (`format_on_save`).
+    pub format_on_save: bool,
+    /// True while a format is running as the first half of a save.
+    format_then_save: bool,
+    /// In-flight finder query (see [`SearchJob`]).
+    search_job: Option<SearchJob>,
+    /// Bumped on every new query; a result whose generation is stale is
+    /// dropped instead of overwriting fresher rows.
+    search_gen: u64,
+    /// Incremental in-diff search (`/`, `n`, `N`).
+    pub find: Find,
+    /// A line to jump to once the file finishes loading (set when a
+    /// search result names a file that isn't open yet).
+    pending_jump: Option<usize>,
     /// Error to re-surface once a fallback PR-list load finishes.
     post_load_err: Option<String>,
     /// One-shot note prepended to the next file-loaded status message.
@@ -574,6 +1237,19 @@ impl App {
             stash: None,
             quiet: None,
             pending_quiet: None,
+            lsp: Lsp::default(),
+            lsp_enabled: true,
+            click_word: None,
+            editor_job: None,
+            editor_gen: 0,
+            editor_touched: None,
+            diag_seen: 0,
+            format_on_save: false,
+            format_then_save: false,
+            search_job: None,
+            search_gen: 0,
+            find: Find::default(),
+            pending_jump: None,
             post_load_err: None,
             auto_open_note: None,
             layout: HitAreas::default(),
@@ -613,6 +1289,83 @@ impl App {
     /// loop ticking so its spinner animates and its result lands promptly).
     pub fn refreshing(&self) -> bool {
         self.quiet.is_some()
+    }
+
+    /// Push the editor buffer to its language server once typing pauses.
+    ///
+    /// Debounced, and deliberately best-effort: `sync_open` never blocks
+    /// and never starts a server, so a slow or missing one costs a
+    /// skipped tick rather than a stutter between keystrokes.
+    fn sync_editor_buffer(&mut self) -> bool {
+        if !self.lsp_enabled {
+            return false;
+        }
+        let Some(touched) = self.editor_touched else {
+            return false;
+        };
+        if touched.elapsed() < SYNC_DEBOUNCE {
+            return false;
+        }
+        let Some(editor) = &self.editor else {
+            self.editor_touched = None;
+            return false;
+        };
+        let text = editor.content();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&text, &mut hasher);
+        let hash = std::hash::Hasher::finish(&hasher);
+        if hash == editor.synced {
+            self.editor_touched = None;
+            return false;
+        }
+        let path = editor.path.clone();
+        let root = self.repo_root.clone();
+        if self.lsp.sync_open(&root, &path, &text) {
+            self.editor_touched = None;
+            if let Some(editor) = &mut self.editor {
+                editor.synced = hash;
+            }
+        }
+        false
+    }
+
+    /// Collect anything the servers have pushed — diagnostics, mostly —
+    /// and hand the current file's to the editor.
+    fn poll_diagnostics(&mut self) -> bool {
+        if !self.lsp_enabled || self.editor.is_none() {
+            return false;
+        }
+        let version = self.lsp.poll();
+        if version == self.diag_seen {
+            return false;
+        }
+        self.diag_seen = version;
+        let root = self.repo_root.clone();
+        let Some(path) = self.editor.as_ref().map(|e| e.path.clone()) else {
+            return false;
+        };
+        let list = self.lsp.diagnostics(&root, &path);
+        if let Some(editor) = &mut self.editor {
+            if editor.diagnostics == list {
+                return false;
+            }
+            editor.diagnostics = list;
+        }
+        true
+    }
+
+    /// True while a finder query is running or waiting out its debounce.
+    /// The main loop treats this like `busy()` for timing purposes only —
+    /// input stays live throughout.
+    pub fn searching(&self) -> bool {
+        self.search_job.is_some()
+            || matches!(&self.overlay, Overlay::Finder(f) if f.pending.is_some())
+    }
+
+    /// Spinner frame for a running query — a whole-repo grep on a large
+    /// tree is fast, but not instant, and silence reads as breakage.
+    pub fn search_spinner(&self) -> Option<char> {
+        self.search_job.as_ref().map(|j| spinner_frame(j.started))
     }
 
     /// Spinner frame + label for a silent refresh — informational only,
@@ -695,7 +1448,65 @@ impl App {
                             self.err(format!("Staging {path} failed: {e:#}"));
                             changed = true;
                         }
+                        // A failed re-read leaves the icons as they were:
+                        // cosmetic, and not worth a scary message.
+                        (Err(_), BgKind::Rescan) => {}
                     }
+                }
+            }
+        }
+
+        // Keep the language server's copy of the buffer current, and pick
+        // up whatever it has pushed back.
+        if self.sync_editor_buffer() {
+            changed = true;
+        }
+        if self.poll_diagnostics() {
+            changed = true;
+        }
+        if let Some(job) = &self.editor_job {
+            match job.rx.try_recv() {
+                Ok(r) => {
+                    let gen = job.gen;
+                    self.editor_job = None;
+                    match r {
+                        Ok(o) => self.apply_editor_outcome(gen, o),
+                        Err(e) => self.err(format!("{e:#}")),
+                    }
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.editor_job = None;
+                    changed = true;
+                }
+            }
+        }
+
+        // A debounced query whose quiet period has elapsed becomes a job.
+        if self.maybe_spawn_search() {
+            changed = true;
+        }
+        if let Some(job) = &self.search_job {
+            match job.rx.try_recv() {
+                Ok(r) => {
+                    let gen = job.gen;
+                    self.search_job = None;
+                    match r {
+                        Ok(o) => self.apply_search(gen, o),
+                        Err(e) => {
+                            if let Overlay::Finder(f) = &mut self.overlay {
+                                f.rows.clear();
+                                f.note = format!("Search failed: {e:#}");
+                            }
+                        }
+                    }
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.search_job = None;
+                    changed = true;
                 }
             }
         }
@@ -884,13 +1695,30 @@ impl App {
                 self.diff = Some(d.diff);
                 self.expanded_folds.clear();
                 self.rebuild_display();
-                self.diff_cursor = self.first_change_display();
-                self.diff_scroll = self.diff_cursor.saturating_sub(3);
+                // A search result names a line; opening the file normally
+                // lands on its first change instead.
+                match self.pending_jump.take() {
+                    Some(line) => self.jump_to_line(line),
+                    None => {
+                        self.diff_cursor = self.first_change_display();
+                        self.diff_scroll = self.diff_cursor.saturating_sub(3);
+                    }
+                }
                 self.diff_hscroll = 0;
                 self.select_mode = false;
                 self.selection = None;
                 self.editor = None;
+                self.recompute_matches();
                 self.reveal_current_file();
+                // Start this language's server in the background, so the
+                // first gd / gr / K doesn't pay for the handshake.
+                if self.lsp_enabled {
+                    if let (Some(file), Some(text)) =
+                        (self.files.get(self.file_cursor), self.new_content.as_deref())
+                    {
+                        self.lsp.warm(&self.repo_root, &file.path, text);
+                    }
+                }
                 let mode = if self.checked_out {
                     "editable"
                 } else {
@@ -929,6 +1757,60 @@ impl App {
                     d.path
                 ));
             }
+            Outcome::Reverted(data) => self.apply_reverted(*data),
+            Outcome::ExternalOpened(data) => self.apply_external(*data),
+            Outcome::ExternalSaved(path) => {
+                if let Some(ed) = &mut self.editor {
+                    ed.dirty = false;
+                    ed.discard_armed = false;
+                }
+                self.ok(format!("✔ Saved {path} (not part of this change)."));
+            }
+            Outcome::Locations(data) => self.apply_locations(*data),
+            Outcome::Hover(data) => {
+                let d = *data;
+                match d.text {
+                    Some(text) => {
+                        self.ok(format!("{} — Esc closes.", d.word));
+                        self.overlay = Overlay::Hover(Box::new(HoverPanel {
+                            word: d.word,
+                            lines: text.lines().map(str::to_string).collect(),
+                        }));
+                    }
+                    None => self.err(format!("Nothing known about {}.", d.word)),
+                }
+            }
+        }
+    }
+
+    /// Open a file that is not part of the changeset, in the editor.
+    ///
+    /// Deliberately *not* a diff: there is nothing to diff it against,
+    /// and a side-by-side view of a file against itself is two identical
+    /// columns. The review underneath is untouched, so closing the editor
+    /// puts the reader back exactly where they were with no reload.
+    fn apply_external(&mut self, d: ExternalFile) {
+        let mut editor = Editor::new(&d.path, d.abs_path, &d.content);
+        editor.standalone = true;
+        editor.read_only = d.read_only;
+        if let Some(line) = d.line {
+            editor.jump_to_line(line);
+        }
+        self.editor = Some(editor);
+        let where_ = match d.line {
+            Some(line) => format!(" at line {line}"),
+            None => String::new(),
+        };
+        if d.read_only {
+            self.ok(format!(
+                "👁 {}{where_} — not in this change, and the branch isn't checked out, so it's read-only. Esc goes back.",
+                d.path
+            ));
+        } else {
+            self.ok(format!(
+                "{}{where_} — not part of this change. Edit and Ctrl+S if you want; Esc goes back.",
+                d.path
+            ));
         }
     }
 
@@ -1115,9 +1997,19 @@ impl App {
 
     fn spawn_save_editor(&mut self) {
         let Some(editor) = &self.editor else { return };
+        if editor.read_only {
+            self.err(
+                "This file is read-only — it came from the commit under review, not your working tree. Reopen the PR with “Checkout & review” to edit.",
+            );
+            return;
+        }
         let content = editor.content();
         let abs_path = editor.abs_path.clone();
         let path = editor.path.clone();
+        // A file that isn't part of the changeset has no diff to refresh:
+        // write it and stop, rather than recomputing the open file's diff
+        // against someone else's content.
+        let standalone = editor.standalone;
         let head_oid = self
             .pr
             .as_ref()
@@ -1135,6 +2027,9 @@ impl App {
                 );
             }
             std::fs::write(&abs_path, &content)?;
+            if standalone {
+                return Ok(Outcome::ExternalSaved(path));
+            }
             // Line numbers may have shifted relative to the PR head, so
             // commenting stays blocked until the change is pushed. (Local
             // review has no PR head — nothing to compare against.)
@@ -1156,6 +2051,294 @@ impl App {
         });
     }
 
+    // ------------------------------------------------------------- reverting
+
+    /// Whether putting changes back is possible at all. The working tree has
+    /// to be the thing under review: a PR opened read-only is someone else's
+    /// commit, and there is nothing of ours on disk to undo. An open editor
+    /// owns the file until it is closed, so it hides the offer too.
+    pub fn can_revert(&self) -> bool {
+        self.checked_out && self.screen == Screen::Review && self.editor.is_none()
+    }
+
+    /// Columns the change bar takes off the left of the diff pane — zero
+    /// when there is nothing to revert, so nothing but the feature pays for
+    /// it. Every piece of diff geometry measures from
+    /// [`Self::diff_body`], which subtracts this.
+    pub fn revert_gutter(&self) -> u16 {
+        if self.can_revert() && self.diff.is_some() {
+            REVERT_W
+        } else {
+            0
+        }
+    }
+
+    /// The diff pane minus the change bar: the part that actually holds the
+    /// two panes (or the inline body).
+    pub fn diff_body(&self) -> Rect {
+        let r = self.layout.diff;
+        let g = self.revert_gutter().min(r.width);
+        Rect {
+            x: r.x + g,
+            width: r.width - g,
+            ..r
+        }
+    }
+
+    /// The section of the diff a display row belongs to, if any. Fold
+    /// banners and context lines belong to none — there is nothing there to
+    /// put back.
+    pub fn section_on_row(&self, display_row: usize) -> Option<(usize, usize)> {
+        let entry = *self.display.get(display_row)?;
+        if matches!(
+            entry,
+            DisplayEntry::Fold { .. } | DisplayEntry::Unfold { .. }
+        ) {
+            return None;
+        }
+        self.diff.as_ref()?.section_at(self.entry_row(entry))
+    }
+
+    /// What the change bar draws on a display row: `Some(true)` on the first
+    /// row of a section (the ↺ marker), `Some(false)` further down it, None
+    /// where nothing changed.
+    pub fn change_bar(&self, display_row: usize) -> Option<bool> {
+        let here = self.section_on_row(display_row)?;
+        let above = display_row
+            .checked_sub(1)
+            .and_then(|i| self.section_on_row(i));
+        Some(above != Some(here))
+    }
+
+    /// Ask before reverting one section of the open diff, named by the
+    /// display row the click landed on. Deliberately not tied to the cursor:
+    /// the marker you click is the change that goes.
+    pub fn ask_revert_section(&mut self, display_row: usize) {
+        if !self.revert_allowed() {
+            return;
+        }
+        let Some((start, end)) = self.section_on_row(display_row) else {
+            self.err("No change on that line — ↺ marks each one you can put back.");
+            return;
+        };
+        let Some((adds, dels, deletes)) = self.diff.as_ref().map(|d| {
+            let (adds, dels) = d.section_counts((start, end));
+            let gone = d
+                .revert_section(
+                    (start, end),
+                    self.old_content.as_deref(),
+                    self.new_content.as_deref(),
+                )
+                .is_none();
+            (adds, dels, gone)
+        }) else {
+            return;
+        };
+        let Some(path) = self.files.get(self.file_cursor).map(|f| f.path.clone()) else {
+            return;
+        };
+        self.overlay = Overlay::Revert(Box::new(RevertPrompt {
+            target: RevertTarget::Section { start, end },
+            path,
+            adds,
+            dels,
+            deletes,
+        }));
+    }
+
+    /// Ask before throwing away every change in one file.
+    pub fn ask_revert_file(&mut self, idx: usize) {
+        if !self.revert_allowed() {
+            return;
+        }
+        let Some(file) = self.files.get(idx) else {
+            return;
+        };
+        self.overlay = Overlay::Revert(Box::new(RevertPrompt {
+            target: RevertTarget::File { idx },
+            path: file.path.clone(),
+            adds: file.additions as usize,
+            dels: file.deletions as usize,
+            deletes: file.status == "added",
+        }));
+    }
+
+    /// Shared guard: says why not, rather than doing nothing.
+    fn revert_allowed(&mut self) -> bool {
+        if self.editor.is_some() {
+            self.err("Close the editor first (Ctrl+S to save, Esc to close) before reverting.");
+            return false;
+        }
+        if !self.can_revert() {
+            self.err(
+                "This review is read-only — reopen the PR with “Checkout & review” to change files.",
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Go ahead with the prompt that is open.
+    pub fn confirm_revert(&mut self) {
+        let Overlay::Revert(prompt) = &self.overlay else {
+            return;
+        };
+        let target = prompt.target;
+        self.overlay = Overlay::None;
+        self.spawn_revert(target);
+    }
+
+    /// Do the revert on a worker thread, then reload the file it touched.
+    ///
+    /// A section is written straight to the working tree (the index is left
+    /// exactly as it was — half a file is not something to stage behind
+    /// someone's back); a whole file goes through git, which puts the index
+    /// back too so the file stops showing as changed.
+    fn spawn_revert(&mut self, target: RevertTarget) {
+        let root = self.repo_root.clone();
+        let rev = Some(self.merge_base.clone()).filter(|r| !r.is_empty());
+        let ctx = self.file_load_ctx();
+        let open_idx = self.file_cursor;
+        match target {
+            RevertTarget::File { idx } => {
+                let Some(file) = self.files.get(idx).cloned() else {
+                    return;
+                };
+                let path = file.path.clone();
+                let previous = file.previous.clone();
+                let gone = file.status == "added";
+                // Reloading only makes sense for the file on screen.
+                let reload = (idx == open_idx).then(|| file.clone());
+                self.spawn(format!("Reverting {path}"), false, false, move || {
+                    gitops::revert_path(&root, rev.as_deref(), &path)?;
+                    // A rename has two halves: the new path goes, the
+                    // original comes back.
+                    if let Some(prev) = previous {
+                        gitops::revert_path(&root, rev.as_deref(), &prev)?;
+                    }
+                    let file = match reload {
+                        Some(f) => Some(Box::new(load_file_data(open_idx, f, ctx)?)),
+                        None => None,
+                    };
+                    Ok(Outcome::Reverted(Box::new(RevertedData {
+                        what: format!("every change in {path}"),
+                        gone,
+                        whole_file: true,
+                        file,
+                    })))
+                });
+            }
+            RevertTarget::Section { start, end } => {
+                let Some(file) = self.files.get(open_idx).cloned() else {
+                    return;
+                };
+                let Some((adds, dels, rebuilt)) = self.diff.as_ref().map(|d| {
+                    let (adds, dels) = d.section_counts((start, end));
+                    let rebuilt = d.revert_section(
+                        (start, end),
+                        self.old_content.as_deref(),
+                        self.new_content.as_deref(),
+                    );
+                    (adds, dels, rebuilt)
+                }) else {
+                    return;
+                };
+                let Some(abs_path) = gitops::safe_repo_path(&self.repo_root, &file.path) else {
+                    self.err(format!("Refusing to write to “{}”.", file.path));
+                    return;
+                };
+                let path = file.path.clone();
+                // What the diff on screen was computed from. If the file has
+                // moved on since, the row model is stale and writing it back
+                // would clobber whatever else happened.
+                let expected = self.new_content.clone();
+                let what = format!("{} in {path}", lines_phrase(adds, dels));
+                let gone = rebuilt.is_none();
+                self.spawn(format!("Reverting a change in {path}"), false, false, move || {
+                    if is_symlink(&abs_path) {
+                        anyhow::bail!(
+                            "{} is a symlink — refusing to write through it",
+                            abs_path.display()
+                        );
+                    }
+                    let on_disk = std::fs::read_to_string(&abs_path).ok();
+                    if on_disk != expected {
+                        anyhow::bail!(
+                            "{path} changed on disk since it was loaded — press r to reload it first"
+                        );
+                    }
+                    match &rebuilt {
+                        Some(text) => std::fs::write(&abs_path, text)?,
+                        // The whole of a file the change created: undoing it
+                        // means the file goes.
+                        None => std::fs::remove_file(&abs_path)?,
+                    }
+                    let file = Box::new(load_file_data(open_idx, file, ctx)?);
+                    Ok(Outcome::Reverted(Box::new(RevertedData {
+                        what,
+                        gone,
+                        whole_file: false,
+                        file: Some(file),
+                    })))
+                });
+            }
+        }
+    }
+
+    /// Put a reloaded file back on screen without moving the reader, the way
+    /// a silent refresh does — a revert changes a few lines, not the place
+    /// you were reading.
+    fn apply_reverted(&mut self, d: RevertedData) {
+        let mut cleaned = false;
+        if let Some(file) = d.file {
+            let f = *file;
+            let idx = f.idx;
+            if self.files.get(idx).map(|x| x.path.as_str()) == Some(f.path.as_str()) {
+                self.old_content = f.old;
+                self.new_content = f.new;
+                self.old_hl = f.old_hl;
+                self.new_hl = f.new_hl;
+                self.differs_from_head = f.differs;
+                // Counts in the file panel come from the list, which was
+                // built before the revert — keep them honest.
+                if let Some(entry) = self.files.get_mut(idx) {
+                    entry.additions = f.diff.additions as u64;
+                    entry.deletions = f.diff.deletions as u64;
+                }
+                cleaned = f.diff.additions == 0 && f.diff.deletions == 0;
+                self.diff = Some(f.diff);
+                self.expanded_folds.clear();
+                self.selection = None;
+                self.select_mode = false;
+                self.rebuild_display();
+                let last = self.display.len().saturating_sub(1);
+                self.diff_cursor = self.diff_cursor.min(last);
+                self.diff_scroll = self.diff_scroll.min(last);
+                self.diff_hscroll = self.diff_hscroll.min(self.max_hscroll());
+                self.recompute_matches();
+            }
+        }
+        let tail = if d.gone {
+            " — the file is gone; there was no earlier version of it."
+        } else if d.whole_file {
+            " — it is back to the version it was changed from."
+        } else {
+            " — the rest of the file is untouched."
+        };
+        self.ok(format!("↩ Reverted {}{tail}", d.what));
+        // Local review lists what is uncommitted, so a file that is clean
+        // again has to leave the list — and a whole-file revert always
+        // leaves it, including one done from a row that isn't open.
+        if self.local && (cleaned || d.gone || d.whole_file) {
+            self.spawn_quiet_local();
+        } else if self.local {
+            // A section went back in the working tree only, which can turn
+            // a staged file into a partly staged one: re-read the index so
+            // the icon column doesn't lie about it.
+            self.refresh_stage_states();
+        }
+    }
+
     /// Flip a file's viewed checkbox: local state immediately, GitHub sync in
     /// the background (reverted with an error message if the sync fails).
     /// The file panel's leading icon: "viewed" for a PR, "staged" for local
@@ -1170,6 +2353,21 @@ impl App {
             .iter()
             .filter(|f| self.stage_state(&f.path) == StageState::Staged)
             .count()
+    }
+
+    /// Re-read the index in the background and adopt it wholesale — the
+    /// cheap half of a rescan, for when the working tree moved but the file
+    /// list did not.
+    fn refresh_stage_states(&mut self) {
+        let root = self.repo_root.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(gitops::stage_states(&root).map(Some));
+        });
+        self.bg_jobs.push(BgJob {
+            rx,
+            kind: BgKind::Rescan,
+        });
     }
 
     /// What the icon column does: stage/unstage locally, mark viewed on a PR.
@@ -1422,6 +2620,46 @@ impl App {
                 }
                 return;
             }
+            Overlay::Revert(_) => {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char('y') => self.confirm_revert(),
+                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                        self.overlay = Overlay::None;
+                        self.ok("Left alone — nothing was reverted.");
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            Overlay::PathMenu(menu) => {
+                let last = menu.items.len().saturating_sub(1);
+                let mut close = false;
+                let hit = match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        menu.sel = menu.sel.saturating_sub(1);
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        menu.sel = (menu.sel + 1).min(last);
+                        None
+                    }
+                    KeyCode::Enter => Some(menu.sel),
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        close = true;
+                        None
+                    }
+                    // Each line has its own letter, so the common case is
+                    // one key press rather than move-then-confirm.
+                    KeyCode::Char(c) => menu.items.iter().position(|it| it.key == c),
+                    _ => None,
+                };
+                if close {
+                    self.overlay = Overlay::None;
+                } else if let Some(i) = hit {
+                    self.path_menu_copy(i);
+                }
+                return;
+            }
             Overlay::Comment(draft) => {
                 match (key.code, key.modifiers) {
                     (KeyCode::Esc, _) => self.overlay = Overlay::None,
@@ -1450,14 +2688,116 @@ impl App {
                 }
                 return;
             }
+            Overlay::Finder(_) => {
+                self.finder_key(key);
+                return;
+            }
+            Overlay::Hover(_) => {
+                self.overlay = Overlay::None;
+                return;
+            }
             Overlay::None => {}
         }
 
+        // The `/` prompt owns every keystroke while it is open.
+        if self.find.typing {
+            self.find_key(key);
+            return;
+        }
+
         // Editor mode.
-        if let Some(editor) = &mut self.editor {
+        if self.editor.is_some() {
+            // The completion popup owns a few keys while it is open, and
+            // gives them straight back when it closes.
+            if self.editor.as_ref().is_some_and(|e| e.completion.is_some()) {
+                let handled = match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => {
+                        if let Some(e) = &mut self.editor {
+                            e.completion = None;
+                        }
+                        self.ok("Completion dismissed.");
+                        true
+                    }
+                    (KeyCode::Tab, _) | (KeyCode::Enter, _) => {
+                        let accepted = self.editor.as_mut().and_then(|e| e.accept_completion());
+                        match accepted {
+                            Some(label) => self.ok(format!("Inserted {label}.")),
+                            None => self.err("Nothing selected."),
+                        }
+                        true
+                    }
+                    (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                        if let Some(c) = self.editor.as_mut().and_then(|e| e.completion.as_mut()) {
+                            c.move_sel(-1);
+                        }
+                        true
+                    }
+                    (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                        if let Some(c) = self.editor.as_mut().and_then(|e| e.completion.as_mut()) {
+                            c.move_sel(1);
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if handled {
+                    return;
+                }
+            }
+
+            let editor = self.editor.as_mut().expect("checked above");
             match (key.code, key.modifiers) {
                 (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                    self.spawn_save_editor();
+                    // Format first when asked to: saving the unformatted
+                    // text and reformatting after would write twice.
+                    if self.format_on_save && !self.editor.as_ref().is_some_and(|e| e.read_only) {
+                        self.format_then_save = true;
+                        self.spawn_editor_request(EditorRequest::Format);
+                    } else {
+                        self.spawn_save_editor();
+                    }
+                }
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                    let target = editor.copy_target();
+                    match target {
+                        Some((text, what)) => match clipboard::copy(&text) {
+                            Ok(via) => self.ok(format!("⧉ Copied {what} via {via}.")),
+                            Err(e) => self.err(format!("Couldn't copy: {e:#}")),
+                        },
+                        None => self.err("Nothing to copy."),
+                    }
+                }
+                // Language-server keys. These are Ctrl-based because the
+                // editor takes plain characters as text — `K` and `gd`
+                // from the diff view would just type letters here — and
+                // Ctrl+G/T/] are the ones tui-textarea leaves free.
+                (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
+                    self.spawn_editor_request(EditorRequest::Hover);
+                }
+                (KeyCode::Char(']'), KeyModifiers::CONTROL) => {
+                    self.spawn_editor_request(EditorRequest::Definition);
+                }
+                (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                    self.ok("Formatting…");
+                    self.spawn_editor_request(EditorRequest::Format);
+                }
+                (KeyCode::Char(' '), KeyModifiers::CONTROL) => {
+                    self.spawn_editor_request(EditorRequest::Complete);
+                }
+                // tui-textarea's own undo is Ctrl+U; Ctrl+Z is what
+                // everyone reaches for, so both work. A format is undone
+                // whole rather than in the two steps it took to apply.
+                (KeyCode::Char('z'), KeyModifiers::CONTROL)
+                | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                    if editor.undo_format() {
+                        self.ok("Formatting undone.");
+                    } else {
+                        editor.textarea.undo();
+                    }
+                    if let Some(e) = &mut self.editor {
+                        e.dirty = true;
+                    }
+                    self.editor_touched = Some(Instant::now());
                 }
                 // Paging must bypass tui-textarea's handler: its internal
                 // PageUp/PageDown call TextArea::scroll, which would desync
@@ -1483,6 +2823,33 @@ impl App {
                     if modified {
                         editor.dirty = true;
                         editor.discard_armed = false;
+                        editor.touched();
+                    }
+                    let typed = match key.code {
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            Some(c)
+                        }
+                        _ => None,
+                    };
+                    if modified {
+                        // The server's copy is now stale; the idle tick
+                        // will push the new text.
+                        self.editor_touched = Some(Instant::now());
+                    }
+                    // Narrow an open popup to what has been typed since,
+                    // or open one when a word (or a `.`) starts.
+                    let open = self.editor.as_ref().is_some_and(|e| e.completion.is_some());
+                    if open {
+                        if let Some(e) = &mut self.editor {
+                            e.update_completion();
+                        }
+                    }
+                    if let Some(c) = typed {
+                        let still_open =
+                            self.editor.as_ref().is_some_and(|e| e.completion.is_some());
+                        if !still_open && (c == '.' || c == ':' || c == '>') {
+                            self.spawn_editor_request(EditorRequest::Complete);
+                        }
                     }
                 }
             }
@@ -1518,9 +2885,26 @@ impl App {
                 // `g` is the one prefix key: gg jumps to the top. Any other
                 // key cancels the pending g and is handled normally.
                 let pending_g = std::mem::take(&mut self.pending_g);
-                if pending_g && key.code == KeyCode::Char('g') {
-                    self.cursor_to(0);
-                    return;
+                if pending_g {
+                    match key.code {
+                        KeyCode::Char('g') => {
+                            self.cursor_to(0);
+                            return;
+                        }
+                        // gd / gr: the language server's answers, under
+                        // the keys vim users already reach for.
+                        KeyCode::Char('d') => {
+                            self.lsp_action(LspAction::Definition);
+                            return;
+                        }
+                        KeyCode::Char('r') => {
+                            self.lsp_action(LspAction::References);
+                            return;
+                        }
+                        // Anything else cancels the prefix and is handled
+                        // normally below.
+                        _ => {}
+                    }
                 }
                 let page = self.diff_page() as i32;
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1550,6 +2934,15 @@ impl App {
                     }
                     KeyCode::Char('}') => self.jump_hunk(true),
                     KeyCode::Char('{') => self.jump_hunk(false),
+                    // --- search
+                    KeyCode::Char('/') => self.start_find(),
+                    // vim's "what is this?" key.
+                    KeyCode::Char('K') => self.lsp_action(LspAction::Hover),
+                    KeyCode::Char('n') => self.goto_match(true),
+                    KeyCode::Char('N') => self.goto_match(false),
+                    KeyCode::Char('p') if ctrl => self.open_finder(FinderMode::Files),
+                    KeyCode::Char('#') => self.open_finder(FinderMode::Grep),
+                    KeyCode::Char('@') => self.open_finder(FinderMode::Symbols),
                     // --- scrolling that leaves the cursor where it is
                     KeyCode::Char('e') if ctrl => {
                         self.scroll_diff(1);
@@ -1566,19 +2959,30 @@ impl App {
                     KeyCode::Char('$') => self.scroll_diff_h(i32::MAX / 2),
                     // --- selection and actions on the cursor row
                     KeyCode::Char('V') => self.toggle_select_mode(),
+                    // Copy what is selected (or the cursor line). Ctrl+C
+                    // does nothing else here — `q` is how you quit.
+                    KeyCode::Char('y') => self.yank(),
+                    KeyCode::Char('c') if ctrl => self.yank(),
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         let idx = self.diff_cursor;
                         if !self.toggle_fold_row(idx) {
                             self.err("Nothing to fold here — V selects lines, e edits.");
                         }
                     }
+                    // Esc unwinds one layer at a time, saying which each
+                    // time: selection, then search, then out.
                     KeyCode::Esc if self.selection.is_some() => self.clear_selection(),
+                    KeyCode::Esc if self.find.active() => self.clear_find(),
                     // --- everything that was already bound
                     KeyCode::Char('q') => self.should_quit = true,
                     KeyCode::Esc | KeyCode::Char('b') => self.back_to_pr_list(),
                     KeyCode::Char('v') => self.toggle_view(),
                     KeyCode::Char('z') => self.toggle_fold(),
                     KeyCode::Char('x') => self.toggle_file_mark(self.file_cursor),
+                    // Put changes back: the section at the cursor, or (with
+                    // shift) the whole file. Both ask first.
+                    KeyCode::Char('u') => self.ask_revert_section(self.diff_cursor),
+                    KeyCode::Char('U') => self.ask_revert_file(self.file_cursor),
                     KeyCode::Char('e') | KeyCode::Char('i') => {
                         let line = match self.cursor_pos() {
                             Some((Side::Right, n)) => Some(n),
@@ -1593,8 +2997,10 @@ impl App {
                     KeyCode::Char('?') => self.overlay = Overlay::Help,
                     KeyCode::Char('<') => self.resize_file_panel(-2),
                     KeyCode::Char('>') => self.resize_file_panel(2),
-                    KeyCode::Char('n') | KeyCode::Char(']') => self.step_file(1),
-                    KeyCode::Char('p') | KeyCode::Char('[') => self.step_file(-1),
+                    // `n`/`p` used to do this too; they belong to search
+                    // now, and `]`/`[` is the convention anyway.
+                    KeyCode::Char(']') => self.step_file(1),
+                    KeyCode::Char('[') => self.step_file(-1),
                     _ => {}
                 }
             }
@@ -1646,6 +3052,19 @@ impl App {
                 }
                 return;
             }
+            Overlay::Revert(_) => {
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    match self.layout.button_at(x, y) {
+                        Some(ButtonId::RevertYes) => self.confirm_revert(),
+                        Some(ButtonId::RevertCancel) => {
+                            self.overlay = Overlay::None;
+                            self.ok("Left alone — nothing was reverted.");
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
             Overlay::Comment(_) => {
                 if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
                     match self.layout.button_at(x, y) {
@@ -1679,6 +3098,27 @@ impl App {
                 }
                 return;
             }
+            Overlay::Finder(_) => {
+                self.finder_mouse(m, x, y);
+                return;
+            }
+            Overlay::Hover(_) => {
+                if matches!(m.kind, MouseEventKind::Down(_)) {
+                    self.overlay = Overlay::None;
+                }
+                return;
+            }
+            Overlay::PathMenu(_) => {
+                // A click anywhere else closes it, which is what every
+                // other context menu does.
+                if matches!(m.kind, MouseEventKind::Down(_)) {
+                    match self.layout.button_at(x, y) {
+                        Some(ButtonId::PathMenuRow(i)) => self.path_menu_copy(i),
+                        _ => self.overlay = Overlay::None,
+                    }
+                }
+                return;
+            }
             Overlay::None => {}
         }
 
@@ -1691,7 +3131,12 @@ impl App {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     match self.layout.button_at(x, y) {
-                        Some(ButtonId::EditorSave) => {
+                        Some(ButtonId::EditorFormat) => {
+                        self.ok("Formatting…");
+                        self.spawn_editor_request(EditorRequest::Format);
+                        return;
+                    }
+                    Some(ButtonId::EditorSave) => {
                             self.spawn_save_editor();
                             return;
                         }
@@ -1711,6 +3156,13 @@ impl App {
                     }
                     if let Some(ed) = &mut self.editor {
                         ed.on_click(x, y);
+                    }
+                }
+                // Copying a path does not switch files, so the menu still
+                // works while the editor holds the file panel.
+                MouseEventKind::Down(MouseButton::Right) => {
+                    if contains(self.layout.file_list, x, y) {
+                        self.open_path_menu(x, y);
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
@@ -1836,6 +3288,14 @@ impl App {
                         self.toggle_workspace();
                         return;
                     }
+                    Some(ButtonId::Find) => {
+                        self.open_finder(FinderMode::Files);
+                        return;
+                    }
+                    Some(ButtonId::Copy) => {
+                        self.yank();
+                        return;
+                    }
                     Some(ButtonId::Theme) => {
                         self.open_theme_picker();
                         return;
@@ -1856,21 +3316,23 @@ impl App {
                     self.diff_click(x, y);
                 }
             }
-            MouseEventKind::Drag(MouseButton::Left)
-                if self.drag_select && contains(self.layout.diff, x, y) =>
-            {
-                if let Some((side, line)) = self.diff_pos_at(x, y) {
-                    if let Some(sel) = &mut self.selection {
-                        if sel.side == side {
-                            sel.end = line;
-                        }
-                    }
-                }
+            // Dragging past the top or bottom edge scrolls and keeps
+            // selecting, so a block bigger than the screen is one gesture.
+            MouseEventKind::Drag(MouseButton::Left) if self.drag_select => {
+                self.drag_to(x, y);
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag_select = false;
             }
-            MouseEventKind::Down(MouseButton::Right) => self.clear_selection(),
+            // Right-click on the file panel asks about the row's path;
+            // anywhere else it drops the diff selection.
+            MouseEventKind::Down(MouseButton::Right) => {
+                if contains(self.layout.file_list, x, y) {
+                    self.open_path_menu(x, y);
+                } else {
+                    self.clear_selection();
+                }
+            }
             // Sideways wheel. A horizontal trackpad swipe (or a tilt wheel)
             // arrives as ScrollLeft/ScrollRight; otherwise it is the normal
             // wheel with a modifier held. Which modifier survives depends on
@@ -1909,6 +3371,76 @@ impl App {
     /// Divider drag: press on the two border columns between the panels and
     /// move to resize. Returns true when the event belonged to the divider
     /// (including every move of an in-flight drag, wherever the pointer is).
+    /// Extend the selection to the pointer, character by character.
+    ///
+    /// The side is pinned to wherever the drag *started*: dragging from
+    /// the old pane into the new one keeps selecting old-side text, which
+    /// is the only reading that makes sense — the two sides are different
+    /// documents.
+    fn drag_to(&mut self, x: u16, y: u16) {
+        let Some(sel) = self.selection else { return };
+        let side = sel.side;
+        let r = self.layout.diff;
+        if y < r.y {
+            self.scroll_diff(-1);
+        } else if y >= r.y + r.height {
+            self.scroll_diff(1);
+        }
+        let r = self.layout.diff;
+        let offset = y.saturating_sub(r.y) as usize;
+        let row = (self.diff_scroll + offset).min(
+            self.diff_scroll
+                .saturating_add(r.height.saturating_sub(1) as usize)
+                .min(self.display.len().saturating_sub(1)),
+        );
+        // Past the last line, the selection runs to the end of the file
+        // rather than stopping dead where the text does.
+        let line = match self.line_on_row(row, side) {
+            Some(line) => line,
+            None => return,
+        };
+        let len = self
+            .side_content(side)
+            .and_then(|c| c.lines().nth(line.saturating_sub(1)))
+            .map(|t| t.chars().count())
+            .unwrap_or(0);
+        // Left of the pane's text is the start of the line, not "no
+        // column" — dragging out to the left selects to the line start.
+        let col = self
+            .diff_col_at(x, side)
+            .and_then(|c| self.char_index(side, line, c))
+            .unwrap_or(0)
+            .min(len);
+        let Some(sel) = &mut self.selection else { return };
+        sel.end = Pos::new(line, col);
+        // Any drag at all means the user is choosing characters, not lines.
+        sel.linewise = false;
+    }
+
+    /// The file line shown on a display row for one side — the vertical
+    /// half of hit-testing, without the side-from-x guessing that
+    /// `diff_pos_at` does (a drag already knows its side).
+    fn line_on_row(&self, row: usize, side: Side) -> Option<usize> {
+        let diff = self.diff.as_ref()?;
+        let DisplayEntry::Line(i) = *self.display.get(row)? else {
+            return None;
+        };
+        let row = match self.view {
+            ViewMode::SideBySide => diff.rows.get(i)?,
+            ViewMode::Inline => {
+                let entry = diff.inline.get(i)?;
+                if entry.side != side {
+                    return None;
+                }
+                diff.rows.get(entry.row)?
+            }
+        };
+        match side {
+            Side::Left => row.old_ln,
+            Side::Right => row.new_ln,
+        }
+    }
+
     fn divider_mouse(&mut self, m: MouseEvent, x: u16, y: u16) -> bool {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) if contains(self.layout.divider, x, y) => {
@@ -1972,8 +3504,12 @@ impl App {
             FileEntry::File { idx, depth } => {
                 // The icon plus its trailing space: a 4-column target.
                 let cb_start = fl.x + depth;
+                // ↺ at the far right of the row, where the counts end.
+                let revert_from = fl.x + fl.width.saturating_sub(REVERT_W);
                 if x >= cb_start && x < cb_start + 4 {
                     self.toggle_file_mark(idx);
+                } else if self.can_revert() && x >= revert_from {
+                    self.ask_revert_file(idx);
                 } else if idx != self.file_cursor {
                     self.spawn_load_file(idx);
                 }
@@ -1981,10 +3517,79 @@ impl App {
         }
     }
 
+    /// Absolute path of a repo-relative path. The repo root is a relative
+    /// path until a repository is opened, so it is resolved first; the
+    /// file itself is not, because a deleted file has nothing on disk to
+    /// resolve and its path is still worth copying.
+    fn abs_path(&self, rel: &str) -> Option<PathBuf> {
+        let root =
+            std::fs::canonicalize(&self.repo_root).unwrap_or_else(|_| self.repo_root.clone());
+        gitops::safe_repo_path(&root, rel)
+    }
+
+    /// Open the right-click menu for the file-panel row at `y`.
+    fn open_path_menu(&mut self, x: u16, y: u16) {
+        let fl = self.layout.file_list;
+        let vis = self.file_scroll + (y - fl.y) as usize;
+        let Some(entry) = self.entries.get(vis) else {
+            return;
+        };
+        let (path, is_dir) = match entry {
+            FileEntry::Dir { path, .. } => (path.clone(), true),
+            FileEntry::File { idx, .. } => match self.files.get(*idx) {
+                Some(f) => (f.path.clone(), false),
+                None => return,
+            },
+        };
+        let mut items = vec![PathMenuItem {
+            key: 'r',
+            label: "Copy relative path",
+            text: path.clone(),
+        }];
+        // A path git cannot express as a plain relative path has no
+        // absolute form worth handing out, so that line is left off.
+        if let Some(abs) = self.abs_path(&path) {
+            items.push(PathMenuItem {
+                key: 'f',
+                label: "Copy full path",
+                text: abs.to_string_lossy().into_owned(),
+            });
+        }
+        self.overlay = Overlay::PathMenu(Box::new(PathMenu {
+            path,
+            is_dir,
+            items,
+            sel: 0,
+            anchor: (x, y),
+        }));
+    }
+
+    /// Copy line `i` of the right-click menu and close it.
+    fn path_menu_copy(&mut self, i: usize) {
+        let Overlay::PathMenu(menu) = &self.overlay else {
+            return;
+        };
+        let Some(item) = menu.items.get(i) else {
+            return;
+        };
+        let text = item.text.clone();
+        self.overlay = Overlay::None;
+        match clipboard::copy(&text) {
+            Ok(via) => self.ok(format!("⧉ Copied {text} to the clipboard via {via}.")),
+            Err(e) => self.err(format!("Couldn't copy: {e:#}")),
+        }
+    }
+
     fn diff_click(&mut self, x: u16, y: u16) {
         // Clicking a fold row expands it.
         let r = self.layout.diff;
         let vis = self.diff_scroll + (y - r.y) as usize;
+        // The change bar down the left edge: anywhere on a section's bar
+        // offers to put that section back.
+        if x < r.x + self.revert_gutter() {
+            self.ask_revert_section(vis);
+            return;
+        }
         if self.toggle_fold_row(vis) {
             return;
         }
@@ -1998,21 +3603,72 @@ impl App {
         let Some((side, line)) = self.diff_pos_at(x, y) else {
             return;
         };
+        // Remember which word was clicked: it makes the next gd / gr / K
+        // unambiguous without needing a column cursor.
+        self.click_word = self.diff_char_at(x, side, line).map(|c| (vis, c));
         if double && side == Side::Right {
             self.open_editor(Some(line));
             return;
         }
+        // A click selects the whole line — the shape commenting wants.
+        // Dragging from here switches to exactly the characters covered
+        // (see the Drag arm in `mouse_review`).
+        let col = self.diff_char_at(x, side, line).unwrap_or(0);
         self.selection = Some(Selection {
             side,
-            anchor: line,
-            end: line,
+            anchor: Pos::new(line, col),
+            end: Pos::new(line, col),
+            linewise: true,
         });
         self.select_mode = false;
         self.drag_select = true;
         let side_name = if side == Side::Right { "new" } else { "old" };
         self.ok(format!(
-            "Selected line {line} ({side_name} side) — drag to extend, then [Comment] or c. Double-click to edit."
+            "Line {line} selected ({side_name}) — drag for text · y copies · c comments"
         ));
+    }
+
+    /// Which pane the pointer is over. Inline view has only one.
+    fn pane_at(&self, x: u16) -> Side {
+        let r = self.diff_body();
+        let lw = (r.width as usize).saturating_sub(1) / 2;
+        if self.view == ViewMode::Inline || (x as usize) < r.x as usize + lw + 1 {
+            Side::Left
+        } else {
+            Side::Right
+        }
+    }
+
+    /// Display column within one pane's body, horizontal scroll included —
+    /// the horizontal half of the mapping [`Self::diff_pos_at`] does
+    /// vertically. `None` when the pointer is left of that body.
+    ///
+    /// The pane is passed in rather than derived from `x` because the two
+    /// callers want different things: a click reads the pane it landed on,
+    /// while a drag stays with the pane it started in even when the
+    /// pointer wanders across the divider.
+    fn diff_col_at(&self, x: u16, pane: Side) -> Option<usize> {
+        let r = self.diff_body();
+        let lw = (r.width as usize).saturating_sub(1) / 2;
+        // Gutters: 5 columns per side, 12 inline.
+        let body_x = match (self.view, pane) {
+            (ViewMode::Inline, _) => r.x as usize + 12,
+            (ViewMode::SideBySide, Side::Left) => r.x as usize + 5,
+            (ViewMode::SideBySide, Side::Right) => r.x as usize + lw + 1 + 5,
+        };
+        Some((x as usize).checked_sub(body_x)? + self.diff_hscroll)
+    }
+
+    /// Char index in a file line, for a display column (tabs expanded).
+    fn char_index(&self, side: Side, line: usize, col: usize) -> Option<usize> {
+        let text = self.side_content(side)?.lines().nth(line.checked_sub(1)?)?;
+        Some(crate::diff::char_at_col(text, col))
+    }
+
+    /// Char index under the pointer, for a click.
+    fn diff_char_at(&self, x: u16, side: Side, line: usize) -> Option<usize> {
+        let col = self.diff_col_at(x, self.pane_at(x))?;
+        self.char_index(side, line, col)
     }
 
     /// Map a screen position inside the diff area to (side, file line).
@@ -2029,7 +3685,8 @@ impl App {
         match self.view {
             ViewMode::SideBySide => {
                 let row = diff.rows.get(i)?;
-                let mid = r.x + r.width / 2;
+                let body = self.diff_body();
+                let mid = body.x + body.width / 2;
                 let clicked_left = x < mid;
                 use crate::diff::RowKind::*;
                 if clicked_left {
@@ -2242,7 +3899,8 @@ impl App {
         };
         if let Some(line) = self.cursor_line_on(side) {
             if let Some(sel) = &mut self.selection {
-                sel.end = line;
+                sel.end = Pos::new(line, 0);
+                sel.linewise = true;
             }
         }
     }
@@ -2258,11 +3916,7 @@ impl App {
             self.err("Nothing selectable on this row.");
             return;
         };
-        self.selection = Some(Selection {
-            side,
-            anchor: line,
-            end: line,
-        });
+        self.selection = Some(Selection::lines(side, line, line));
         self.select_mode = true;
         let which = if side == Side::Right { "new" } else { "old" };
         self.ok(format!(
@@ -2311,9 +3965,9 @@ impl App {
                 });
             }
             None => self.err(if forward {
-                "No more changes below — n for the next file."
+                "No more changes below — ] for the next file."
             } else {
-                "No more changes above — p for the previous file."
+                "No more changes above — [ for the previous file."
             }),
         }
     }
@@ -2378,7 +4032,7 @@ impl App {
     /// Columns available for line *text* in the diff pane — what the
     /// horizontal offset is measured against. The gutters don't scroll.
     pub fn diff_body_w(&self) -> usize {
-        let w = self.layout.diff.width as usize;
+        let w = self.diff_body().width as usize;
         match self.view {
             // Two panes split by one divider column, each with a 5-column
             // line-number gutter.
@@ -2486,6 +4140,1138 @@ impl App {
         }
     }
 
+    // ---------------------------------------------------------------- finder
+
+    /// Paths of the changeset under review — the default search scope.
+    fn changeset_paths(&self) -> Vec<String> {
+        self.files.iter().map(|f| f.path.clone()).collect()
+    }
+
+    /// The commit a search should read. In local review that's the working
+    /// tree (`None`); in PR review it's the head commit, because the tree
+    /// on disk may be a different branch entirely — and even when it isn't,
+    /// the commit is what the diff on screen is showing.
+    fn search_rev(&self) -> Option<String> {
+        if self.local {
+            return None;
+        }
+        self.pr
+            .as_ref()
+            .map(|p| p.head_ref_oid.clone())
+            .filter(|oid| !oid.is_empty())
+    }
+
+    /// Definitions in the open file, for the `@` mode.
+    fn current_symbols(&self) -> (Vec<search::Symbol>, String) {
+        let Some(file) = self.files.get(self.file_cursor) else {
+            return (Vec::new(), String::new());
+        };
+        let content = self.new_content.as_ref().or(self.old_content.as_ref());
+        let syms = content
+            .map(|c| search::symbols(&file.path, c))
+            .unwrap_or_default();
+        (syms, file.path.clone())
+    }
+
+    pub fn open_finder(&mut self, mode: FinderMode) {
+        if self.editor.is_some() {
+            self.err("Close the editor first (Ctrl+S saves, Esc closes).");
+            return;
+        }
+        let (symbols, symbol_path) = self.current_symbols();
+        let finder = Finder::new(mode, self.changeset_paths(), symbols, symbol_path);
+        self.overlay = Overlay::Finder(Box::new(finder));
+        self.refresh_finder();
+        if mode == FinderMode::Symbols {
+            // Pattern matches show instantly; the language server's
+            // better answer replaces them when it arrives.
+            self.spawn_lsp_symbols();
+        }
+        self.ok(match mode {
+            FinderMode::Files => "Type to filter files · # searches inside them · @ lists symbols",
+            FinderMode::Grep => "Type to search inside every changed file · Tab widens to the repo",
+            FinderMode::Symbols => "Type to jump to a definition in this file",
+            FinderMode::Refs | FinderMode::Pick => "Type to filter · Enter chooses",
+        });
+    }
+
+    /// Recompute the finder's rows, and fetch the repository file list if
+    /// the scope now needs one.
+    fn refresh_finder(&mut self) {
+        let need_files = {
+            let Overlay::Finder(f) = &mut self.overlay else {
+                return;
+            };
+            f.rebuild();
+            f.mode == FinderMode::Files && f.repo_scope && f.repo_files.is_none()
+        };
+        if need_files && self.search_job.is_none() {
+            self.spawn_repo_files();
+        }
+    }
+
+    /// Start the debounced query if its quiet period has passed.
+    fn maybe_spawn_search(&mut self) -> bool {
+        let ready = match &self.overlay {
+            Overlay::Finder(f) => match &f.pending {
+                Some((q, at)) if at.elapsed() >= SEARCH_DEBOUNCE => {
+                    Some((q.clone(), f.repo_scope, f.regex))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((query, repo_scope, regex)) = ready else {
+            return false;
+        };
+        if let Overlay::Finder(f) = &mut self.overlay {
+            f.pending = None;
+        }
+        self.spawn_grep(query, repo_scope, regex);
+        true
+    }
+
+    fn spawn_grep(&mut self, query: String, repo_scope: bool, regex: bool) {
+        self.search_gen += 1;
+        let gen = self.search_gen;
+        let req = search::GrepRequest {
+            root: self.repo_root.clone(),
+            query: query.clone(),
+            rev: self.search_rev(),
+            paths: if repo_scope {
+                Vec::new()
+            } else {
+                self.changeset_paths()
+            },
+            regex,
+            // Only a working-tree search can see files git doesn't know
+            // about yet — which is exactly when they matter.
+            untracked: self.local,
+        };
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(search::grep(&req).map(|(hits, truncated)| SearchOutcome::Grep {
+                hits,
+                truncated,
+                query,
+            }));
+        });
+        self.search_job = Some(SearchJob {
+            rx,
+            gen,
+            started: Instant::now(),
+        });
+    }
+
+    fn spawn_repo_files(&mut self) {
+        self.search_gen += 1;
+        let gen = self.search_gen;
+        let root = self.repo_root.clone();
+        let rev = self.search_rev();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(search::list_files(&root, rev.as_deref()).map(SearchOutcome::Files));
+        });
+        self.search_job = Some(SearchJob {
+            rx,
+            gen,
+            started: Instant::now(),
+        });
+    }
+
+    /// Apply a finished query — unless the user has typed past it.
+    fn apply_search(&mut self, gen: u64, outcome: SearchOutcome) {
+        if gen != self.search_gen {
+            return;
+        }
+        let Overlay::Finder(f) = &mut self.overlay else {
+            return;
+        };
+        match outcome {
+            SearchOutcome::Grep {
+                hits,
+                truncated,
+                query,
+            } => {
+                let total = hits.len();
+                f.rows = hits
+                    .into_iter()
+                    .map(|h| {
+                        let in_changeset = f.changeset.contains(&h.path);
+                        FinderRow {
+                            line: Some(h.line),
+                            text: h.text.trim_end().to_string(),
+                            range: (h.len > 0).then_some((h.col, h.col + h.len)),
+                            tag: if h.definition {
+                                "def"
+                            } else if in_changeset {
+                                "changed"
+                            } else {
+                                ""
+                            },
+                            path: h.path,
+                            matched: Vec::new(),
+                            in_changeset,
+                            pick: None,
+                        }
+                    })
+                    .collect();
+                // Definitions first, then hits in files under review. A
+                // stable sort keeps git's path ordering inside each group.
+                f.rows
+                    .sort_by_key(|r| (r.tag != "def", !r.in_changeset));
+                f.sel = 0;
+                f.scroll = 0;
+                let scope = if f.repo_scope {
+                    "the repository"
+                } else {
+                    "changed files"
+                };
+                f.note = if total == 0 {
+                    format!(
+                        "No match for “{query}” in {scope}.{}",
+                        if f.repo_scope {
+                            ""
+                        } else {
+                            " Tab searches the whole repo."
+                        }
+                    )
+                } else {
+                    format!(
+                        "{total}{} match{} in {scope} · Tab {}",
+                        if truncated { "+" } else { "" },
+                        if total == 1 { "" } else { "es" },
+                        if f.repo_scope {
+                            "back to changed files"
+                        } else {
+                            "widens to the repo"
+                        }
+                    )
+                };
+            }
+            SearchOutcome::Files(list) => {
+                f.repo_files = Some(list);
+                f.rebuild();
+            }
+            SearchOutcome::Symbols(syms) => {
+                // The language server knows more than the pattern matcher
+                // ever will — take its answer over ours.
+                let path = f.symbol_path.clone();
+                f.symbols = syms
+                    .into_iter()
+                    .map(|s| search::Symbol {
+                        line: s.line,
+                        kind: s.kind,
+                        text: match &s.container {
+                            Some(c) if !c.is_empty() => format!("{c}.{}", s.name),
+                            _ => s.name.clone(),
+                        },
+                        name: s.name,
+                    })
+                    .collect();
+                let n = f.symbols.len();
+                f.rebuild();
+                f.note = format!("{n} symbols in {path} · from the language server");
+            }
+        }
+    }
+
+    fn finder_key(&mut self, key: KeyEvent) {
+        // Anything that closes the overlay is decided up front, so the
+        // borrow of the finder is over before it runs.
+        match key.code {
+            KeyCode::Esc => {
+                self.overlay = Overlay::None;
+                self.ok("Search closed.");
+                return;
+            }
+            KeyCode::Enter => {
+                // In "which symbol?" mode the row picks a target for a
+                // pending request rather than a place to go.
+                let chosen = match &self.overlay {
+                    Overlay::Finder(f) => f.rows.get(f.sel).and_then(|r| r.pick).and_then(|i| {
+                        f.pending_action
+                            .map(|action| (action, f.targets.get(i).cloned()))
+                    }),
+                    _ => None,
+                };
+                if let Some((action, target)) = chosen {
+                    self.overlay = Overlay::None;
+                    match target {
+                        Some(t) => self.spawn_lsp(action, t),
+                        None => self.err("That symbol is no longer available."),
+                    }
+                    return;
+                }
+                let pick = match &self.overlay {
+                    Overlay::Finder(f) => f.rows.get(f.sel).map(|r| (r.path.clone(), r.line)),
+                    _ => None,
+                };
+                match pick {
+                    Some((path, line)) => self.open_hit(path, line),
+                    None => self.err("No results — nothing to open."),
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let mut changed = false;
+        {
+            let Overlay::Finder(f) = &mut self.overlay else {
+                return;
+            };
+            let page = FINDER_ROWS as i32;
+            match (key.code, ctrl) {
+                (KeyCode::Up, _) | (KeyCode::Char('p'), true) => f.move_sel(-1),
+                (KeyCode::Down, _) | (KeyCode::Char('n'), true) => f.move_sel(1),
+                (KeyCode::PageUp, _) => f.move_sel(-page),
+                (KeyCode::PageDown, _) => f.move_sel(page),
+                (KeyCode::Left, _) => f.cursor = f.cursor.saturating_sub(1),
+                (KeyCode::Right, _) => f.cursor = (f.cursor + 1).min(f.input.chars().count()),
+                (KeyCode::Home, _) => f.cursor = 0,
+                (KeyCode::End, _) => f.cursor = f.input.chars().count(),
+                (KeyCode::Char('u'), true) => {
+                    f.input.clear();
+                    f.cursor = 0;
+                    changed = true;
+                }
+                (KeyCode::Char('w'), true) => {
+                    f.delete_word();
+                    changed = true;
+                }
+                (KeyCode::Char('r'), true) => {
+                    f.regex = !f.regex;
+                    changed = true;
+                }
+                (KeyCode::Tab, _) => {
+                    f.repo_scope = !f.repo_scope;
+                    changed = true;
+                }
+                (KeyCode::Backspace, _) => {
+                    // Rubbing out the prefix returns to plain file matching.
+                    if f.input.is_empty() && f.mode != FinderMode::Files {
+                        f.mode = FinderMode::Files;
+                    } else {
+                        f.backspace();
+                    }
+                    changed = true;
+                }
+                (KeyCode::Char(c), false) => {
+                    // A prefix character only means "switch mode" as the
+                    // very first thing typed — after that it's just text.
+                    match c {
+                        '#' if f.input.is_empty() => f.mode = FinderMode::Grep,
+                        '@' if f.input.is_empty() => f.mode = FinderMode::Symbols,
+                        _ => f.insert(c),
+                    }
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        if changed {
+            self.refresh_finder();
+        }
+    }
+
+    fn finder_mouse(&mut self, m: MouseEvent, x: u16, y: u16) {
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                if let Overlay::Finder(f) = &mut self.overlay {
+                    f.move_sel(3);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Overlay::Finder(f) = &mut self.overlay {
+                    f.move_sel(-3);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => match self.layout.button_at(x, y) {
+                Some(ButtonId::FinderRow(i)) => {
+                    let pick = match &mut self.overlay {
+                        Overlay::Finder(f) => {
+                            f.sel = i.min(f.rows.len().saturating_sub(1));
+                            f.rows.get(f.sel).map(|r| (r.path.clone(), r.line))
+                        }
+                        _ => None,
+                    };
+                    if let Some((path, line)) = pick {
+                        self.open_hit(path, line);
+                    }
+                }
+                Some(ButtonId::FinderMode(mode)) => {
+                    if let Overlay::Finder(f) = &mut self.overlay {
+                        f.mode = mode;
+                    }
+                    self.refresh_finder();
+                }
+                Some(ButtonId::FinderScope) => {
+                    if let Overlay::Finder(f) = &mut self.overlay {
+                        f.repo_scope = !f.repo_scope;
+                    }
+                    self.refresh_finder();
+                }
+                Some(ButtonId::FinderClose) => self.overlay = Overlay::None,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Go to a search result: the file if it's under review, the editor
+    /// if it isn't.
+    fn open_hit(&mut self, path: String, line: Option<usize>) {
+        self.overlay = Overlay::None;
+        // Already looking at it.
+        if self.files.get(self.file_cursor).map(|f| f.path.as_str()) == Some(path.as_str())
+            && self.diff.is_some()
+        {
+            if let Some(l) = line {
+                self.jump_to_line(l);
+            }
+            return;
+        }
+        if let Some(idx) = self.files.iter().position(|f| f.path == path) {
+            self.pending_jump = line;
+            self.spawn_load_file(idx);
+            return;
+        }
+        self.spawn_open_external(path, line);
+    }
+
+    /// Open a file that is not part of the changeset — the other half of
+    /// a search that can reach the whole repository, and where a jump to a
+    /// definition in untouched code lands.
+    ///
+    /// The working tree is preferred, because that is the copy an edit
+    /// would change. When the branch under review isn't checked out the
+    /// tree belongs to some other branch, so the commit's text is shown
+    /// instead and the editor refuses to write it back.
+    fn spawn_open_external(&mut self, path: String, line: Option<usize>) {
+        if self.editor.is_some() {
+            self.err("Close the editor first (Ctrl+S saves, Esc closes).");
+            return;
+        }
+        let root = self.repo_root.clone();
+        let rev = self.search_rev();
+        // In local review the working tree *is* what is under review.
+        let tree_is_review = self.local || self.checked_out;
+        let label = format!("Opening {path}");
+        self.spawn(label, true, false, move || {
+            let Some(abs_path) = gitops::safe_repo_path(&root, &path) else {
+                anyhow::bail!("Refusing to open “{path}” — unsafe path.");
+            };
+            // Same rule as the diff editor: never open (and so never save)
+            // through a symlink, which a PR could have planted.
+            if is_symlink(&abs_path) {
+                anyhow::bail!("“{path}” is a symlink — refusing to open through it.");
+            }
+            let on_disk = tree_is_review
+                .then(|| std::fs::read_to_string(&abs_path).ok())
+                .flatten();
+            let (content, read_only) = match on_disk {
+                Some(text) => (text, false),
+                None => {
+                    let from_commit = match &rev {
+                        Some(rev) => gitops::show_file(rev, &path),
+                        None => gitops::head_oid().and_then(|oid| gitops::show_file(&oid, &path)),
+                    };
+                    match from_commit {
+                        Some(text) => (text, true),
+                        None => anyhow::bail!("Cannot read {path}."),
+                    }
+                }
+            };
+            Ok(Outcome::ExternalOpened(Box::new(ExternalFile {
+                path,
+                abs_path,
+                content,
+                line,
+                read_only,
+            })))
+        });
+    }
+
+    // ------------------------------------------------- the editor's server
+
+    /// Ask the editor's language server something, off the UI thread.
+    /// Any in-flight request is superseded — the newest question is the
+    /// only one whose answer still matters.
+    fn spawn_editor_request(&mut self, what: EditorRequest) {
+        if !self.lsp_enabled {
+            if what.is_explicit() {
+                self.err("Language servers are off (`language_servers = false` in your config).");
+            }
+            return;
+        }
+        let Some(editor) = &self.editor else { return };
+        if lsp::Lsp::supports(&editor.path).is_none() {
+            if what.is_explicit() {
+                self.err(format!(
+                    "No language server for {} — loupe drives TypeScript, Go and Rust.",
+                    editor.path
+                ));
+            }
+            return;
+        }
+        let text = editor.content();
+        let path = editor.path.clone();
+        let at = editor.cursor_pos();
+        let word = editor.word_at_cursor();
+        let lsp = self.lsp.clone();
+        let root = self.repo_root.clone();
+        self.editor_gen += 1;
+        let gen = self.editor_gen;
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = match what {
+                EditorRequest::Complete => lsp
+                    .complete(&root, &path, &text, at)
+                    .map(EditorOutcome::Completions),
+                EditorRequest::Hover => lsp
+                    .hover(&root, &path, &text, at)
+                    .map(|text| EditorOutcome::Hover { word, text }),
+                EditorRequest::Definition => lsp
+                    .definition(&root, &path, &text, at)
+                    .map(|locs| EditorOutcome::Definition { word, locs }),
+                EditorRequest::Format => lsp
+                    .format(&root, &path, &text, crate::diff::TAB_WIDTH)
+                    .map(EditorOutcome::Formatted),
+            };
+            let _ = tx.send(result);
+        });
+        self.editor_job = Some(EditorJob { rx, gen });
+    }
+
+    fn apply_editor_outcome(&mut self, gen: u64, outcome: EditorOutcome) {
+        // Typed past it: the answer is about text that no longer exists.
+        if gen != self.editor_gen {
+            return;
+        }
+        match outcome {
+            EditorOutcome::Completions(items) => {
+                let n = items.len();
+                let Some(editor) = &mut self.editor else { return };
+                if !editor.open_completion(items) && n > 0 {
+                    // Everything was filtered out by what was typed while
+                    // the request was in flight.
+                    self.ok("No matching completions.");
+                }
+            }
+            EditorOutcome::Hover { word, text } => match text {
+                Some(text) => {
+                    self.ok(format!("{word} — Esc closes."));
+                    self.overlay = Overlay::Hover(Box::new(HoverPanel {
+                        word,
+                        lines: text.lines().map(str::to_string).collect(),
+                    }));
+                }
+                None => self.err(format!("Nothing known about {word}.")),
+            },
+            EditorOutcome::Definition { word, locs } => {
+                let Some(loc) = locs.into_iter().next() else {
+                    self.err(format!("No definition found for {word}."));
+                    return;
+                };
+                // Jumping inside the open file keeps the buffer (and any
+                // unsaved edits); anywhere else has to leave it first.
+                let same = self.editor.as_ref().is_some_and(|e| e.path == loc.path);
+                if same {
+                    if let Some(editor) = &mut self.editor {
+                        editor.jump_to_line(loc.line);
+                    }
+                    self.ok(format!("{word} — line {}.", loc.line));
+                    return;
+                }
+                if self.editor.as_ref().is_some_and(|e| e.dirty) {
+                    self.err(format!(
+                        "{word} is defined in {} — save (Ctrl+S) or discard first.",
+                        loc.path
+                    ));
+                    return;
+                }
+                self.editor = None;
+                self.open_hit(loc.path, Some(loc.line));
+            }
+            EditorOutcome::Formatted(edits) => {
+                let Some(edits) = edits else {
+                    self.err("This language server does not format.".to_string());
+                    return;
+                };
+                let pending = std::mem::take(&mut self.format_then_save);
+                let changed = self
+                    .editor
+                    .as_mut()
+                    .map(|e| e.apply_edits(&edits))
+                    .unwrap_or(false);
+                if pending {
+                    // Formatting was a step on the way to saving.
+                    self.spawn_save_editor();
+                } else if changed {
+                    self.ok("Formatted — Ctrl+Z puts it back.");
+                } else {
+                    self.ok("Already formatted.");
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ clipboard
+
+    /// The lines a copy would take: the selection if there is one,
+    /// otherwise the cursor row. Returns the text and a description of
+    /// what it was, for the status line.
+    fn copy_target(&self) -> Option<(String, String)> {
+        // Nothing selected: the cursor line, whole.
+        let sel = match self.selection {
+            Some(sel) => sel,
+            None => {
+                let (side, line) = self.cursor_pos()?;
+                Selection::lines(side, line, line)
+            }
+        };
+        // The text comes from the side the selection is on — which is what
+        // makes copying *deleted* code work at all: the old side's text is
+        // still here, and it is what gets copied.
+        let content = self.side_content(sel.side)?;
+        let text = sel.text(content);
+        if text.is_empty() {
+            return None;
+        }
+        let (lo, hi) = sel.range();
+        let which = if sel.side == Side::Left {
+            "removed"
+        } else {
+            "new"
+        };
+        let what = if !sel.linewise {
+            let chars = text.chars().filter(|c| *c != '\n').count();
+            format!("{chars} characters ({which} side)")
+        } else if lo == hi {
+            format!("line {lo} ({which} side)")
+        } else {
+            format!("{} lines ({which} side)", hi + 1 - lo)
+        };
+        Some((text, what))
+    }
+
+    /// `y` / Ctrl+C / the ⧉ Copy button.
+    pub fn yank(&mut self) {
+        let Some((text, what)) = self.copy_target() else {
+            self.err("Nothing to copy — click or drag over the lines you want, or press V.");
+            return;
+        };
+        match clipboard::copy(&text) {
+            Ok(via) => self.ok(format!("⧉ Copied {what} to the clipboard via {via}.")),
+            Err(e) => self.err(format!("Couldn't copy: {e:#}")),
+        }
+    }
+
+    // ------------------------------------------------------ language servers
+
+    /// The full text of the file on one side of the diff — what gets
+    /// handed to the language server, so it analyses what is on screen
+    /// rather than what happens to be on disk.
+    fn side_content(&self, side: Side) -> Option<&String> {
+        match side {
+            Side::Right => self.new_content.as_ref(),
+            Side::Left => self.old_content.as_ref(),
+        }
+    }
+
+    /// Symbols on the cursor row that could be asked about. A click on a
+    /// word wins outright — that is an unambiguous "this one".
+    fn targets_on_cursor_row(&self) -> Vec<Target> {
+        let Some(file) = self.files.get(self.file_cursor) else {
+            return Vec::new();
+        };
+        let Some((side, line)) = self.cursor_pos() else {
+            return Vec::new();
+        };
+        let Some(content) = self.side_content(side) else {
+            return Vec::new();
+        };
+        let Some(text) = content.lines().nth(line.saturating_sub(1)) else {
+            return Vec::new();
+        };
+        let make = |col: usize, word: String| Target {
+            path: file.path.clone(),
+            line,
+            col: col + 1,
+            word,
+            side,
+        };
+        // A word the mouse landed on, if the click was on this very row.
+        if let Some((idx, char_col)) = self.click_word {
+            if idx == self.diff_cursor {
+                if let Some((start, word)) = search::word_at(text, char_col) {
+                    return vec![make(start, word)];
+                }
+            }
+        }
+        search::identifiers(text)
+            .into_iter()
+            .map(|(col, word)| make(col, word))
+            .collect()
+    }
+
+    /// `gd` / `gr` / `K`. One symbol on the line goes straight through;
+    /// several open the picker rather than guessing.
+    pub fn lsp_action(&mut self, action: LspAction) {
+        if !self.lsp_enabled {
+            self.err("Language servers are off (`language_servers = false` in your config).");
+            return;
+        }
+        let targets = self.targets_on_cursor_row();
+        match targets.len() {
+            0 => self.err(format!(
+                "No symbol on this line to find the {}.",
+                action.verb()
+            )),
+            1 => self.spawn_lsp(action, targets[0].clone()),
+            _ => self.open_pick(action, targets),
+        }
+    }
+
+    /// Ask which symbol on the line was meant, then do the thing.
+    fn open_pick(&mut self, action: LspAction, targets: Vec<Target>) {
+        let (symbols, symbol_path) = self.current_symbols();
+        let mut finder = Finder::new(
+            FinderMode::Pick,
+            self.changeset_paths(),
+            symbols,
+            symbol_path,
+        );
+        finder.preset = targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| FinderRow {
+                path: t.path.clone(),
+                line: None,
+                text: t.word.clone(),
+                matched: Vec::new(),
+                range: None,
+                tag: "",
+                in_changeset: true,
+                pick: Some(i),
+            })
+            .collect();
+        finder.targets = targets;
+        finder.pending_action = Some(action);
+        finder.mode = FinderMode::Pick;
+        self.overlay = Overlay::Finder(Box::new(finder));
+        self.refresh_finder();
+        self.ok(format!(
+            "Several symbols on this line — pick the one to find the {}.",
+            action.verb()
+        ));
+    }
+
+    fn spawn_lsp(&mut self, action: LspAction, target: Target) {
+        let Some(text) = self.side_content(target.side).cloned() else {
+            self.err("This side of the diff has no content to analyse.");
+            return;
+        };
+        if lsp::Lsp::supports(&target.path).is_none() {
+            self.err(format!(
+                "No language server for {} — {} works in TypeScript, Go and Rust.",
+                target.path,
+                match action {
+                    LspAction::Hover => "hover",
+                    LspAction::Definition => "go to definition",
+                    LspAction::References => "find references",
+                }
+            ));
+            return;
+        }
+        let lsp = self.lsp.clone();
+        let root = self.repo_root.clone();
+        let rev = self.search_rev();
+        let at = (target.line, target.col);
+        let word = target.word.clone();
+        let path = target.path.clone();
+        let label = format!("Finding the {} {}", action.verb(), word);
+        self.spawn(label, true, false, move || match action {
+            LspAction::Hover => {
+                let text = lsp.hover(&root, &path, &text, at)?;
+                Ok(Outcome::Hover(Box::new(HoverData { word, text })))
+            }
+            LspAction::Definition | LspAction::References => {
+                let locs = if action == LspAction::Definition {
+                    lsp.definition(&root, &path, &text, at)?
+                } else {
+                    lsp.references(&root, &path, &text, at)?
+                };
+                // The positions alone would make an unreadable list; read
+                // the line each one points at, once per file.
+                let mut cache: HashMap<String, Option<String>> = HashMap::new();
+                let places = locs
+                    .into_iter()
+                    .take(search::RESULT_LIMIT)
+                    .map(|loc| {
+                        let content = cache
+                            .entry(loc.path.clone())
+                            .or_insert_with(|| read_source(&root, rev.as_deref(), &loc.path));
+                        let line = content
+                            .as_ref()
+                            .and_then(|c| c.lines().nth(loc.line.saturating_sub(1)))
+                            .unwrap_or("");
+                        // The server counts columns in UTF-16 units; the
+                        // rest of loupe counts chars.
+                        let loc = lsp::Loc {
+                            col: lsp::char_column(line, loc.col.saturating_sub(1)) + 1,
+                            ..loc
+                        };
+                        Place {
+                            loc,
+                            text: line.trim_end().to_string(),
+                        }
+                    })
+                    .collect();
+                Ok(Outcome::Locations(Box::new(LocationsData {
+                    action,
+                    word,
+                    places,
+                })))
+            }
+        });
+    }
+
+    /// Ask the language server for this file's symbols, replacing the
+    /// pattern-matched ones in the open finder when the answer lands.
+    fn spawn_lsp_symbols(&mut self) {
+        if !self.lsp_enabled {
+            return;
+        }
+        let Some(file) = self.files.get(self.file_cursor).cloned() else {
+            return;
+        };
+        let Some(spec) = lsp::Lsp::supports(&file.path) else {
+            return;
+        };
+        // Don't start a job that can only end in "not installed".
+        if lsp::which(spec.cmd).is_none() {
+            if let Overlay::Finder(f) = &mut self.overlay {
+                f.note = format!(
+                    "{} · pattern matching ({} not installed)",
+                    f.note, spec.cmd
+                );
+            }
+            return;
+        }
+        let Some(text) = self.new_content.clone().or_else(|| self.old_content.clone()) else {
+            return;
+        };
+        self.search_gen += 1;
+        let gen = self.search_gen;
+        let lsp = self.lsp.clone();
+        let root = self.repo_root.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(
+                lsp.symbols(&root, &file.path, &text)
+                    .map(SearchOutcome::Symbols),
+            );
+        });
+        self.search_job = Some(SearchJob {
+            rx,
+            gen,
+            started: Instant::now(),
+        });
+    }
+
+    /// Show the answer to `gd` / `gr`.
+    fn apply_locations(&mut self, d: LocationsData) {
+        let n = d.places.len();
+        if n == 0 {
+            self.err(format!(
+                "No {} {} found. If the server just started it may still be indexing — try again.",
+                d.action.verb(),
+                d.word
+            ));
+            return;
+        }
+        // One answer is not a list: go there.
+        if n == 1 && d.action == LspAction::Definition {
+            let place = &d.places[0];
+            let (path, line) = (place.loc.path.clone(), place.loc.line);
+            self.open_hit(path, Some(line));
+            return;
+        }
+        let changeset = self.changeset_paths();
+        let (symbols, symbol_path) = self.current_symbols();
+        let mut finder = Finder::new(FinderMode::Refs, changeset.clone(), symbols, symbol_path);
+        finder.preset = d
+            .places
+            .iter()
+            .map(|p| {
+                let in_changeset = changeset.contains(&p.loc.path);
+                FinderRow {
+                    path: p.loc.path.clone(),
+                    line: Some(p.loc.line),
+                    text: p.text.clone(),
+                    matched: Vec::new(),
+                    range: search::find_ranges(&p.text, &d.word).first().copied(),
+                    tag: if in_changeset { "changed" } else { "" },
+                    in_changeset,
+                    pick: None,
+                }
+            })
+            .collect();
+        finder.note = format!(
+            "{n} {} {} · Enter opens · type to filter",
+            if n == 1 { "place uses" } else { "places use" },
+            d.word
+        );
+        self.overlay = Overlay::Finder(Box::new(finder));
+        self.refresh_finder();
+        // rebuild() overwrites the note only when a filter is typed.
+        if let Overlay::Finder(f) = &mut self.overlay {
+            f.note = format!(
+                "{n} {} “{}” · Enter opens · type to filter",
+                if d.action == LspAction::Definition {
+                    "definitions of"
+                } else if n == 1 {
+                    "reference to"
+                } else {
+                    "references to"
+                },
+                d.word
+            );
+        }
+        self.ok(format!("{n} results for {}.", d.word));
+    }
+
+    // ------------------------------------------------------- jumping to a line
+
+    /// Display row showing diff row `row`, if it is currently visible.
+    fn display_index_of_row(&self, row: usize) -> Option<usize> {
+        match self.view {
+            ViewMode::SideBySide => self
+                .display
+                .iter()
+                .position(|e| matches!(e, DisplayEntry::Line(i) if *i == row)),
+            ViewMode::Inline => {
+                let diff = self.diff.as_ref()?;
+                // Prefer the new side of a modified row — that's the one a
+                // search result's line number refers to.
+                let entry = diff
+                    .inline
+                    .iter()
+                    .position(|e| e.row == row && e.side == Side::Right)
+                    .or_else(|| diff.inline.iter().position(|e| e.row == row))?;
+                self.display
+                    .iter()
+                    .position(|e| matches!(e, DisplayEntry::Line(i) if *i == entry))
+            }
+        }
+    }
+
+    /// Put the cursor on a diff row, expanding the fold hiding it first.
+    /// Landing *inside* a collapsed section is the whole reason this isn't
+    /// a plain `cursor_to`.
+    fn reveal_row(&mut self, row: usize) {
+        if self.display_index_of_row(row).is_none() {
+            if let Some(start) = self.diff.as_ref().and_then(|d| d.fold_start_for(row)) {
+                self.expanded_folds.insert(start);
+                self.rebuild_display();
+            }
+        }
+        let Some(idx) = self.display_index_of_row(row) else {
+            return;
+        };
+        self.diff_cursor = idx;
+        self.center_cursor();
+        self.extend_selection();
+    }
+
+    /// Scroll so the cursor sits a third of the way down — near enough to
+    /// the middle to show context, high enough to read forward.
+    fn center_cursor(&mut self) {
+        let h = self.diff_page();
+        let max = self.display.len().saturating_sub(h);
+        self.diff_scroll = self.diff_cursor.saturating_sub(h / 3).min(max);
+        self.ensure_cursor_visible();
+    }
+
+    /// Jump to a file line number (new side first, then old).
+    pub fn jump_to_line(&mut self, line: usize) {
+        let row = {
+            let Some(diff) = &self.diff else { return };
+            diff.rows
+                .iter()
+                .position(|r| r.new_ln == Some(line))
+                .or_else(|| diff.rows.iter().position(|r| r.old_ln == Some(line)))
+        };
+        match row {
+            Some(row) => self.reveal_row(row),
+            None => self.err(format!(
+                "Line {line} isn't in this view — it may only exist on the other side of the diff."
+            )),
+        }
+    }
+
+    // -------------------------------------------------- in-diff search (`/`)
+
+    pub fn start_find(&mut self) {
+        if self.diff.is_none() {
+            self.err("Open a file first — / searches the diff you're reading.");
+            return;
+        }
+        self.find.typing = true;
+        self.find.origin = (self.diff_scroll, self.diff_cursor);
+        self.find.query.clear();
+        self.find.rows.clear();
+        self.ok("/");
+    }
+
+    /// Keystrokes while the `/` prompt is open.
+    fn find_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                let (scroll, cursor) = self.find.origin;
+                self.find.typing = false;
+                self.find.query.clear();
+                self.find.rows.clear();
+                self.diff_scroll = scroll;
+                self.diff_cursor = cursor;
+                self.ok("Search cancelled.");
+            }
+            KeyCode::Enter => {
+                self.find.typing = false;
+                if self.find.query.is_empty() {
+                    self.ok("Search cleared.");
+                } else if self.find.rows.is_empty() {
+                    self.err(format!(
+                        "No match for “{}” in this file — # searches every file.",
+                        self.find.query
+                    ));
+                } else {
+                    let n = self.find.rows.len();
+                    self.ok(format!(
+                        "{n} match{} — n / N step through them, Esc clears.",
+                        if n == 1 { "" } else { "es" }
+                    ));
+                }
+            }
+            KeyCode::Backspace => {
+                self.find.query.pop();
+                self.refresh_find();
+            }
+            KeyCode::Char(c) => {
+                self.find.query.push(c);
+                self.refresh_find();
+            }
+            _ => {}
+        }
+    }
+
+    /// Re-scan for matches and jump to the first one at or after where the
+    /// search started, so the view follows the query as it's typed.
+    fn refresh_find(&mut self) {
+        self.recompute_matches();
+        let (_, origin_cursor) = self.find.origin;
+        let from = self
+            .display
+            .get(origin_cursor)
+            .map(|e| self.entry_row(*e))
+            .unwrap_or(0);
+        let next = self
+            .find
+            .rows
+            .iter()
+            .position(|r| *r >= from)
+            .or(if self.find.rows.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
+        match next {
+            Some(i) => {
+                self.find.at = i;
+                let row = self.find.rows[i];
+                self.reveal_row(row);
+            }
+            None => {
+                let (scroll, cursor) = self.find.origin;
+                self.diff_scroll = scroll;
+                self.diff_cursor = cursor;
+            }
+        }
+    }
+
+    /// Rows of the open diff containing the search text. Recomputed
+    /// whenever the query or the file changes — never per frame.
+    pub fn recompute_matches(&mut self) {
+        self.find.rows.clear();
+        self.find.at = 0;
+        if self.find.query.is_empty() {
+            return;
+        }
+        let query = self.find.query.clone();
+        let Some(diff) = &self.diff else { return };
+        let mut rows = Vec::new();
+        for (i, row) in diff.rows.iter().enumerate() {
+            let hit = [row.old_text.as_deref(), row.new_text.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|t| !search::find_ranges(t, &query).is_empty());
+            if hit {
+                rows.push(i);
+            }
+        }
+        self.find.rows = rows;
+    }
+
+    /// `n` / `N`: step to the next or previous match, wrapping.
+    pub fn goto_match(&mut self, forward: bool) {
+        if !self.find.active() {
+            self.err("No search yet — press / to search this file, # to search every file.");
+            return;
+        }
+        if self.find.rows.is_empty() {
+            self.err(format!(
+                "No match for “{}” in this file.",
+                self.find.query
+            ));
+            return;
+        }
+        let cur = self
+            .display
+            .get(self.diff_cursor)
+            .map(|e| self.entry_row(*e))
+            .unwrap_or(0);
+        let (idx, wrapped) = if forward {
+            match self.find.rows.iter().position(|r| *r > cur) {
+                Some(i) => (i, false),
+                None => (0, true),
+            }
+        } else {
+            match self.find.rows.iter().rposition(|r| *r < cur) {
+                Some(i) => (i, false),
+                None => (self.find.rows.len() - 1, true),
+            }
+        };
+        self.find.at = idx;
+        let row = self.find.rows[idx];
+        self.reveal_row(row);
+        self.ok(format!(
+            "Match {} of {}{}",
+            idx + 1,
+            self.find.rows.len(),
+            if wrapped { " (wrapped)" } else { "" }
+        ));
+    }
+
+    fn clear_find(&mut self) {
+        self.find.query.clear();
+        self.find.rows.clear();
+        self.find.at = 0;
+        self.ok("Search cleared.");
+    }
+
     pub fn open_comment(&mut self) {
         if self.local {
             self.err("Reviewing local changes — commenting needs an open pull request (b for the PR list).");
@@ -2495,11 +5281,7 @@ impl App {
         let sel = match self.selection {
             Some(sel) => sel,
             None => match self.cursor_pos() {
-                Some((side, line)) => Selection {
-                    side,
-                    anchor: line,
-                    end: line,
-                },
+                Some((side, line)) => Selection::lines(side, line, line),
                 None => {
                     self.err("Put the cursor on a line first — click it, or move with j/k.");
                     return;
@@ -2591,7 +5373,14 @@ impl App {
     }
 
     fn close_editor(&mut self) {
+        let standalone = self.editor.as_ref().is_some_and(|e| e.standalone);
         self.editor = None;
+        if standalone {
+            // The review was never disturbed — there is nothing to reload,
+            // and reloading would throw away the reader's place.
+            self.ok("Back to the diff.");
+            return;
+        }
         // Reload the file so the diff reflects whatever is on disk now.
         self.spawn_load_file(self.file_cursor);
     }
@@ -3199,6 +5988,89 @@ mod tests {
         );
     }
 
+    /// A right-click on a file row offers both spellings of its path, and
+    /// the full one is the relative one under the repo root.
+    #[test]
+    fn right_click_on_a_file_offers_both_paths() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.repo_root = std::env::temp_dir();
+        app.files = vec![cf("src/app.rs")];
+        app.tree_view = false;
+        app.rebuild_entries();
+        app.layout.file_list = Rect::new(0, 2, 30, 10);
+        app.open_path_menu(4, 2);
+
+        let Overlay::PathMenu(menu) = &app.overlay else {
+            panic!("right-click must open the path menu");
+        };
+        assert_eq!(menu.path, "src/app.rs");
+        assert!(!menu.is_dir);
+        assert_eq!(menu.items.len(), 2);
+        assert_eq!(menu.items[0].text, "src/app.rs");
+        let full = &menu.items[1].text;
+        assert!(full.starts_with('/'), "{full}");
+        assert!(full.ends_with("/src/app.rs"), "{full}");
+    }
+
+    /// Directory rows are worth copying too — a folder path is what you
+    /// hand something that should look at the whole subtree.
+    #[test]
+    fn right_click_on_a_folder_offers_the_folder_path() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.repo_root = std::env::temp_dir();
+        app.files = vec![cf("src/ui/panel.rs")];
+        app.tree_view = true;
+        app.rebuild_entries();
+        app.layout.file_list = Rect::new(0, 0, 30, 10);
+        app.open_path_menu(2, 0);
+
+        let Overlay::PathMenu(menu) = &app.overlay else {
+            panic!("right-click on a folder must open the path menu");
+        };
+        assert!(menu.is_dir);
+        assert_eq!(menu.path, "src/ui");
+        assert_eq!(menu.items[0].text, "src/ui");
+    }
+
+    /// The menu is a menu: arrows move, Esc closes, nothing is copied.
+    #[test]
+    fn path_menu_moves_and_closes() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.repo_root = std::env::temp_dir();
+        app.files = vec![cf("README.md")];
+        app.tree_view = false;
+        app.rebuild_entries();
+        app.layout.file_list = Rect::new(0, 0, 30, 10);
+        app.open_path_menu(1, 0);
+
+        app.handle_key(key(KeyCode::Down));
+        let Overlay::PathMenu(menu) = &app.overlay else {
+            panic!("moving must not close the menu");
+        };
+        assert_eq!(menu.sel, 1, "Down selects the second line");
+
+        app.handle_key(key(KeyCode::Down));
+        let Overlay::PathMenu(menu) = &app.overlay else {
+            panic!("the menu must stay open at its last line");
+        };
+        assert_eq!(menu.sel, 1, "Down stops at the last line");
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.overlay, Overlay::None), "Esc closes the menu");
+    }
+
+    /// A right-click on empty space below the last row does nothing.
+    #[test]
+    fn right_click_below_the_last_row_opens_nothing() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.files = vec![cf("README.md")];
+        app.tree_view = false;
+        app.rebuild_entries();
+        app.layout.file_list = Rect::new(0, 0, 30, 10);
+        app.open_path_menu(1, 6);
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
     #[test]
     fn tree_compresses_single_child_chains() {
         let files = vec![cf("a/b/c/deep.rs")];
@@ -3702,11 +6574,7 @@ mod tests {
         app.new_content = Some(new.clone());
         app.diff_scroll = 3;
         app.diff_cursor = 4;
-        app.selection = Some(Selection {
-            side: Side::Right,
-            anchor: 10,
-            end: 10,
-        });
+        app.selection = Some(Selection::lines(Side::Right, 10, 10));
 
         let reload = |old: &str, new: &str| FileLoadedData {
             idx: 0,
@@ -3788,5 +6656,820 @@ mod tests {
                 FileEntry::File { idx: 1, depth: 0 },
             ]
         );
+    }
+
+    // ---------------------------------------------------------------- search
+
+    fn finder_of(app: &App) -> &Finder {
+        match &app.overlay {
+            Overlay::Finder(f) => f,
+            _ => panic!("the finder should be open"),
+        }
+    }
+
+    fn type_into_finder(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
+
+    #[test]
+    fn finder_filters_files_and_prefixes_switch_mode() {
+        let mut app = folded_app();
+        app.files = vec![cf("src/app.rs"), cf("src/ui/render.rs"), cf("README.md")];
+        app.rebuild_entries();
+        app.new_content = Some("fn alpha() {}\nfn beta() {}\n".into());
+
+        app.open_finder(FinderMode::Files);
+        assert_eq!(finder_of(&app).rows.len(), 3, "everything, unfiltered");
+
+        type_into_finder(&mut app, "app");
+        let f = finder_of(&app);
+        assert_eq!(f.mode, FinderMode::Files);
+        assert_eq!(
+            f.rows[0].path, "src/app.rs",
+            "the best fuzzy match sorts first"
+        );
+        assert!(
+            !f.rows[0].matched.is_empty(),
+            "matched positions come back for highlighting"
+        );
+
+        // Backspacing to empty and typing `@` switches to symbols; the
+        // definitions come from the open file.
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        app.handle_key(key(KeyCode::Char('@')));
+        let f = finder_of(&app);
+        assert_eq!(f.mode, FinderMode::Symbols);
+        assert_eq!(f.rows.len(), 2, "two fns in the open file");
+        type_into_finder(&mut app, "bet");
+        let f = finder_of(&app);
+        assert_eq!(f.rows.len(), 1);
+        assert_eq!(f.rows[0].text, "beta");
+        assert_eq!(f.rows[0].line, Some(2));
+
+        // Backspace on an empty input walks back out of the mode.
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(finder_of(&app).mode, FinderMode::Files);
+
+        // `#` needs a subprocess, so it only arms the debounce here.
+        app.handle_key(key(KeyCode::Char('#')));
+        type_into_finder(&mut app, "al");
+        assert_eq!(finder_of(&app).mode, FinderMode::Grep);
+        assert!(app.searching(), "a grep query is pending");
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn grep_results_put_definitions_first() {
+        let mut app = folded_app();
+        app.files = vec![cf("a.ts"), cf("b.ts")];
+        app.open_finder(FinderMode::Grep);
+        let gen = app.search_gen + 1;
+        app.search_gen = gen;
+        app.apply_search(
+            gen,
+            SearchOutcome::Grep {
+                query: "handleClick".into(),
+                truncated: false,
+                hits: vec![
+                    search::Hit {
+                        path: "b.ts".into(),
+                        line: 9,
+                        text: "  handleClick();".into(),
+                        col: 2,
+                        len: 11,
+                        definition: false,
+                    },
+                    search::Hit {
+                        path: "vendor/z.ts".into(),
+                        line: 3,
+                        text: "const handleClick = () => {}".into(),
+                        col: 6,
+                        len: 11,
+                        definition: true,
+                    },
+                ],
+            },
+        );
+        let f = finder_of(&app);
+        assert_eq!(f.rows[0].tag, "def", "the definition floats to the top");
+        assert_eq!(f.rows[0].path, "vendor/z.ts");
+        assert!(!f.rows[0].in_changeset);
+        assert_eq!(f.rows[1].tag, "changed");
+        assert_eq!(f.rows[1].range, Some((2, 13)));
+
+        // A result from a query the user has already typed past is dropped.
+        app.search_gen += 1;
+        let stale = gen;
+        app.apply_search(
+            stale,
+            SearchOutcome::Grep {
+                query: "old".into(),
+                truncated: false,
+                hits: Vec::new(),
+            },
+        );
+        assert_eq!(finder_of(&app).rows.len(), 2, "stale results are ignored");
+    }
+
+    #[test]
+    fn jumping_to_a_line_expands_the_fold_hiding_it() {
+        let mut app = folded_app();
+        // Line 3 is inside the first folded run (rows 0..6).
+        assert!(folds(&app) > 0);
+        let before = app.display.len();
+        app.jump_to_line(3);
+        assert!(
+            app.display.len() > before,
+            "the fold covering the target line was expanded"
+        );
+        let row = match app.display[app.diff_cursor] {
+            DisplayEntry::Line(i) => i,
+            other => panic!("cursor should be on a line, got {other:?}"),
+        };
+        assert_eq!(app.diff.as_ref().unwrap().rows[row].new_ln, Some(3));
+    }
+
+    #[test]
+    fn slash_search_highlights_steps_and_wraps() {
+        let mut app = folded_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        assert!(app.find.typing);
+        type_into_finder(&mut app, "line1");
+        // line1, line10 (as LINE10 — smart case matches), line11..line19
+        assert!(app.find.rows.len() > 2, "matches found while typing");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.find.typing);
+        assert!(app.find.active());
+
+        let first = app.find.at;
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_ne!(app.find.at, first, "n steps to the next match");
+        // Walk off the end and confirm it wraps rather than stopping.
+        for _ in 0..app.find.rows.len() {
+            app.handle_key(key(KeyCode::Char('n')));
+        }
+        assert!(app.status.contains("Match"));
+
+        // Esc clears the search rather than leaving the review.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.find.active());
+        assert_eq!(app.screen, Screen::Review);
+
+        // Cancelling mid-type puts the reader back where they started.
+        app.diff_cursor = 5;
+        app.handle_key(key(KeyCode::Char('/')));
+        type_into_finder(&mut app, "line19");
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.diff_cursor, 5, "Esc restores the original position");
+        assert!(app.find.query.is_empty());
+    }
+
+    #[test]
+    fn n_and_p_no_longer_step_files() {
+        let mut app = folded_app();
+        app.files = vec![cf("a.rs"), cf("b.rs")];
+        app.rebuild_entries();
+        // `n` with no search says so instead of loading the next file.
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.file_cursor, 0);
+        assert!(app.job.is_none(), "no file load was started");
+        assert!(app.status_err && app.status.contains('/'));
+    }
+
+    /// A file whose language has no server, so the flow can be tested
+    /// without starting a subprocess.
+    fn app_with_line(path: &str, line: &str) -> App {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.files = vec![cf(path)];
+        app.rebuild_entries();
+        let content = format!("first\n{line}\nlast\n");
+        // A file against itself: every row is context.
+        app.diff = Some(FileDiff::compute(Some(&content), Some(&content)));
+        app.new_content = Some(content.clone());
+        app.old_content = Some(content);
+        app.collapse_unchanged = false;
+        app.rebuild_display();
+        app.layout.diff = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        app.diff_cursor = 1; // the interesting line
+        app
+    }
+
+    #[test]
+    fn a_clicked_word_wins_over_guessing() {
+        let mut app = app_with_line("notes.md", "alpha = beta(gamma)");
+        // Nothing clicked: every identifier on the line is a candidate.
+        let all = app.targets_on_cursor_row();
+        assert_eq!(
+            all.iter().map(|t| t.word.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma"]
+        );
+        assert_eq!(all[1].line, 2, "line numbers are 1-based");
+        assert_eq!(all[1].col, 9, "columns are 1-based char offsets");
+
+        // A click on "beta" (char 8 of the line) settles it.
+        app.click_word = Some((app.diff_cursor, 9));
+        let picked = app.targets_on_cursor_row();
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].word, "beta");
+
+        // A click recorded on a *different* row doesn't leak into this one.
+        app.click_word = Some((0, 1));
+        assert_eq!(app.targets_on_cursor_row().len(), 3);
+    }
+
+    #[test]
+    fn an_ambiguous_line_asks_which_symbol() {
+        let mut app = app_with_line("notes.md", "alpha = beta(gamma)");
+        app.lsp_action(LspAction::References);
+        let f = finder_of(&app);
+        assert_eq!(f.mode, FinderMode::Pick);
+        assert_eq!(f.rows.len(), 3);
+        assert_eq!(f.pending_action, Some(LspAction::References));
+        assert_eq!(f.rows[0].pick, Some(0));
+
+        // Typing filters the picker, and Enter runs the pending request
+        // against the row that survived — which for a language with no
+        // server means an explanation rather than a subprocess.
+        type_into_finder(&mut app, "gam");
+        assert_eq!(finder_of(&app).rows.len(), 1);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.job.is_none(), "no server was started for a .md file");
+        assert!(
+            app.status_err && app.status.contains("No language server"),
+            "got {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn one_symbol_on_the_line_needs_no_picker() {
+        let mut app = app_with_line("notes.md", "    handleClick");
+        app.lsp_action(LspAction::Hover);
+        assert!(
+            matches!(app.overlay, Overlay::None),
+            "a single candidate goes straight through"
+        );
+        assert!(app.status.contains("No language server"));
+
+        // An empty line has nothing to ask about, and says so differently.
+        app.diff_cursor = 0;
+        let mut app2 = app_with_line("notes.md", "   ");
+        app2.lsp_action(LspAction::Definition);
+        assert!(app2.status.contains("No symbol on this line"));
+    }
+
+    #[test]
+    fn references_land_in_the_finder_with_their_source_lines() {
+        let mut app = app_with_line("a.ts", "handleClick()");
+        app.files = vec![cf("a.ts")];
+        app.rebuild_entries();
+        app.apply_locations(LocationsData {
+            action: LspAction::References,
+            word: "handleClick".into(),
+            places: vec![
+                Place {
+                    loc: lsp::Loc {
+                        path: "a.ts".into(),
+                        line: 2,
+                        col: 1,
+                    },
+                    text: "handleClick()".into(),
+                },
+                Place {
+                    loc: lsp::Loc {
+                        path: "vendor/b.ts".into(),
+                        line: 40,
+                        col: 7,
+                    },
+                    text: "  const x = handleClick;".into(),
+                },
+            ],
+        });
+        let f = finder_of(&app);
+        assert_eq!(f.mode, FinderMode::Refs);
+        assert_eq!(f.rows.len(), 2);
+        assert!(f.note.contains("references to"), "note: {}", f.note);
+        assert_eq!(f.rows[0].tag, "changed", "a hit under review is marked");
+        assert_eq!(f.rows[1].tag, "");
+        assert_eq!(
+            f.rows[1].range,
+            Some((12, 23)),
+            "the word is highlighted inside the source line"
+        );
+
+        // A lone definition skips the list entirely and just goes there.
+        app.apply_locations(LocationsData {
+            action: LspAction::Definition,
+            word: "handleClick".into(),
+            places: vec![Place {
+                loc: lsp::Loc {
+                    path: "a.ts".into(),
+                    line: 2,
+                    col: 1,
+                },
+                text: "handleClick()".into(),
+            }],
+        });
+        assert!(matches!(app.overlay, Overlay::None));
+
+        // Nothing found says why, rather than showing an empty list.
+        app.apply_locations(LocationsData {
+            action: LspAction::References,
+            word: "handleClick".into(),
+            places: Vec::new(),
+        });
+        assert!(app.status_err && app.status.contains("indexing"));
+    }
+
+    #[test]
+    fn language_servers_can_be_turned_off() {
+        let mut app = app_with_line("a.ts", "handleClick()");
+        app.lsp_enabled = false;
+        app.lsp_action(LspAction::Definition);
+        assert!(app.status_err && app.status.contains("language_servers = false"));
+        assert!(app.job.is_none());
+    }
+
+    /// A one-file review at a known size, so mouse coordinates in a test
+    /// mean something. Side-by-side with the diff pane at column 34: its
+    /// left body starts after a 5-column gutter (39), the right pane after
+    /// the divider at 34 + 32 + 1, plus its own gutter (72).
+    fn mouse_app(old: &str, new: &str) -> App {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.files = vec![cf("a.ts")];
+        app.rebuild_entries();
+        app.old_content = Some(old.to_string());
+        app.new_content = Some(new.to_string());
+        app.diff = Some(FileDiff::compute(Some(old), Some(new)));
+        app.collapse_unchanged = false;
+        app.rebuild_display();
+        app.layout.diff = Rect {
+            x: 34,
+            y: 1,
+            width: 66,
+            height: 20,
+        };
+        app.layout.review = Rect {
+            x: 0,
+            y: 1,
+            width: 100,
+            height: 20,
+        };
+        app
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// The ask this feature exists for: drag across part of a line and get
+    /// exactly those characters, from whichever side was dragged.
+    #[test]
+    fn dragging_selects_characters_not_whole_lines() {
+        let old = "const alpha = compute(one);\nconst beta = compute(two);\nconst gamma = 3;\n";
+        let new = "const alpha = compute(one);\nconst beta = RENAMED(two);\nconst gamma = 3;\n";
+        let mut app = mouse_app(old, new);
+        // Line 2 is the second row of the pane, at y = 1 + 1.
+        let left = |col: usize| 39 + col as u16;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), left(6), 2));
+
+        // A press alone still selects the whole line — that is what
+        // commenting wants, and what clicking has always done.
+        let sel = app.selection.expect("a selection");
+        assert!(sel.linewise);
+        assert_eq!(sel.side, Side::Left);
+        assert_eq!(app.copy_target().unwrap().0, "const beta = compute(two);");
+
+        // Dragging turns it into exactly the characters covered.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), left(10), 2));
+        let sel = app.selection.unwrap();
+        assert!(!sel.linewise);
+        let (text, what) = app.copy_target().unwrap();
+        assert_eq!(text, "beta");
+        assert!(what.contains("4 characters") && what.contains("removed"), "{what}");
+
+        // Across lines, it runs to the end of the first and into the next.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), left(11), 3));
+        assert_eq!(
+            app.copy_target().unwrap().0,
+            "beta = compute(two);\nconst gamma"
+        );
+
+        // The renderer paints precisely that range — the highlight and the
+        // clipboard read the same function, so they cannot drift apart.
+        let sel = app.selection.unwrap();
+        assert_eq!(sel.cols_on(Side::Left, 2, 26), Some((6, 26)));
+        assert_eq!(sel.cols_on(Side::Left, 3, 16), Some((0, 11)));
+        assert_eq!(sel.cols_on(Side::Right, 2, 26), None, "wrong side");
+
+        // Releasing ends the drag; a later move doesn't keep selecting.
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), left(1), 4));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), left(1), 4));
+        assert_eq!(app.selection.unwrap().end, Pos::new(3, 11));
+
+        // Commenting still works off the line span, unchanged.
+        assert_eq!(app.selection.unwrap().range(), (2, 3));
+    }
+
+    #[test]
+    fn a_drag_on_the_new_side_stays_on_the_new_side() {
+        let old = "let a = 1;\nlet b = 2;\n";
+        let new = "let a = 1;\nlet B = 22;\n";
+        let mut app = mouse_app(old, new);
+        let right = |col: usize| 72 + col as u16;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), right(4), 2));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), right(10), 2));
+        let sel = app.selection.unwrap();
+        assert_eq!(sel.side, Side::Right);
+        assert_eq!(app.copy_target().unwrap().0, "B = 22");
+
+        // Dragging back across the divider into the left pane keeps
+        // selecting new-side text: the two panes are different documents,
+        // so a selection that spanned both would copy nonsense.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 40, 2));
+        assert_eq!(app.selection.unwrap().side, Side::Right);
+        assert!(app.copy_target().unwrap().0.starts_with("let"));
+    }
+
+    /// The point of copying: getting the *removed* text out, which is the
+    /// side that no longer exists anywhere on disk.
+    #[test]
+    fn copying_takes_the_lines_from_the_selected_side() {
+        let mut app = folded_app();
+        let old: String = (1..=20).map(|i| format!("line{i}\n")).collect();
+        let new = old.replace("line10\n", "LINE10\n");
+        app.old_content = Some(old);
+        app.new_content = Some(new);
+
+        // A selection on the old side copies what was deleted.
+        app.selection = Some(Selection::lines(Side::Left, 9, 11));
+        let (text, what) = app.copy_target().expect("something to copy");
+        assert_eq!(text, "line9\nline10\nline11");
+        assert!(what.contains("3 lines") && what.contains("removed"), "{what}");
+
+        // The new side of the same range is the replacement text.
+        app.selection = Some(Selection::lines(Side::Right, 10, 10));
+        let (text, what) = app.copy_target().unwrap();
+        assert_eq!(text, "LINE10");
+        assert!(what.contains("line 10") && what.contains("new"), "{what}");
+
+        // With no selection it falls back to the cursor row, so `y` always
+        // means something.
+        app.selection = None;
+        app.jump_to_line(10);
+        let (text, what) = app.copy_target().expect("the cursor row");
+        assert_eq!(text, "LINE10");
+        assert!(what.contains("line 10"), "{what}");
+
+        // A fold banner is not a line — say so rather than copying blank.
+        app.cursor_to(0);
+        assert!(matches!(app.display[0], DisplayEntry::Fold { .. }));
+        assert!(app.copy_target().is_none());
+
+        // And with nothing loaded at all it says so rather than copying "".
+        let mut empty = App::new(LaunchMode::Local, None);
+        empty.screen = Screen::Review;
+        assert!(empty.copy_target().is_none());
+        empty.yank();
+        assert!(empty.status_err && empty.status.contains("Nothing to copy"));
+    }
+
+    /// Two changed sections in one small file, with folding off so every
+    /// row is on screen: rows 0 a, 1 b→B, 2-4 context, 5 f→F1, 6 +F2, 7 g.
+    fn revert_app() -> App {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        // Local review always has the working tree under it.
+        app.checked_out = true;
+        app.files = vec![cf("a.txt")];
+        app.rebuild_entries();
+        let old = "a\nb\nc\nd\ne\nf\ng\n";
+        let new = "a\nB\nc\nd\ne\nF1\nF2\ng\n";
+        app.old_content = Some(old.into());
+        app.new_content = Some(new.into());
+        app.diff = Some(FileDiff::compute(Some(old), Some(new)));
+        app.collapse_unchanged = false;
+        app.rebuild_display();
+        app.layout.diff = Rect {
+            x: 34,
+            y: 1,
+            width: 66,
+            height: 20,
+        };
+        app.layout.file_list = Rect {
+            x: 1,
+            y: 1,
+            width: 32,
+            height: 10,
+        };
+        app.layout.review = Rect {
+            x: 0,
+            y: 1,
+            width: 100,
+            height: 20,
+        };
+        app
+    }
+
+    /// The change bar marks the first row of every section, and clicking it
+    /// asks before anything is thrown away.
+    #[test]
+    fn the_change_bar_marks_each_section_and_asks_before_reverting() {
+        let mut app = revert_app();
+        let bars: Vec<Option<bool>> = (0..app.display.len()).map(|i| app.change_bar(i)).collect();
+        assert_eq!(
+            bars,
+            vec![
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                Some(true),
+                Some(false),
+                None
+            ],
+            "↺ on the first row of each section, a plain bar below it"
+        );
+
+        // Clicking the bar beside the second section (display row 5) offers
+        // to revert exactly that section — the cursor is somewhere else
+        // entirely, and that must not matter.
+        app.diff_cursor = 0;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 6));
+        let Overlay::Revert(prompt) = &app.overlay else {
+            panic!("expected a confirm prompt, status: {}", app.status);
+        };
+        assert_eq!(prompt.target, RevertTarget::Section { start: 5, end: 7 });
+        assert_eq!(prompt.path, "a.txt");
+        assert_eq!((prompt.adds, prompt.dels), (2, 1));
+        assert!(!prompt.deletes);
+        assert!(app.selection.is_none(), "the bar is not the diff body");
+
+        // Esc backs out and says so; nothing was touched.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("Left alone"), "{}", app.status);
+
+        // The bar beside an unchanged line has nothing to offer.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 34, 1));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status_err && app.status.contains("No change"), "{}", app.status);
+
+        // `u` works off the cursor for keyboard users.
+        app.diff_cursor = 1;
+        app.handle_key(key(KeyCode::Char('u')));
+        assert!(matches!(
+            &app.overlay,
+            Overlay::Revert(p) if p.target == RevertTarget::Section { start: 1, end: 2 }
+        ));
+    }
+
+    /// A read-only review has no working tree to put back: no change bar, no
+    /// stolen clicks, and a reason rather than silence.
+    #[test]
+    fn a_read_only_review_offers_no_revert() {
+        let mut app = revert_app();
+        app.local = false;
+        app.checked_out = false;
+        assert_eq!(app.revert_gutter(), 0);
+        assert!(!app.can_revert());
+
+        // The columns the change bar would have taken belong to the diff
+        // again: this click selects a line instead of opening a prompt.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 6));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.selection.is_some(), "the click reached the diff");
+
+        app.handle_key(key(KeyCode::Char('u')));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(
+            app.status_err && app.status.contains("read-only"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// The file list's ↺ column reverts the whole file, and says plainly
+    /// when that means deleting it.
+    #[test]
+    fn the_file_list_offers_a_whole_file_revert() {
+        let mut app = revert_app();
+        let fl = app.layout.file_list;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            fl.x + fl.width - 1,
+            fl.y,
+        ));
+        let Overlay::Revert(prompt) = &app.overlay else {
+            panic!("expected a confirm prompt, status: {}", app.status);
+        };
+        assert_eq!(prompt.target, RevertTarget::File { idx: 0 });
+        assert!(!prompt.deletes);
+
+        // A file the change created has nothing to go back to.
+        app.overlay = Overlay::None;
+        app.files = vec![ChangedFile {
+            path: "new.txt".into(),
+            status: "added".into(),
+            additions: 3,
+            deletions: 0,
+            previous: None,
+        }];
+        app.rebuild_entries();
+        app.ask_revert_file(0);
+        let Overlay::Revert(prompt) = &app.overlay else {
+            panic!("expected a confirm prompt");
+        };
+        assert!(prompt.deletes, "a new file is deleted, not emptied");
+        assert_eq!((prompt.adds, prompt.dels), (3, 0));
+
+        // Clicking the same column while the review is read-only explains
+        // itself instead of doing nothing.
+        app.overlay = Overlay::None;
+        app.checked_out = false;
+        app.ask_revert_file(0);
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status_err, "{}", app.status);
+    }
+
+    /// End to end: confirm the prompt, let the worker run, and the file on
+    /// disk has exactly that one section put back — the rest of the change
+    /// is still there.
+    #[test]
+    fn reverting_a_section_rewrites_only_that_section_on_disk() {
+        let dir = std::env::temp_dir().join(format!("loupe-revert-app-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let new = "a\nB\nc\nd\ne\nF1\nF2\ng\n";
+        std::fs::write(dir.join("a.txt"), new).unwrap();
+
+        let mut app = revert_app();
+        app.repo_root = dir.clone();
+        app.diff_scroll = 2;
+        app.diff_cursor = 5;
+        app.ask_revert_section(5);
+        app.confirm_revert();
+        for _ in 0..300 {
+            if app.job.is_none() {
+                break;
+            }
+            app.poll_jobs();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.job.is_none(), "the revert finished");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "a\nB\nc\nd\ne\nf\ng\n",
+            "the second section went back; the first one stayed"
+        );
+        assert!(app.status.contains("Reverted"), "{}", app.status);
+        // The panel's counts are re-read from the diff that just landed, so
+        // the two can't disagree.
+        let diff = app.diff.as_ref().expect("the file was reloaded");
+        assert_eq!(app.files[0].additions as usize, diff.additions);
+        assert_eq!(app.files[0].deletions as usize, diff.deletions);
+        // And the reader is still roughly where they were.
+        assert!(app.diff_scroll <= 2 && app.diff_cursor <= 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A revert that finds the file changed underneath it stops rather than
+    /// writing a stale row model over someone else's edit.
+    #[test]
+    fn a_stale_diff_refuses_to_write() {
+        let dir = std::env::temp_dir().join(format!("loupe-revert-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // What is on disk is not what the diff on screen was built from.
+        std::fs::write(dir.join("a.txt"), "something else entirely\n").unwrap();
+
+        let mut app = revert_app();
+        app.repo_root = dir.clone();
+        app.ask_revert_section(1);
+        app.confirm_revert();
+        for _ in 0..300 {
+            if app.job.is_none() {
+                break;
+            }
+            app.poll_jobs();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "something else entirely\n",
+            "the file is untouched"
+        );
+        assert!(
+            app.status_err && app.status.contains("changed on disk"),
+            "{}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_outside_the_change_opens_in_the_editor() {
+        let mut app = folded_app();
+        app.files = vec![cf("test.rs"), cf("other.rs")];
+        app.rebuild_entries();
+        app.file_cursor = 1;
+        app.diff_scroll = 4;
+        let files_before = app.files.len();
+        let diff_before = app.display.len();
+
+        app.apply_external(ExternalFile {
+            path: "vendor/untouched.ts".into(),
+            abs_path: "/repo/vendor/untouched.ts".into(),
+            content: "one\ntwo\nthree\nfour\n".into(),
+            line: Some(3),
+            read_only: false,
+        });
+        let ed = app.editor.as_ref().expect("the editor is open");
+        assert!(ed.standalone, "it is not the changeset file");
+        assert!(!ed.read_only);
+        assert_eq!(ed.path, "vendor/untouched.ts");
+        assert_eq!(ed.textarea.cursor().0, 2, "landed on line 3");
+
+        // The review underneath is untouched — that is the whole point of
+        // using the editor instead of a diff of the file against itself.
+        assert_eq!(app.files.len(), files_before);
+        assert_eq!(app.file_cursor, 1);
+        assert_eq!(app.diff_scroll, 4);
+        assert_eq!(app.display.len(), diff_before);
+
+        // So closing it needs no reload and loses nothing.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.editor.is_none());
+        assert!(app.job.is_none(), "no reload was needed");
+        assert_eq!(app.file_cursor, 1);
+        assert_eq!(app.diff_scroll, 4);
+    }
+
+    #[test]
+    fn a_file_from_a_commit_opens_read_only() {
+        let mut app = folded_app();
+        app.apply_external(ExternalFile {
+            path: "vendor/x.ts".into(),
+            abs_path: "/repo/vendor/x.ts".into(),
+            content: "one\n".into(),
+            line: None,
+            read_only: true,
+        });
+        assert!(app.editor.as_ref().unwrap().read_only);
+        assert!(app.status.contains("read-only"));
+        // Saving is refused rather than writing another branch's file.
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.job.is_none(), "no write job was started");
+        assert!(app.status_err && app.status.contains("read-only"));
+    }
+
+    #[test]
+    fn opening_a_hit_outside_the_changeset_opens_a_file() {
+        let mut app = folded_app();
+        app.files = vec![cf("test.rs")];
+        app.rebuild_entries();
+        app.open_finder(FinderMode::Grep);
+        // A path that is not under review: this has to open the file,
+        // not diff it against a base it has no place in.
+        app.open_hit("vendor/elsewhere.ts".into(), Some(12));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.job.is_some(), "a load job was started");
+        assert!(app.job.as_ref().unwrap().label.contains("elsewhere.ts"));
+
+        // A path that *is* under review loads the file and remembers the
+        // line to land on.
+        app.job = None;
+        app.file_cursor = 0;
+        app.diff = None;
+        app.open_hit("test.rs".into(), Some(7));
+        assert_eq!(app.pending_jump, Some(7));
     }
 }
