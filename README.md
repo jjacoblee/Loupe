@@ -107,6 +107,12 @@ leaving your terminal or touching a browser.
   review appear without a key press. It never interrupts (no re-scan
   with the editor, a menu or a selection open) and never moves your
   place. `r` or the `⟳` button pulls changes in right now.
+- **Two reviews, one window** — a review asks two questions: *what does
+  this branch do?* and *what have I changed in reply?* `` ` `` swaps
+  between the pull request and your own uncommitted changes and keeps
+  both whole — the open file, the cursor row, the scroll position, the
+  folds, and what you marked viewed or staged. Swap back and it is the
+  screen you left, not a reload of it.
 - **A top bar that fits** — the toolbar shows the two or three things
   that match what you are doing; `☰` holds the rest, grouped and
   labelled with the key that does the same thing.
@@ -215,20 +221,30 @@ reference is in
 
 | | |
 | --- | --- |
-| [Getting started](docs/getting-started.md) | Requirements, installation, first run, troubleshooting |
-| [Reviewing pull requests](docs/reviewing-prs.md) | Picker, checkout modes, comments, viewed sync, editing |
-| [Reviewing local changes](docs/local-changes.md) | Local mode and the staging column |
+| [Documentation index](docs/README.md) | Every page, and a table of where each feature is written up |
+| [Getting started](docs/getting-started.md) | Requirements, installation, first run, a tour, troubleshooting |
+| [Reviewing pull requests](docs/reviewing-prs.md) | Picker, checkout modes, comments, the review box, viewed sync, editing |
+| [Reviewing local changes](docs/local-changes.md) | Local mode, the staging column, merge conflicts, keeping up with an agent |
 | [Configuration](docs/configuration.md) | Config file, all keys, CLI flags, themes |
-| [Keyboard & mouse reference](docs/keys-and-mouse.md) | Every binding and clickable control |
+| [Keyboard & mouse reference](docs/keys-and-mouse.md) | Every binding and clickable control, and how each feature works |
 | [Architecture](docs/architecture.md) | How Loupe works inside — start here to contribute |
+
+The features that work in both review modes — [pinned
+files](docs/keys-and-mouse.md#pinned-files), the [markdown
+preview](docs/keys-and-mouse.md#markdown-preview), the [blame
+pane](docs/keys-and-mouse.md#the-blame-pane),
+[find](docs/keys-and-mouse.md#find), [language
+servers](docs/keys-and-mouse.md#language-servers) and the
+[editor](docs/keys-and-mouse.md#editor) — are written up in the
+reference and listed in the [documentation index](docs/README.md).
 
 Configuration lives in `~/.config/loupe/config.toml` plus an optional
 per-repo `.loupe.toml` (see
 [`config.example.toml`](config.example.toml)) — upstream `org` for fork
-workflows, default mode, light/dark `appearance`, syntax themes, and
-panel width. You'll rarely
-edit it by hand: the setup wizard and theme picker write it for you, and
-`loupe setup` re-runs the wizard whenever you want.
+workflows, default mode, light/dark `appearance`, syntax themes, panel
+width, the blame pane, language servers, and the idle re-scan. You'll
+rarely edit it by hand: the setup wizard and theme picker write it for
+you, and `loupe setup` re-runs the wizard whenever you want.
 
 ## Contributing
 

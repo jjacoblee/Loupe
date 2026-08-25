@@ -117,7 +117,7 @@ You can make either behavior the default in the
 - **Drag the divider** between the panels to resize; double-click it to
   reset.
 - **Click a diff line** (or drag over several) and press `c` or click
-  `💬 Comment` to post a review comment to the PR.
+  `💬 Comment` to write a review comment.
 - **Double-click a line on the new side** (or press `e`) to edit the file
   in place with the same syntax colors, then `Ctrl+S` to save.
 
@@ -125,7 +125,44 @@ You can make either behavior the default in the
 
 - **Press `t`** (or click 🎨) any time to switch themes — the picker
   previews live and saves your choice.
+- **Press `m`** (or click `☰`) for everything the top bar left out,
+  grouped and labelled with the key that does the same thing. The menu is
+  the way to learn the keys.
 - Press `?` at any time for the built-in help overlay, and `q` to quit.
+
+## The next 60 seconds
+
+The tour above is one file and one diff. These are the parts that make a
+long review shorter — all of them work on a pull request and on your own
+changes alike.
+
+- **Send one review, not ten notifications.** `Ctrl+S` in a comment draft
+  *holds* it. `R` opens the review box: write a summary, pick **Comment**,
+  **Approve** or **Request changes**, and `Ctrl+S` sends the lot as one
+  GitHub review. See [reviewing pull requests](reviewing-prs.md#the-review-box).
+- **Find anything** without leaving the review: `/` searches the open
+  diff, `Ctrl+P` matches a file by name, `#` greps the repository, and
+  `@` lists what the file defines. See [Find](keys-and-mouse.md#find).
+- **`gd`, `gr`, `K`** go to a definition, list references, and say what a
+  symbol is — driven by whichever language server is already on your
+  PATH. `loupe --lsp` says what it found. See
+  [language servers](keys-and-mouse.md#language-servers).
+- **`B` opens the blame pane** between the file panel and the diff: who
+  last touched each line, how long ago, and the pull request it landed
+  in. See [the blame pane](keys-and-mouse.md#the-blame-pane).
+- **`P` reads a markdown file as a document** rather than as markup, and
+  re-renders it when an agent rewrites it. See
+  [markdown preview](keys-and-mouse.md#markdown-preview).
+- **`=` pins the file you are on** to a row of tabs that survives
+  quitting, and dragging a file onto the window pins and opens it from
+  anywhere on the machine. See [pinned files](keys-and-mouse.md#pinned-files).
+- **`` ` `` swaps** between the pull request and your own uncommitted
+  changes, keeping your place in both. See
+  [swapping between the two reviews](keys-and-mouse.md#swapping-between-the-two-reviews).
+- **A stopped merge takes over the review.** Conflicted files sort to the
+  top and the diff shows our side against theirs, with the marker lines
+  gone; `o` resolves one. See
+  [merge conflicts](local-changes.md#merge-conflicts).
 
 Full reference: [keyboard & mouse](keys-and-mouse.md).
 

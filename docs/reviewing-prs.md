@@ -174,8 +174,8 @@ Double-click a line on the new side (or press `e` / `i` at the cursor
 line, or click `✎ Edit`) to open a real editor over the working-tree
 file — available when the PR branch is checked out:
 
-- Click to place the cursor, drag to select, type, undo/redo
-  (`Ctrl+Z` / `Ctrl+Y`), `Ctrl+S` to save, `Esc` to close (twice to
+- Click to place the cursor, drag to select, type, undo (`Ctrl+Z`, or
+  `Ctrl+U`), redo (`Ctrl+R`), `Ctrl+S` to save, `Esc` to close (twice to
   discard unsaved changes).
 - The editor uses the same syntax colors as the diff, re-highlighted
   incrementally as you type, so even large files stay responsive. (Files
@@ -183,6 +183,30 @@ file — available when the PR branch is checked out:
 - Saving refreshes the diff immediately. Edits only touch your local
   working tree — **you** commit and push when ready; Loupe never commits
   for you.
+
+## The rest of the review
+
+These work the same way here as they do on your own changes, so they are
+written up once in the reference:
+
+| What | Where |
+| --- | --- |
+| Pin the files you keep returning to, and read files from outside the repository | [Pinned files](keys-and-mouse.md#pinned-files) |
+| Read a plan or a write-up as a document instead of as markup | [Markdown preview](keys-and-mouse.md#markdown-preview) |
+| See who last touched each line, and which PR it landed in | [The blame pane](keys-and-mouse.md#the-blame-pane) |
+| Search this diff, a file by name, text in the repository, or definitions | [Find](keys-and-mouse.md#find) |
+| Go to a definition, list references, ask what a symbol is | [Language servers](keys-and-mouse.md#language-servers) |
+| Copy exact characters out of either side of the diff | [Copying](keys-and-mouse.md#copying) |
+| Reload the PR after its head moves | [Refreshing](keys-and-mouse.md#refreshing) |
+
+**Right-click the `PR #123` badge** to copy the link to the pull request.
+That is the URL a coding agent needs, and the badge is the one place on
+screen that always carries it.
+
+**`` ` `` swaps to your own uncommitted changes** and back, keeping your
+place in both — the fast way to answer "what did the review make me
+change?" without losing the review. See
+[swapping between the two reviews](keys-and-mouse.md#swapping-between-the-two-reviews).
 
 ## Notes & limits
 

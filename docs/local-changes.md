@@ -206,6 +206,24 @@ Two ways to take over:
 - **`☰ → Refresh while idle`** — turn the polling off for this session.
   `auto_refresh = false` in your config turns it off for good.
 
+## The rest of the review
+
+These work the same way here as they do on a pull request, so they are
+written up once in the reference:
+
+| What | Where |
+| --- | --- |
+| Pin the files you keep returning to, and read files from outside the repository | [Pinned files](keys-and-mouse.md#pinned-files) |
+| Read the plan file an agent is writing, as a document | [Markdown preview](keys-and-mouse.md#markdown-preview) |
+| See who last touched each line — your uncommitted lines get their own color | [The blame pane](keys-and-mouse.md#the-blame-pane) |
+| Search this diff, a file by name, text in the repository, or definitions | [Find](keys-and-mouse.md#find) |
+| Go to a definition, list references, ask what a symbol is | [Language servers](keys-and-mouse.md#language-servers) |
+| Copy exact characters out of either side of the diff | [Copying](keys-and-mouse.md#copying) |
+
+**`` ` `` swaps to the pull request** for the current branch and back,
+keeping your place in both. See
+[swapping between the two reviews](keys-and-mouse.md#swapping-between-the-two-reviews).
+
 ## A typical flow
 
 1. Hack until the feature works; run `loupe`.

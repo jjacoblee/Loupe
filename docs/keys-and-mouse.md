@@ -17,6 +17,7 @@ for the built-in help overlay.
 | `m` or `☰` | Open the menu (see [The top bar and the ☰ menu](#the-top-bar-and-the--menu)) |
 | `b` | Open the PR list (from an auto-opened PR) |
 | `l` | Switch to local-changes review (from the PR list) |
+| `` ` `` or `☰ → Swap` | Swap between the pull request and your local changes, keeping your place in both (see [Swapping between the two reviews](#swapping-between-the-two-reviews)) |
 | `B` or `☰ → Blame column` | Show / hide the blame pane (see [The blame pane](#the-blame-pane)) |
 | `P` | Render the open markdown file as a document (see [Markdown preview](#markdown-preview)) |
 | `=` | Pin the file in front of you to the tab row, or unpin it (see [Pinned files](#pinned-files)) |
@@ -87,6 +88,36 @@ day. Press `r` (or click `⟳`) to fetch it.
 
 Turn the idle re-scan off for one session from `☰ → Refresh while idle`,
 or for good with `auto_refresh = false` in your config.
+
+## Swapping between the two reviews
+
+`` ` `` (backtick), or `☰ → Go → Swap`, moves between the pull request and
+your own uncommitted changes. The menu line names the side you are going
+to: `⇄ Swap to local changes` while you read a pull request, and
+`⇄ Swap to the pull request` while you read your working tree.
+
+You answer two different questions during one review — *what does this
+branch do?* and *what have I changed in reply?* — and each one used to
+cost a restart.
+
+**Both sides keep their place.** Loupe holds the side you leave whole: the
+file list, which file was open, the cursor row, the scroll position, the
+folded directories, and the viewed or staged marks. Swap back and it is
+the screen you left, not a fresh load of the same review.
+
+**It is instant, and it is still current.** The side you swap to is drawn
+from the stash straight away, and then re-checked in the background —
+GitHub for the pull request, the working tree for your changes — so
+there is no loading screen on the way back and no stale diff either. The
+status line names what it is checking: `PR #123 — checking GitHub for
+updates.`, or `⎇ Local changes — rescanning in the background.`
+
+The very first swap has nothing stashed yet, so it loads that side the
+long way once: it looks for a pull request for the current branch, or
+scans the working tree.
+
+Close the editor first. A swap with an editor open is refused, because the
+buffer belongs to the side you are leaving.
 
 ## File panel
 
@@ -437,11 +468,12 @@ Set `language_servers = false` in your config to switch all of this off.
 | Click | Place the cursor |
 | Drag | Select text |
 | `Ctrl+S` | Save (the diff refreshes immediately) |
-| `Ctrl+C` | Copy the selection, or the cursor line |
+| `Ctrl+C` | Copy the selection, or the cursor line, to the system clipboard |
+| `Ctrl+X` / `Ctrl+Y` | Cut / paste, through the editor's own buffer |
 | `Ctrl+Z` or `Ctrl+U` | Undo (`Ctrl+U` is tui-textarea's own binding; `Ctrl+Z` is an alias) |
 | `Ctrl+R` | Redo |
 | `Alt+P` | Preview the buffer as markdown, saved or not (`.md` files) |
-| `PgUp` / `PgDn` | Page through the file |
+| `PgUp` / `PgDn`, or `Ctrl+V` / `Alt+V` | Page through the file |
 | `Esc` | Close (press twice to discard unsaved changes) |
 
 ### In the editor, with a language server

@@ -179,6 +179,42 @@ a (side, line) and asks whether any held comment covers it — rather than
 indexing by comment, because the same line can be reached from either view
 mode and only the row model knows which side a row is showing.
 
+## The PR ⇄ local swap
+
+`toggle_workspace` (the `` ` `` key, and the `⇄` menu line) flips between
+the two reviews without losing either. It is a stash, not a reload.
+
+`Workspace` is every field of `App` that belongs to *one* side: which side
+it is, the branch and its upstream drift, the merge in progress, the
+conflict view, the `PrDetail`, the merge base, the file list, the viewed
+and staged marks, the file cursor and scroll, the collapsed directories,
+and the open `FileDiff`. `save_workspace` moves those out of `App` with
+`take`/`mem::take`, leaving defaults behind for the caller to overwrite;
+`restore_workspace` puts the other side's back.
+
+Two things are deliberately *not* stored. `entries` and `display` are
+cheap derivations of the diff and the fold state, so `restore_workspace`
+rebuilds them rather than carrying them. And the restored diff cursor and
+scroll are clamped to the rebuilt `display`: the view mode (split or
+inline) is shared between the two sides, so switching it while a side sat
+stashed changes how many rows that side's stored position was counted in.
+
+A swap shows the stashed side immediately and then re-checks it on a
+background job — `spawn_quiet_pr` or `spawn_quiet_local`, the same silent
+refresh path the idle re-scan uses. So the flip costs no wall-clock and
+still cannot show a stale diff. Any in-flight quiet refresh is dropped
+first: it belonged to the side being left.
+
+The stash holds at most one side, and only ever the *other* one. When
+`toggle_workspace` finds it empty it loads that side the long way once
+(`pr_for_current_branch`, or `spawn_open_local`). Opening local review on
+top of a PR — or a PR from local review — stashes the side being left by
+the same route, so arriving by menu and arriving by `` ` `` converge on
+one state.
+
+A swap is refused while the editor is open: the buffer belongs to the side
+being left, and its unsaved text has nowhere to go.
+
 ## Merge conflicts
 
 A conflicted file is fed through the *same* diff pipeline, with one
