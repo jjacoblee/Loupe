@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Right-click the `PR #123` badge to copy the link to the pull
+  request**: the top-left badge is now a click target. The link goes to
+  the clipboard through the same route as every other copy (`pbcopy` /
+  `wl-copy` / `xclip` / `xsel`, or OSC 52 over SSH), and the status line
+  says which route it used. The URL comes from `gh pr view --json url`,
+  so a GitHub Enterprise host stays correct. Hand it to a coding agent
+  without leaving the review. A local-changes review has no pull
+  request, so the `⎇ LOCAL` badge says so instead.
+
+- **The diff keeps up with an agent**: local review now re-scans the
+  working tree by itself, about 2 seconds after the last key press or
+  mouse move and at most once every 5 seconds. Files a coding agent (or
+  a second terminal) rewrites under an open review show up without a key
+  press. It never interrupts: the re-scan stands down while the editor
+  is open, while any overlay or menu is open, while lines are selected,
+  and during a drag or a panel resize. A re-scan that finds nothing says
+  nothing and moves nothing — the file panel stays exactly where it was
+  scrolled. Pull requests are never polled: a PR head lives on GitHub,
+  and a timer would spend API calls on a commit that moves a few times a
+  day. Turn it off with `auto_refresh = false`, or for one session from
+  `☰ → Refresh while idle`.
+
+- **A `⟳` refresh button, and `r` behind it**: re-scans the changed-file
+  list and reloads the open file, without a loading screen and without
+  losing your place — scroll position, cursor row and folds all survive.
+  In a pull request it fetches from GitHub. `r` used to reload only the
+  open file, modally; it now does the whole thing.
+
+- **A `☰` menu, and a top bar that fits**: the review top bar carried
+  eleven buttons and had begun to crowd out the PR title. It now shows
+  only what fits what you are doing — `🔍 Find` `✎ Edit` while reading,
+  `💬 Comment` `⧉ Copy` once lines are selected, `⇥ Format` `💾 Save`
+  `✕ Close` in the editor — plus `⟳` and `☰`. Everything else moved into
+  the `☰` menu (`m`), grouped under **View**, **Find**, **Actions**,
+  **Go** and **Settings**. The menu is built from the state it opens in:
+  no *Comment* line in local review, no *Refresh while idle* switch on a
+  pull request, and lines that cannot act right now are drawn dim and
+  skipped by the cursor. Every line names the key that does the same
+  thing outside the menu. Menu lines and toolbar buttons run through one
+  dispatch, so the two can never disagree.
+
 - **Right-click a file-panel row to copy its path**: a small menu opens
   at the pointer with *Copy relative path* (`r`) — `src/app.rs`, the way
   git spells it — and *Copy full path* (`f`), the same path from the
@@ -95,6 +136,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comments and unrelated keys); Esc restores the previous theme.
 - **Theme CLI**: `loupe --theme <name>` for a one-session override and
   `loupe set-theme <name>` to persist a theme from the shell.
+
+### Changed
+
+- **`Back to PRs`, `🎨 Theme`, `? Help`, `◫ Split`, `≡ Inline` and
+  `⇕ Fold` left the top bar** for the `☰` menu. Their keys (`b`, `t`,
+  `?`, `v`, `z`) are unchanged.
+
+- **New config key `auto_refresh`** (default `true`) — see
+  [docs/configuration.md](docs/configuration.md).
 
 ### Fixed
 

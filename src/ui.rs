@@ -1,7 +1,9 @@
 //! All rendering. Every clickable region drawn here is recorded into
 //! `app.layout` so the mouse handlers can hit-test against it.
 
-use crate::app::{App, ButtonId, FileEntry, FinderMode, Overlay, Screen, ViewMode, FINDER_ROWS};
+use crate::app::{
+    App, ButtonId, FileEntry, FinderMode, MenuRow, Overlay, Screen, ViewMode, FINDER_ROWS,
+};
 use crate::diff::{DisplayEntry, Row, RowKind, Selection, Side, TAB_WIDTH};
 use crate::gitops::StageState;
 use crate::highlight::HlLine;
@@ -15,6 +17,10 @@ use unicode_width::UnicodeWidthChar;
 
 /// Width of the Tree/Flat toggle drawn on the file panel's top border.
 const TOGGLE_W: usize = 13;
+
+/// Rows the ☰ menu keeps below the button before it gives up and fills
+/// the screen from the top instead.
+const MENU_MIN_H: u16 = 8;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.layout = Default::default();
@@ -53,6 +59,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Finder(_) => draw_finder(f, app, area),
         Overlay::Hover(_) => draw_hover(f, app, area),
         Overlay::PathMenu(_) => draw_path_menu(f, app, area),
+        Overlay::Menu(_) => draw_menu(f, app, area),
     }
 }
 
@@ -124,7 +131,11 @@ fn buttons_right(
     reserve: u16,
     buttons: &[(&str, ButtonId, bool)],
 ) {
-    let width = |l: &str| l.chars().map(|c| c.width().unwrap_or(0) as u16).sum::<u16>();
+    let width = |l: &str| {
+        l.chars()
+            .map(|c| c.width().unwrap_or(0) as u16)
+            .sum::<u16>()
+    };
     let budget = area.width.saturating_sub(reserve);
     // The rightmost buttons are the ones people reach for (Help, Back),
     // so when they don't all fit, drop from the left.
@@ -220,11 +231,15 @@ fn draw_topbar_prlist(f: &mut Frame, app: &mut App, area: Rect) {
         reserve,
         &[
             ("⎇ Local changes", ButtonId::LocalChanges, false),
-            ("⟳ Refresh", ButtonId::Refresh, false),
-            ("🎨 Theme", ButtonId::Theme, false),
-            ("? Help", ButtonId::Help, false),
+            ("⟳", ButtonId::Refresh, false),
+            ("☰", ButtonId::Menu, menu_open(app)),
         ],
     );
+}
+
+/// True while the ☰ menu is open, so its button draws as pressed.
+fn menu_open(app: &App) -> bool {
+    matches!(app.overlay, Overlay::Menu(_))
 }
 
 fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
@@ -253,7 +268,15 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
     // The badge and the PR title (or branch) are what the buttons have to
     // leave room for; the trailing note is expendable.
     let shown_title = tail_truncate(&title, (area.width / 3) as usize);
-    let reserve = disp_width(&badge) as u16 + 1 + disp_width(&shown_title) as u16 + 1;
+    let badge_w = disp_width(&badge) as u16;
+    let reserve = badge_w + 1 + disp_width(&shown_title) as u16 + 1;
+    // The badge is a click target: right-click copies the PR link.
+    app.layout.badge = Rect {
+        x: area.x,
+        y: area.y,
+        width: badge_w.min(area.width),
+        height: 1,
+    };
     let left = Line::from(vec![
         Span::styled(
             badge,
@@ -271,6 +294,9 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
     ]);
     f.render_widget(Paragraph::new(left), area);
 
+    // The toolbar carries only what fits what you are doing right now;
+    // ☰ holds the rest. Eleven buttons on one row left no space for the
+    // PR title, and most of them were one keystroke away anyway.
     if app.editor.is_some() {
         buttons_right(
             f,
@@ -281,42 +307,25 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
                 ("⇥ Format", ButtonId::EditorFormat, false),
                 ("💾 Save", ButtonId::EditorSave, true),
                 ("✕ Close", ButtonId::EditorClose, false),
-                ("? Help", ButtonId::Help, false),
+                ("☰", ButtonId::Menu, menu_open(app)),
             ],
         );
     } else {
-        let has_sel = app.selection.is_some();
-        let mut buttons = vec![
-            (
-                "◫ Split",
-                ButtonId::ViewSplit,
-                app.view == ViewMode::SideBySide,
-            ),
-            (
-                "≡ Inline",
-                ButtonId::ViewInline,
-                app.view == ViewMode::Inline,
-            ),
-            ("⇕ Fold", ButtonId::FoldToggle, app.collapse_unchanged),
-            ("🔍 Find", ButtonId::Find, false),
-            ("✎ Edit", ButtonId::Edit, false),
-        ];
-        // Mouse reporting eats the terminal's own selection, so copying
-        // has to be offered here too, not only as a key — but only once
-        // there is something to copy, because the row is already full.
-        if has_sel {
+        let mut buttons: Vec<(&str, ButtonId, bool)> = Vec::new();
+        if app.selection.is_some() {
+            // Lines are selected: the only two things anyone does next.
+            // Mouse reporting eats the terminal's own selection, so Copy
+            // has to be a button and not only the `y` key.
+            if !app.local {
+                buttons.push(("💬 Comment", ButtonId::Comment, true));
+            }
             buttons.push(("⧉ Copy", ButtonId::Copy, true));
+        } else {
+            buttons.push(("🔍 Find", ButtonId::Find, false));
+            buttons.push(("✎ Edit", ButtonId::Edit, false));
         }
-        // No PR — nothing to comment on.
-        if !app.local {
-            buttons.push(("💬 Comment", ButtonId::Comment, has_sel));
-        }
-        // The other side of the PR ⇄ local toggle (also the ` key).
-        let swap = if app.local { "⇄ PR" } else { "⇄ Local" };
-        buttons.push((swap, ButtonId::SwapView, false));
-        buttons.push(("🎨", ButtonId::Theme, false));
-        buttons.push(("← PRs", ButtonId::BackToPrs, false));
-        buttons.push(("? Help", ButtonId::Help, false));
+        buttons.push(("⟳", ButtonId::Refresh, app.refreshing()));
+        buttons.push(("☰", ButtonId::Menu, menu_open(app)));
         buttons_right(f, app, area, reserve, &buttons);
     }
 }
@@ -1217,6 +1226,156 @@ fn draw_path_menu(f: &mut Frame, app: &mut App, area: Rect) {
     app.layout.buttons.extend(rows);
 }
 
+/// The ☰ menu: everything the top bar no longer has room for, grouped
+/// under headings, with the key that does the same thing on the right.
+fn draw_menu(f: &mut Frame, app: &mut App, area: Rect) {
+    let Overlay::Menu(menu) = &app.overlay else {
+        return;
+    };
+    let p = palette();
+    let title = " ☰ Menu ";
+    // Two columns of padding, the widest label, a gap, the widest hint,
+    // and two columns for the on/off mark.
+    let label_w = menu
+        .rows
+        .iter()
+        .map(|r| match r {
+            MenuRow::Heading(h) => disp_width(h),
+            MenuRow::Item(it) => disp_width(&it.label) + 2,
+        })
+        .max()
+        .unwrap_or(0);
+    let hint_w = menu
+        .rows
+        .iter()
+        .map(|r| match r {
+            MenuRow::Heading(_) => 0,
+            MenuRow::Item(it) => disp_width(it.hint),
+        })
+        .max()
+        .unwrap_or(0);
+    let w = ((label_w + hint_w + 5).max(disp_width(title)) as u16 + 2).min(area.width);
+    let want = menu.rows.len() as u16 + 2;
+    let (ax, ay) = menu.anchor;
+    // Hang below the button, pulled left until the whole panel is on
+    // screen. A menu taller than the room below it is shortened and
+    // scrolls, rather than being flipped up over the top bar — the ☰ it
+    // belongs to has to stay visible.
+    let x = ax.min(area.x + area.width.saturating_sub(w));
+    let below = (area.y + area.height).saturating_sub(ay + 1);
+    let (y, h) = if below >= want || below >= MENU_MIN_H {
+        (ay + 1, want.min(below))
+    } else {
+        (area.y, want.min(area.height))
+    };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().fg(p.text))
+        .title(title);
+    // Say so when there is more than fits, or the lines below the fold
+    // are simply invisible.
+    if want > h {
+        block = block.title_bottom(Line::from(Span::styled(
+            " ▴ scroll ▾ ",
+            Style::default().fg(p.dim),
+        )));
+    }
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    // A menu taller than the terminal scrolls with the selection.
+    let height = inner.height as usize;
+    let Overlay::Menu(menu) = &mut app.overlay else {
+        return;
+    };
+    menu.scroll_into_view(height);
+    let scroll = menu.scroll;
+    let sel = menu.sel;
+    let rows: Vec<(usize, String, String, Option<bool>, bool, bool)> = menu
+        .rows
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(height)
+        .map(|(i, r)| match r {
+            MenuRow::Heading(h) => (i, h.to_string(), String::new(), None, false, false),
+            MenuRow::Item(it) => (
+                i,
+                it.label.clone(),
+                it.hint.to_string(),
+                it.checked,
+                it.enabled,
+                true,
+            ),
+        })
+        .collect();
+
+    let mut hits: Vec<(Rect, ButtonId)> = Vec::new();
+    for (slot, (i, label, hint, checked, enabled, is_item)) in rows.into_iter().enumerate() {
+        let r = Rect {
+            x: inner.x,
+            y: inner.y + slot as u16,
+            width: inner.width,
+            height: 1,
+        };
+        if !is_item {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    label,
+                    Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
+                ))),
+                r,
+            );
+            continue;
+        }
+        let selected = i == sel;
+        let fg = if enabled { p.text } else { p.faint };
+        let row_style = if selected {
+            Style::default()
+                .bg(p.row)
+                .fg(fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(fg)
+        };
+        // A switch says what it is set to; a plain line gets the same two
+        // columns of indent so the labels stay in one column.
+        let mark = match checked {
+            Some(true) => "● ",
+            Some(false) => "○ ",
+            None => "  ",
+        };
+        let body = format!("{mark}{label}");
+        let pad = (inner.width as usize).saturating_sub(disp_width(&body) + disp_width(&hint) + 1);
+        let line = Line::from(vec![
+            Span::styled(body, row_style),
+            Span::styled(" ".repeat(pad), row_style),
+            Span::styled(
+                hint,
+                if enabled {
+                    Style::default().fg(p.key)
+                } else {
+                    Style::default().fg(p.faint)
+                },
+            ),
+            Span::styled(" ", row_style),
+        ]);
+        f.render_widget(Paragraph::new(line).style(row_style), r);
+        if enabled {
+            hits.push((r, ButtonId::MenuRow(i)));
+        }
+    }
+    app.layout.buttons.extend(hits);
+}
+
 fn draw_comment_overlay(f: &mut Frame, app: &mut App, area: Rect) {
     let Overlay::Comment(draft) = &mut app.overlay else {
         return;
@@ -1441,8 +1600,7 @@ fn emphasize<'a>(
         if w + cw > width {
             break;
         }
-        let is_hit = matched.contains(&i)
-            || range.map(|(s, e)| i >= s && i < e).unwrap_or(false);
+        let is_hit = matched.contains(&i) || range.map(|(s, e)| i >= s && i < e).unwrap_or(false);
         if is_hit != on && !out.is_empty() {
             spans.push(Span::styled(
                 std::mem::take(&mut out),
@@ -1477,7 +1635,9 @@ fn draw_hover(f: &mut Frame, app: &App, area: Rect) {
         .max()
         .unwrap_or(20)
         .clamp(24, area.width.saturating_sub(8) as usize);
-    let height = (h.lines.len() as u16 + 2).min(area.height.saturating_sub(4)).max(3);
+    let height = (h.lines.len() as u16 + 2)
+        .min(area.height.saturating_sub(4))
+        .max(3);
     let rect = centered(area, widest as u16 + 4, height);
     f.render_widget(Clear, rect);
     let block = Block::default()
@@ -1554,10 +1714,7 @@ fn draw_finder(f: &mut Frame, app: &mut App, area: Rect) {
     }
     f.render_widget(
         Paragraph::new(Line::from(input_spans)),
-        Rect {
-            height: 1,
-            ..inner
-        },
+        Rect { height: 1, ..inner },
     );
     let note = match app.search_spinner() {
         Some(frame) => format!(" {frame} {}", fd.note),
@@ -1582,18 +1739,17 @@ fn draw_finder(f: &mut Frame, app: &mut App, area: Rect) {
         let row = &fd.rows[idx];
         let selected = idx == fd.sel;
         let mut base = Style::default().fg(if row.in_changeset { p.text } else { p.dim });
-        let mut hit = Style::default()
-            .fg(p.key)
-            .add_modifier(Modifier::BOLD);
+        let mut hit = Style::default().fg(p.key).add_modifier(Modifier::BOLD);
         if selected {
             base = base.bg(p.row).fg(p.text);
             hit = hit.bg(p.row);
         }
-        let mut spans = vec![Span::styled(
-            if selected { " ▸ " } else { "   " },
-            base,
-        )];
-        let tag_w = if row.tag.is_empty() { 0 } else { row.tag.len() + 2 };
+        let mut spans = vec![Span::styled(if selected { " ▸ " } else { "   " }, base)];
+        let tag_w = if row.tag.is_empty() {
+            0
+        } else {
+            row.tag.len() + 2
+        };
         let avail = (inner.width as usize).saturating_sub(3 + tag_w);
         match row.line {
             // A line inside a file: where, then what.
@@ -1630,7 +1786,11 @@ fn draw_finder(f: &mut Frame, app: &mut App, area: Rect) {
             spans.push(Span::styled(
                 format!(" {} ", row.tag),
                 Style::default()
-                    .fg(if row.tag == "def" { p.badge_fg } else { p.faint })
+                    .fg(if row.tag == "def" {
+                        p.badge_fg
+                    } else {
+                        p.faint
+                    })
                     .bg(if row.tag == "def" {
                         p.badge_local
                     } else {
@@ -1699,11 +1859,7 @@ fn draw_finder(f: &mut Frame, app: &mut App, area: Rect) {
             (scope, ButtonId::FinderScope, repo_scope),
         ]
     } else {
-        vec![(
-            "◂ Files",
-            ButtonId::FinderMode(FinderMode::Files),
-            false,
-        )]
+        vec![("◂ Files", ButtonId::FinderMode(FinderMode::Files), false)]
     };
     buttons.push(("✕", ButtonId::FinderClose, false));
     buttons_right(f, app, btn_area, 0, &buttons);
@@ -1711,7 +1867,7 @@ fn draw_finder(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let p = palette();
-    let rect = centered(area, 108.min(area.width), 36.min(area.height));
+    let rect = centered(area, 108.min(area.width), 42.min(area.height));
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1773,6 +1929,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             ("right-click a file", "copy its path"),
         ),
         row(
+            ("click ☰", "the full menu"),
+            ("click ⟳", "re-scan and reload now"),
+        ),
+        row(
             ("click [ ] / [+]", "viewed / stage file"),
             ("right-click the diff", "clear selection"),
         ),
@@ -1783,6 +1943,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         row(
             ("wheel", "scroll · Shift for sideways"),
             ("drag the divider", "resize the panel"),
+        ),
+        row(
+            ("right-click PR #n", "copy the link to the PR"),
+            ("double-click the divider", "reset the panel width"),
         ),
         Line::from(""),
         Line::from(Span::styled("Move (the cursor row is underlined)", head)),
@@ -1846,7 +2010,14 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             ("u", "revert the change at the cursor"),
             ("U", "revert every change in the file"),
         ),
-        row(("r", "reload the file"), ("Esc", "clear selection, then search")),
+        row(
+            ("r", "refresh — re-scan and reload"),
+            ("Esc", "clear selection, then search"),
+        ),
+        row(
+            ("m", "the ☰ menu (everything else)"),
+            ("Esc (in the menu)", "put it away"),
+        ),
         row(
             ("` (backtick)", "swap PR ⇄ local view"),
             ("v", "split / inline view"),
@@ -1870,6 +2041,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(Span::styled(
             "  Selecting with the mouse across the whole screen: hold Option (macOS) or Shift",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  Local review re-scans the working tree while you sit idle, so an agent's edits appear on their own (☰ → Refresh while idle)",
             dim,
         )),
         // What gd / gr / K can actually answer right now, and why not.
@@ -1950,7 +2125,11 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
             let line = Line::from(vec![
                 Span::styled(
                     truncate_pad(
-                        &format!("{} {}{code}", if d.is_error() { "✗" } else { "▲" }, d.message),
+                        &format!(
+                            "{} {}{code}",
+                            if d.is_error() { "✗" } else { "▲" },
+                            d.message
+                        ),
                         msg_w,
                     ),
                     Style::default().fg(color),
@@ -1975,7 +2154,11 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
             let worst_is_error = editor.diagnostics.iter().any(|d| d.is_error());
             let line = Line::from(Span::styled(
                 format!(" {summary} in this file"),
-                Style::default().fg(if worst_is_error { p.err } else { p.stage_partial }),
+                Style::default().fg(if worst_is_error {
+                    p.err
+                } else {
+                    p.stage_partial
+                }),
             ));
             f.render_widget(Paragraph::new(line), area);
             return;
@@ -1989,16 +2172,16 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
     // `u` only appears when there is a working tree to put back.
     let undo = if app.can_revert() { " · u revert" } else { "" };
     let hints: String = match app.screen {
-        Screen::PrList => "l local changes · r refresh · ? help · q quit".into(),
+        Screen::PrList => "l local changes · r refresh · m menu · q quit".into(),
         Screen::Review => {
             if app.editor.is_some() {
                 "Ctrl+S save · Esc close · ? help".into()
             } else if app.find.active() {
                 format!("n/N matches · / search · y copy{undo} · ? help")
             } else if app.local {
-                format!("/ find · V select · y copy · x stage{undo} · ? help")
+                format!("/ find · V select · y copy · x stage{undo} · m menu")
             } else {
-                format!("/ find · V select · y copy · c comment{undo} · ? help")
+                format!("/ find · V select · y copy · c comment{undo} · m menu")
             }
         }
     };
@@ -2257,6 +2440,13 @@ mod tests {
                         "the comment overlay must actually open: {}",
                         a.status
                     );
+                }),
+            ),
+            (
+                "the menu",
+                Box::new(|a: &mut App| {
+                    a.overlay = Overlay::None;
+                    a.open_menu(110, 0);
                 }),
             ),
             (
@@ -2600,15 +2790,15 @@ mod tests {
             "Edit stays available in local mode: {top:?}"
         );
         assert!(
-            top.contains("⇄ PR"),
-            "local mode offers the swap-to-PR button: {top:?}"
+            top.contains("☰"),
+            "everything else is behind the menu: {top:?}"
         );
     }
 
-    /// PR review offers the ⇄ Local toggle in the top bar (the ` key's
-    /// clickable twin).
+    /// The PR badge is a click target, so a right-click on it can copy
+    /// the PR link. The rect has to cover the badge text and nothing else.
     #[test]
-    fn pr_mode_topbar_offers_swap_to_local() {
+    fn the_pr_badge_is_a_click_target() {
         let mut app = App::new(crate::app::LaunchMode::Pr, None);
         app.screen = Screen::Review;
         app.pr = Some(crate::github::PrDetail {
@@ -2619,6 +2809,53 @@ mod tests {
             base_ref_oid: "b".repeat(40),
             base_ref_name: "main".into(),
             head_ref_name: "feat".into(),
+            url: "https://github.com/o/r/pull/3".into(),
+        });
+        app.checked_out = true;
+        app.files = vec![ChangedFile {
+            path: "test.rs".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            previous: None,
+        }];
+        app.rebuild_entries();
+        app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
+        app.rebuild_display();
+
+        let backend = TestBackend::new(120, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let badge = app.layout.badge;
+        assert_eq!(badge.y, 0, "the badge is on the top bar");
+        let text: String = (badge.x..badge.x + badge.width)
+            .map(|x| buf[(x, 0)].symbol())
+            .collect();
+        assert_eq!(text, " PR #3 ", "the rect covers the badge: {text:?}");
+        assert_eq!(
+            app.pr_url().as_deref(),
+            Some("https://github.com/o/r/pull/3"),
+            "the link comes from `gh pr view --json url`"
+        );
+    }
+
+    /// The ⇄ swap moved off the toolbar and into the ☰ menu, which names
+    /// the side it would take you to.
+    #[test]
+    fn the_menu_offers_the_swap_to_the_other_side() {
+        let mut app = App::new(crate::app::LaunchMode::Pr, None);
+        app.screen = Screen::Review;
+        app.pr = Some(crate::github::PrDetail {
+            id: "node".into(),
+            number: 3,
+            title: "a change".into(),
+            head_ref_oid: "a".repeat(40),
+            base_ref_oid: "b".repeat(40),
+            base_ref_name: "main".into(),
+            head_ref_name: "feat".into(),
+            url: "https://github.com/o/r/pull/3".into(),
         });
         app.checked_out = true;
         app.files = vec![ChangedFile {
@@ -2637,14 +2874,100 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
 
         let buf = term.backend().buffer();
-        let mut top = String::new();
-        for x in 0..buf.area.width {
-            top.push_str(buf[(x, 0)].symbol());
-        }
+        let _ = buf;
+        // The toolbar no longer carries it; the menu does.
+        app.open_menu(110, 0);
+        let backend = TestBackend::new(120, 44);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let all: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
         assert!(
-            top.contains("⇄ Local"),
-            "PR mode offers the swap-to-local button: {top:?}"
+            all.contains("Swap to local changes"),
+            "the menu names the other side: {all:?}"
         );
+        assert!(
+            app.layout
+                .buttons
+                .iter()
+                .any(|(_, id)| matches!(id, ButtonId::MenuRow(_))),
+            "every menu line is a click target"
+        );
+    }
+
+    /// The ☰ menu draws its headings, its on/off switches and the key
+    /// that does the same thing outside it, and it stays on screen.
+    #[test]
+    fn the_menu_draws_grouped_lines_with_their_keys() {
+        let _guard = crate::theme::test_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.local_branch = Some("feature/x".into());
+        app.files = vec![ChangedFile {
+            path: "test.rs".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            previous: None,
+        }];
+        app.rebuild_entries();
+        app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
+        app.rebuild_display();
+
+        // Open it where the ☰ button is, at the right edge of the top bar.
+        let buf = render(&mut app);
+        let menu_btn = app
+            .layout
+            .buttons
+            .iter()
+            .find(|(_, id)| *id == ButtonId::Menu)
+            .map(|(r, _)| *r)
+            .expect("the top bar draws ☰");
+        let _ = buf;
+        app.open_menu(menu_btn.x, menu_btn.y);
+        let buf = render(&mut app);
+        let all: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
+
+        assert!(all.contains("VIEW"), "headings are drawn: {all:?}");
+        assert!(all.contains("ACTIONS"), "headings are drawn: {all:?}");
+        assert!(all.contains("Search the repository"));
+        // The switches say what they are set to.
+        assert!(all.contains("Fold unchanged lines"), "{all:?}");
+        assert!(all.contains("●"), "a switch shows its state: {all:?}");
+        // Every drawn line is clickable.
+        assert!(app
+            .layout
+            .buttons
+            .iter()
+            .any(|(_, id)| matches!(id, ButtonId::MenuRow(_))));
+        // The panel is pulled left until it fits, never off the edge.
+        for (r, id) in &app.layout.buttons {
+            if matches!(id, ButtonId::MenuRow(_)) {
+                assert!(
+                    r.x + r.width <= buf.area.width,
+                    "a menu row ran off the screen: {r:?}"
+                );
+            }
+        }
+        // Twenty rows cannot hold it, so it says there is more, and it
+        // leaves the ☰ it came from visible.
+        assert!(all.contains("scroll"), "the cut-off menu says so: {all:?}");
+        assert!(
+            row_text(&buf, 0).contains("☰"),
+            "the top bar is never covered: {:?}",
+            row_text(&buf, 0)
+        );
+
+        // A terminal with room shows the whole menu and drops the hint.
+        let backend = TestBackend::new(120, 44);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let all: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
+        assert!(all.contains("SETTINGS"), "{all:?}");
+        assert!(all.contains("Quit"), "the last line is reachable: {all:?}");
+        assert!(!all.contains("scroll"), "nothing is hidden: {all:?}");
     }
 
     /// The finder has to render its results *and* record a hit area per
@@ -2839,7 +3162,11 @@ mod tests {
         // Select a line and it appears.
         app.selection = Some(crate::diff::Selection::lines(Side::Right, 1, 1));
         let buf = render(&mut app);
-        assert!(row_text(&buf, 0).contains("Copy"), "{:?}", row_text(&buf, 0));
+        assert!(
+            row_text(&buf, 0).contains("Copy"),
+            "{:?}",
+            row_text(&buf, 0)
+        );
         assert!(app
             .layout
             .buttons
@@ -2876,7 +3203,7 @@ mod tests {
             top.contains("a-long-branch"),
             "the branch is still readable: {top:?}"
         );
-        assert!(top.contains("Help"), "the last button is kept: {top:?}");
+        assert!(top.contains("☰"), "the last button is kept: {top:?}");
     }
 
     /// The highlight has to show exactly what a copy would take —
@@ -2905,7 +3232,9 @@ mod tests {
 
         let selected = |buf: &ratatui::buffer::Buffer, y: u16| -> usize {
             let bg = palette().selected;
-            (0..buf.area.width).filter(|x| buf[(*x, y)].bg == bg).count()
+            (0..buf.area.width)
+                .filter(|x| buf[(*x, y)].bg == bg)
+                .count()
         };
 
         // A whole-line selection still paints the whole row, padding
@@ -2943,4 +3272,3 @@ mod tests {
         assert_eq!(right_half, 0, "the new side is not selected");
     }
 }
-

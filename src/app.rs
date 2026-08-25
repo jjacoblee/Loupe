@@ -72,6 +72,80 @@ pub enum Overlay {
     Revert(Box<RevertPrompt>),
     /// The right-click menu on a file-panel row.
     PathMenu(Box<PathMenu>),
+    /// The ☰ menu in the top bar — everything the toolbar no longer has
+    /// room to show.
+    Menu(Box<Menu>),
+}
+
+/// One line of the ☰ menu. A heading is a label with no action; an item
+/// runs a [`ButtonId`] through the same dispatch the toolbar uses, so a
+/// menu line and a button can never drift apart.
+pub enum MenuRow {
+    Heading(&'static str),
+    Item(MenuItem),
+}
+
+pub struct MenuItem {
+    pub label: String,
+    /// The key that does the same thing outside the menu, shown greyed on
+    /// the right. Empty when there is no key for it.
+    pub hint: &'static str,
+    pub id: ButtonId,
+    /// False for a line that does not apply right now (no selection to
+    /// copy, nothing to revert). It is drawn dim and does nothing.
+    pub enabled: bool,
+    /// `Some` turns the line into a switch and draws its state.
+    pub checked: Option<bool>,
+}
+
+/// The ☰ menu: a scrollable list of [`MenuRow`], anchored under the button
+/// that opened it.
+pub struct Menu {
+    pub rows: Vec<MenuRow>,
+    /// Index into `rows`; always an enabled [`MenuRow::Item`].
+    pub sel: usize,
+    /// First visible row, for a menu taller than the terminal.
+    pub scroll: usize,
+    /// The cell the ☰ button occupies. The menu hangs below it.
+    pub anchor: (u16, u16),
+}
+
+impl Menu {
+    /// The next selectable row in `step` direction, or the current one when
+    /// there is nothing further. Headings and disabled lines are skipped.
+    fn next_selectable(&self, from: usize, step: isize) -> usize {
+        let mut i = from as isize;
+        loop {
+            i += step;
+            if i < 0 || i as usize >= self.rows.len() {
+                return from;
+            }
+            if matches!(&self.rows[i as usize], MenuRow::Item(it) if it.enabled) {
+                return i as usize;
+            }
+        }
+    }
+
+    /// The first selectable row, for the initial selection.
+    fn first_selectable(&self) -> usize {
+        self.rows
+            .iter()
+            .position(|r| matches!(r, MenuRow::Item(it) if it.enabled))
+            .unwrap_or(0)
+    }
+
+    /// Keep the selection inside the `height` visible rows.
+    pub fn scroll_into_view(&mut self, height: usize) {
+        if height == 0 {
+            return;
+        }
+        if self.sel < self.scroll {
+            self.scroll = self.sel;
+        } else if self.sel >= self.scroll + height {
+            self.scroll = self.sel + 1 - height;
+        }
+        self.scroll = self.scroll.min(self.rows.len().saturating_sub(height));
+    }
 }
 
 /// One line of the file-panel right-click menu.
@@ -173,7 +247,10 @@ impl FinderMode {
     /// Whether the mode is one the user can type their way into (the tabs
     /// along the bottom); `Refs` and `Pick` are arrived at, not chosen.
     pub fn is_tab(self) -> bool {
-        matches!(self, FinderMode::Files | FinderMode::Grep | FinderMode::Symbols)
+        matches!(
+            self,
+            FinderMode::Files | FinderMode::Grep | FinderMode::Symbols
+        )
     }
 }
 
@@ -281,8 +358,22 @@ const SYNC_DEBOUNCE: Duration = Duration::from_millis(220);
 /// Rows the finder shows at once (the overlay is sized to match).
 pub const FINDER_ROWS: usize = 14;
 
+/// How long input has to stop before local review re-scans the working
+/// tree by itself. Short enough that an agent's edits appear while you
+/// read, long enough that it never runs mid-gesture.
+const IDLE_BEFORE_RESCAN: Duration = Duration::from_millis(2000);
+
+/// Floor between two automatic re-scans. A long read is a long idle, and
+/// without this floor it would be one `git status` every 2 seconds.
+const RESCAN_MIN_GAP: Duration = Duration::from_secs(5);
+
 impl Finder {
-    fn new(mode: FinderMode, changeset: Vec<String>, symbols: Vec<search::Symbol>, symbol_path: String) -> Self {
+    fn new(
+        mode: FinderMode,
+        changeset: Vec<String>,
+        symbols: Vec<search::Symbol>,
+        symbol_path: String,
+    ) -> Self {
         Finder {
             mode,
             input: String::new(),
@@ -583,8 +674,6 @@ impl ThemePicker {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonId {
-    ViewSplit,
-    ViewInline,
     ViewTree,
     ViewFlat,
     FoldToggle,
@@ -626,12 +715,38 @@ pub enum ButtonId {
     RevertCancel,
     /// A line of the file-panel right-click menu.
     PathMenuRow(usize),
+
+    // --- the ☰ menu and the lines only it offers
+    /// ☰ in the top bar.
+    Menu,
+    /// A line of the ☰ menu, by index into [`Menu::rows`].
+    MenuRow(usize),
+    /// One row that flips between split and inline (the toolbar used to
+    /// spend two buttons on this).
+    ViewToggle,
+    /// One row that flips the file panel between tree and flat.
+    TreeToggle,
+    /// The finder, opened straight into one of its three modes.
+    FindGrep,
+    FindSymbols,
+    /// `/` — the incremental search inside the open diff.
+    FindInDiff,
+    /// ↺ on the section at the cursor, and on the whole file. Both ask
+    /// before they touch anything.
+    RevertSection,
+    RevertFile,
+    /// The idle re-scan switch (see `App::auto_refresh`).
+    AutoRefreshToggle,
+    Quit,
 }
 
 /// Clickable regions recorded during the last draw.
 #[derive(Default)]
 pub struct HitAreas {
     pub buttons: Vec<(Rect, ButtonId)>,
+    /// The PR / LOCAL badge in the review top bar. Right-click copies the
+    /// PR link, so a coding agent can be pointed at the same PR.
+    pub badge: Rect,
     pub pr_list: Rect,
     pub file_list: Rect,
     pub diff: Rect,
@@ -841,6 +956,10 @@ struct QuietJob {
     rx: Receiver<Result<QuietOutcome>>,
     label: String,
     started: Instant,
+    /// True when the idle timer started this, not the reader. An automatic
+    /// refresh that finds nothing says nothing — otherwise the status line
+    /// repeats "up to date" every few seconds forever.
+    auto: bool,
 }
 
 pub struct PrRefreshData {
@@ -920,10 +1039,17 @@ pub enum Outcome {
     /// Changes thrown away — one section, or a whole file.
     Reverted(Box<RevertedData>),
     LocalOpened(Box<LocalOpenedData>),
-    Prs { repo: String, prs: Vec<PrSummary> },
+    Prs {
+        repo: String,
+        prs: Vec<PrSummary>,
+    },
     PrOpened(Box<PrOpenedData>),
     FileLoaded(Box<FileLoadedData>),
-    CommentPosted { path: String, lo: usize, hi: usize },
+    CommentPosted {
+        path: String,
+        lo: usize,
+        hi: usize,
+    },
     EditorSaved(Box<EditorSavedData>),
     ExternalOpened(Box<ExternalFile>),
     /// A file outside the changeset was written; nothing else changed.
@@ -1007,8 +1133,14 @@ struct EditorJob {
 
 enum EditorOutcome {
     Completions(Vec<lsp::Completion>),
-    Hover { word: String, text: Option<String> },
-    Definition { word: String, locs: Vec<lsp::Loc> },
+    Hover {
+        word: String,
+        text: Option<String>,
+    },
+    Definition {
+        word: String,
+        locs: Vec<lsp::Loc>,
+    },
     /// `None` when the server does not format this language.
     Formatted(Option<Vec<lsp::TextEdit>>),
 }
@@ -1145,7 +1277,17 @@ pub struct App {
     quiet: Option<QuietJob>,
     /// A quiet result that landed while a modal job was running; applied
     /// once the modal job finishes so the two can't fight over the state.
-    pending_quiet: Option<QuietOutcome>,
+    /// The flag is the job's `auto` (see [`QuietJob`]).
+    pending_quiet: Option<(QuietOutcome, bool)>,
+    /// When the last key or mouse event arrived. The idle re-scan waits
+    /// for a gap here, so it never lands mid-drag or mid-keystroke.
+    last_input: Instant,
+    /// When the last automatic re-scan started, for the [`RESCAN_MIN_GAP`]
+    /// floor.
+    last_auto_rescan: Instant,
+    /// `auto_refresh` in the config: the idle re-scan of local changes.
+    /// Also toggled from the ☰ menu, for this session.
+    pub auto_refresh: bool,
     /// Language servers, started on demand and shared with worker
     /// threads (see [`crate::lsp`]).
     pub lsp: Lsp,
@@ -1237,6 +1379,9 @@ impl App {
             stash: None,
             quiet: None,
             pending_quiet: None,
+            last_input: Instant::now(),
+            last_auto_rescan: Instant::now(),
+            auto_refresh: true,
             lsp: Lsp::default(),
             lsp_enabled: true,
             click_word: None,
@@ -1517,12 +1662,19 @@ impl App {
         if let Some(q) = &self.quiet {
             match q.rx.try_recv() {
                 Ok(r) => {
+                    let auto = q.auto;
                     self.quiet = None;
                     match r {
-                        Ok(o) if self.job.is_some() => self.pending_quiet = Some(o),
-                        Ok(o) => self.apply_quiet(o),
+                        Ok(o) if self.job.is_some() => self.pending_quiet = Some((o, auto)),
+                        Ok(o) => self.apply_quiet(o, auto),
                         // A failed refresh never disturbs what's on screen.
-                        Err(e) => self.err(format!("Background refresh failed: {e:#}")),
+                        // An automatic one fails silently too: the reader
+                        // never asked, so a scary line would be noise.
+                        Err(e) => {
+                            if !auto {
+                                self.err(format!("Background refresh failed: {e:#}"));
+                            }
+                        }
                     }
                     changed = true;
                 }
@@ -1532,6 +1684,11 @@ impl App {
                     changed = true;
                 }
             }
+        }
+
+        // Nothing in flight and the reader has gone quiet: check the tree.
+        if self.maybe_auto_rescan() {
+            changed = true;
         }
 
         let Some(job) = &self.job else { return changed };
@@ -1556,11 +1713,52 @@ impl App {
         }
         // A quiet result that arrived mid-job can go on now.
         if self.job.is_none() {
-            if let Some(o) = self.pending_quiet.take() {
-                self.apply_quiet(o);
+            if let Some((o, auto)) = self.pending_quiet.take() {
+                self.apply_quiet(o, auto);
             }
         }
         true
+    }
+
+    /// Start an idle re-scan of the working tree when the reader has been
+    /// still long enough.
+    ///
+    /// This is the answer to an agent editing files under an open review:
+    /// the diff on screen goes stale the moment something else writes to
+    /// the tree, and nothing in a terminal tells loupe that it happened.
+    /// Only local review polls — a pull request lives on GitHub, and
+    /// polling that on a timer spends API calls for a head commit that
+    /// moves a few times a day.
+    ///
+    /// Every condition below means "the reader is in the middle of
+    /// something": a modal job, an overlay, the editor, a live selection,
+    /// a drag. The re-scan waits rather than pulling the ground out.
+    fn maybe_auto_rescan(&mut self) -> bool {
+        if !self.should_auto_rescan() {
+            return false;
+        }
+        self.last_auto_rescan = Instant::now();
+        self.spawn_quiet_local(true);
+        true
+    }
+
+    /// The decision behind [`Self::maybe_auto_rescan`], kept separate so it
+    /// can be tested without starting a `git status`.
+    fn should_auto_rescan(&self) -> bool {
+        if !self.auto_refresh || !self.local || self.screen != Screen::Review {
+            return false;
+        }
+        if self.job.is_some() || self.quiet.is_some() || self.pending_quiet.is_some() {
+            return false;
+        }
+        if self.editor.is_some() || !matches!(self.overlay, Overlay::None) {
+            return false;
+        }
+        if self.selection.is_some() || self.drag_select || self.resizing {
+            return false;
+        }
+        self.last_input.elapsed() >= IDLE_BEFORE_RESCAN
+            && self.last_auto_rescan.elapsed() >= RESCAN_MIN_GAP
     }
 
     fn apply(&mut self, outcome: Outcome) {
@@ -1713,9 +1911,10 @@ impl App {
                 // Start this language's server in the background, so the
                 // first gd / gr / K doesn't pay for the handshake.
                 if self.lsp_enabled {
-                    if let (Some(file), Some(text)) =
-                        (self.files.get(self.file_cursor), self.new_content.as_deref())
-                    {
+                    if let (Some(file), Some(text)) = (
+                        self.files.get(self.file_cursor),
+                        self.new_content.as_deref(),
+                    ) {
                         self.lsp.warm(&self.repo_root, &file.path, text);
                     }
                 }
@@ -2330,7 +2529,7 @@ impl App {
         // again has to leave the list — and a whole-file revert always
         // leaves it, including one done from a row that isn't open.
         if self.local && (cleaned || d.gone || d.whole_file) {
-            self.spawn_quiet_local();
+            self.spawn_quiet_local(false);
         } else if self.local {
             // A section went back in the working tree only, which can turn
             // a staged file into a partly staged one: re-read the index so
@@ -2588,6 +2787,7 @@ impl App {
     // ----------------------------------------------------------------- keys
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.last_input = Instant::now();
         // A foreground job is modal: only cancel/quit get through.
         if self.job.is_some() {
             match key.code {
@@ -2657,6 +2857,54 @@ impl App {
                     self.overlay = Overlay::None;
                 } else if let Some(i) = hit {
                     self.path_menu_copy(i);
+                }
+                return;
+            }
+            Overlay::Menu(menu) => {
+                let mut close = false;
+                let hit = match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        menu.sel = menu.next_selectable(menu.sel, -1);
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        menu.sel = menu.next_selectable(menu.sel, 1);
+                        None
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => Some(menu.sel),
+                    KeyCode::Esc => {
+                        close = true;
+                        None
+                    }
+                    // The hint column is the key that does the same thing
+                    // outside the menu, so pressing it here runs the line.
+                    // A menu open should never be a reason to learn a
+                    // second set of keys.
+                    KeyCode::Char(c) => {
+                        let want = c.to_string();
+                        let found = menu.rows.iter().position(
+                            |r| matches!(r, MenuRow::Item(it) if it.enabled && it.hint == want),
+                        );
+                        // No line owns this key: close and let it through
+                        // to the review, rather than swallowing it.
+                        if found.is_none() {
+                            close = true;
+                        }
+                        found
+                    }
+                    _ => None,
+                };
+                if let Some(i) = hit {
+                    self.menu_activate(i);
+                    return;
+                }
+                if close {
+                    self.overlay = Overlay::None;
+                    // `q` on an open menu means quit, the same as it does
+                    // everywhere else.
+                    if key.code == KeyCode::Char('q') {
+                        self.should_quit = true;
+                    }
                 }
                 return;
             }
@@ -2862,6 +3110,7 @@ impl App {
                 KeyCode::Char('r') => self.spawn_load_prs(),
                 KeyCode::Char('l') => self.spawn_open_local(true),
                 KeyCode::Char('`') => self.toggle_workspace(),
+                KeyCode::Char('m') => self.open_menu_from_key(),
                 KeyCode::Char('t') => self.open_theme_picker(),
                 KeyCode::Char('?') => self.overlay = Overlay::Help,
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -2992,7 +3241,8 @@ impl App {
                     }
                     KeyCode::Char('c') => self.open_comment(),
                     KeyCode::Char('`') => self.toggle_workspace(),
-                    KeyCode::Char('r') => self.spawn_load_file(self.file_cursor),
+                    KeyCode::Char('r') => self.refresh_review(),
+                    KeyCode::Char('m') => self.open_menu_from_key(),
                     KeyCode::Char('t') => self.open_theme_picker(),
                     KeyCode::Char('?') => self.overlay = Overlay::Help,
                     KeyCode::Char('<') => self.resize_file_panel(-2),
@@ -3021,6 +3271,7 @@ impl App {
     // ---------------------------------------------------------------- mouse
 
     pub fn handle_mouse(&mut self, m: MouseEvent) {
+        self.last_input = Instant::now();
         if self.job.is_some() {
             return;
         }
@@ -3119,6 +3370,31 @@ impl App {
                 }
                 return;
             }
+            Overlay::Menu(_) => {
+                match m.kind {
+                    // The wheel over an open menu scrolls the menu, not the
+                    // diff behind it.
+                    MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                        let step: isize = if m.kind == MouseEventKind::ScrollDown {
+                            1
+                        } else {
+                            -1
+                        };
+                        if let Overlay::Menu(menu) = &mut self.overlay {
+                            for _ in 0..3 {
+                                menu.sel = menu.next_selectable(menu.sel, step);
+                            }
+                        }
+                    }
+                    MouseEventKind::Down(_) => match self.layout.button_at(x, y) {
+                        Some(ButtonId::MenuRow(i)) => self.menu_activate(i),
+                        // Clicking ☰ again puts the menu away.
+                        _ => self.overlay = Overlay::None,
+                    },
+                    _ => {}
+                }
+                return;
+            }
             Overlay::None => {}
         }
 
@@ -3131,23 +3407,11 @@ impl App {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     match self.layout.button_at(x, y) {
-                        Some(ButtonId::EditorFormat) => {
-                        self.ok("Formatting…");
-                        self.spawn_editor_request(EditorRequest::Format);
-                        return;
-                    }
-                    Some(ButtonId::EditorSave) => {
-                            self.spawn_save_editor();
+                        Some(ButtonId::Menu) => {
+                            self.open_menu(x, y);
                             return;
                         }
-                        Some(ButtonId::EditorClose) => {
-                            self.request_close_editor();
-                            return;
-                        }
-                        Some(ButtonId::Help) => {
-                            self.overlay = Overlay::Help;
-                            return;
-                        }
+                        Some(id) if self.activate(id) => return,
                         _ => {}
                     }
                     if contains(self.layout.file_list, x, y) {
@@ -3206,22 +3470,11 @@ impl App {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 match self.layout.button_at(x, y) {
-                    Some(ButtonId::Refresh) => {
-                        self.spawn_load_prs();
+                    Some(ButtonId::Menu) => {
+                        self.open_menu(x, y);
                         return;
                     }
-                    Some(ButtonId::LocalChanges) => {
-                        self.spawn_open_local(true);
-                        return;
-                    }
-                    Some(ButtonId::Theme) => {
-                        self.open_theme_picker();
-                        return;
-                    }
-                    Some(ButtonId::Help) => {
-                        self.overlay = Overlay::Help;
-                        return;
-                    }
+                    Some(id) if self.activate(id) => return,
                     _ => {}
                 }
                 let r = self.layout.pr_list;
@@ -3252,58 +3505,11 @@ impl App {
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 match self.layout.button_at(x, y) {
-                    Some(ButtonId::ViewSplit) => {
-                        self.set_view(ViewMode::SideBySide);
+                    Some(ButtonId::Menu) => {
+                        self.open_menu(x, y);
                         return;
                     }
-                    Some(ButtonId::ViewInline) => {
-                        self.set_view(ViewMode::Inline);
-                        return;
-                    }
-                    Some(ButtonId::ViewTree) => {
-                        self.set_tree_view(true);
-                        return;
-                    }
-                    Some(ButtonId::ViewFlat) => {
-                        self.set_tree_view(false);
-                        return;
-                    }
-                    Some(ButtonId::FoldToggle) => {
-                        self.toggle_fold();
-                        return;
-                    }
-                    Some(ButtonId::Edit) => {
-                        self.open_editor(None);
-                        return;
-                    }
-                    Some(ButtonId::Comment) => {
-                        self.open_comment();
-                        return;
-                    }
-                    Some(ButtonId::BackToPrs) => {
-                        self.back_to_pr_list();
-                        return;
-                    }
-                    Some(ButtonId::SwapView) => {
-                        self.toggle_workspace();
-                        return;
-                    }
-                    Some(ButtonId::Find) => {
-                        self.open_finder(FinderMode::Files);
-                        return;
-                    }
-                    Some(ButtonId::Copy) => {
-                        self.yank();
-                        return;
-                    }
-                    Some(ButtonId::Theme) => {
-                        self.open_theme_picker();
-                        return;
-                    }
-                    Some(ButtonId::Help) => {
-                        self.overlay = Overlay::Help;
-                        return;
-                    }
+                    Some(id) if self.activate(id) => return,
                     _ => {}
                 }
                 let fl = self.layout.file_list;
@@ -3327,7 +3533,9 @@ impl App {
             // Right-click on the file panel asks about the row's path;
             // anywhere else it drops the diff selection.
             MouseEventKind::Down(MouseButton::Right) => {
-                if contains(self.layout.file_list, x, y) {
+                if contains(self.layout.badge, x, y) {
+                    self.copy_pr_link();
+                } else if contains(self.layout.file_list, x, y) {
                     self.open_path_menu(x, y);
                 } else {
                     self.clear_selection();
@@ -3411,7 +3619,9 @@ impl App {
             .and_then(|c| self.char_index(side, line, c))
             .unwrap_or(0)
             .min(len);
-        let Some(sel) = &mut self.selection else { return };
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
         sel.end = Pos::new(line, col);
         // Any drag at all means the user is choosing characters, not lines.
         sel.linewise = false;
@@ -3578,6 +3788,266 @@ impl App {
             Ok(via) => self.ok(format!("⧉ Copied {text} to the clipboard via {via}.")),
             Err(e) => self.err(format!("Couldn't copy: {e:#}")),
         }
+    }
+
+    // ------------------------------------------------------------- ☰ menu
+
+    /// Build the ☰ menu for whatever is on screen right now.
+    ///
+    /// The toolbar shows the two or three things that fit; this is the rest
+    /// of the tool. It is rebuilt on every open rather than cached, so a
+    /// line's enabled state and its on/off mark always describe the state
+    /// the reader is actually looking at.
+    fn build_menu(&self) -> Vec<MenuRow> {
+        let item = |label: String, hint: &'static str, id: ButtonId| {
+            MenuRow::Item(MenuItem {
+                label,
+                hint,
+                id,
+                enabled: true,
+                checked: None,
+            })
+        };
+        let switch = |label: String, hint: &'static str, id: ButtonId, on: bool| {
+            MenuRow::Item(MenuItem {
+                label,
+                hint,
+                id,
+                enabled: true,
+                checked: Some(on),
+            })
+        };
+        let maybe = |label: String, hint: &'static str, id: ButtonId, enabled: bool| {
+            MenuRow::Item(MenuItem {
+                label,
+                hint,
+                id,
+                enabled,
+                checked: None,
+            })
+        };
+
+        let mut rows = Vec::new();
+
+        if self.screen == Screen::PrList {
+            rows.push(MenuRow::Heading("GO"));
+            rows.push(item("⎇  Local changes".into(), "l", ButtonId::LocalChanges));
+            rows.push(item("⟳  Refresh the list".into(), "r", ButtonId::Refresh));
+            rows.push(MenuRow::Heading("SETTINGS"));
+            rows.push(item("🎨 Theme".into(), "t", ButtonId::Theme));
+            rows.push(item("?  Help".into(), "?", ButtonId::Help));
+            rows.push(item("✕  Quit".into(), "q", ButtonId::Quit));
+            return rows;
+        }
+
+        if self.editor.is_some() {
+            rows.push(MenuRow::Heading("EDITOR"));
+            rows.push(item("💾 Save".into(), "Ctrl+S", ButtonId::EditorSave));
+            rows.push(item("⇥  Format".into(), "Ctrl+T", ButtonId::EditorFormat));
+            rows.push(item(
+                "✕  Close the editor".into(),
+                "Esc",
+                ButtonId::EditorClose,
+            ));
+            rows.push(MenuRow::Heading("SETTINGS"));
+            rows.push(item("🎨 Theme".into(), "t", ButtonId::Theme));
+            rows.push(item("?  Help".into(), "?", ButtonId::Help));
+            return rows;
+        }
+
+        let has_sel = self.selection.is_some();
+        let split = self.view == ViewMode::SideBySide;
+
+        rows.push(MenuRow::Heading("VIEW"));
+        rows.push(item(
+            if split {
+                "≡  Switch to inline".into()
+            } else {
+                "◫  Switch to split".into()
+            },
+            "v",
+            ButtonId::ViewToggle,
+        ));
+        rows.push(switch(
+            "⇕  Fold unchanged lines".into(),
+            "z",
+            ButtonId::FoldToggle,
+            self.collapse_unchanged,
+        ));
+        rows.push(switch(
+            "🌲 Tree file panel".into(),
+            "",
+            ButtonId::TreeToggle,
+            self.tree_view,
+        ));
+
+        rows.push(MenuRow::Heading("FIND"));
+        rows.push(item("Go to a file".into(), "Ctrl+P", ButtonId::Find));
+        rows.push(item(
+            "Search the repository".into(),
+            "#",
+            ButtonId::FindGrep,
+        ));
+        rows.push(item(
+            "Symbols in this file".into(),
+            "@",
+            ButtonId::FindSymbols,
+        ));
+        rows.push(item("Search this diff".into(), "/", ButtonId::FindInDiff));
+
+        rows.push(MenuRow::Heading("ACTIONS"));
+        rows.push(item("✎  Edit this file".into(), "e", ButtonId::Edit));
+        if !self.local {
+            rows.push(maybe(
+                "💬 Comment on the selection".into(),
+                "c",
+                ButtonId::Comment,
+                has_sel,
+            ));
+        }
+        rows.push(maybe(
+            "⧉  Copy the selection".into(),
+            "y",
+            ButtonId::Copy,
+            has_sel,
+        ));
+        let revert = self.can_revert();
+        rows.push(maybe(
+            "↺  Revert this section".into(),
+            "u",
+            ButtonId::RevertSection,
+            revert,
+        ));
+        rows.push(maybe(
+            "↺  Revert the whole file".into(),
+            "U",
+            ButtonId::RevertFile,
+            revert,
+        ));
+
+        rows.push(MenuRow::Heading("GO"));
+        rows.push(item("⟳  Refresh now".into(), "r", ButtonId::Refresh));
+        rows.push(item(
+            if self.local {
+                "⇄  Swap to the pull request".into()
+            } else {
+                "⇄  Swap to local changes".into()
+            },
+            "`",
+            ButtonId::SwapView,
+        ));
+        rows.push(item(
+            "←  Pull request list".into(),
+            "b",
+            ButtonId::BackToPrs,
+        ));
+
+        rows.push(MenuRow::Heading("SETTINGS"));
+        rows.push(item("🎨 Theme".into(), "t", ButtonId::Theme));
+        // Only local review polls, so the switch belongs to local review.
+        if self.local {
+            rows.push(switch(
+                "⟳  Refresh while idle".into(),
+                "",
+                ButtonId::AutoRefreshToggle,
+                self.auto_refresh,
+            ));
+        }
+        rows.push(item("?  Help".into(), "?", ButtonId::Help));
+        rows.push(item("✕  Quit".into(), "q", ButtonId::Quit));
+        rows
+    }
+
+    /// Open the ☰ menu under the button at (`x`, `y`).
+    pub fn open_menu(&mut self, x: u16, y: u16) {
+        let rows = self.build_menu();
+        let mut menu = Menu {
+            rows,
+            sel: 0,
+            scroll: 0,
+            anchor: (x, y),
+        };
+        menu.sel = menu.first_selectable();
+        self.overlay = Overlay::Menu(Box::new(menu));
+    }
+
+    /// `m`: open the ☰ menu where the ☰ button is, so it lands in the same
+    /// place whether the mouse or the keyboard asked for it.
+    pub fn open_menu_from_key(&mut self) {
+        let anchor = self
+            .layout
+            .buttons
+            .iter()
+            .find(|(_, id)| *id == ButtonId::Menu)
+            .map(|(r, _)| (r.x, r.y))
+            .unwrap_or((0, 0));
+        self.open_menu(anchor.0, anchor.1);
+    }
+
+    /// Run the ☰ menu line at `i` and close the menu.
+    fn menu_activate(&mut self, i: usize) {
+        let Overlay::Menu(menu) = &self.overlay else {
+            return;
+        };
+        let Some(MenuRow::Item(item)) = menu.rows.get(i) else {
+            return;
+        };
+        if !item.enabled {
+            return;
+        }
+        let id = item.id;
+        self.overlay = Overlay::None;
+        self.activate(id);
+    }
+
+    /// The one dispatch table behind every toolbar button and every ☰ menu
+    /// line. Returns false for an id this does not own (an overlay's own
+    /// buttons handle those themselves).
+    pub fn activate(&mut self, id: ButtonId) -> bool {
+        match id {
+            ButtonId::ViewToggle => self.toggle_view(),
+            ButtonId::ViewTree => self.set_tree_view(true),
+            ButtonId::ViewFlat => self.set_tree_view(false),
+            ButtonId::TreeToggle => self.set_tree_view(!self.tree_view),
+            ButtonId::FoldToggle => self.toggle_fold(),
+            ButtonId::Find => self.open_finder(FinderMode::Files),
+            ButtonId::FindGrep => self.open_finder(FinderMode::Grep),
+            ButtonId::FindSymbols => self.open_finder(FinderMode::Symbols),
+            ButtonId::FindInDiff => self.start_find(),
+            ButtonId::Edit => self.open_editor(None),
+            ButtonId::Comment => self.open_comment(),
+            ButtonId::Copy => self.yank(),
+            ButtonId::RevertSection => self.ask_revert_section(self.diff_cursor),
+            ButtonId::RevertFile => self.ask_revert_file(self.file_cursor),
+            ButtonId::Refresh => match self.screen {
+                Screen::PrList => self.spawn_load_prs(),
+                Screen::Review => self.refresh_review(),
+            },
+            ButtonId::SwapView => self.toggle_workspace(),
+            ButtonId::BackToPrs => self.back_to_pr_list(),
+            ButtonId::LocalChanges => self.spawn_open_local(true),
+            ButtonId::Theme => self.open_theme_picker(),
+            ButtonId::AutoRefreshToggle => {
+                self.auto_refresh = !self.auto_refresh;
+                if self.auto_refresh {
+                    // Start the clock now, not from whenever it was last on.
+                    self.last_auto_rescan = Instant::now();
+                    self.ok("⟳ Idle refresh on — local changes re-scan while you read.");
+                } else {
+                    self.ok("⟳ Idle refresh off — press r (or ⟳) to re-scan.");
+                }
+            }
+            ButtonId::Help => self.overlay = Overlay::Help,
+            ButtonId::Quit => self.should_quit = true,
+            ButtonId::EditorSave => self.spawn_save_editor(),
+            ButtonId::EditorClose => self.request_close_editor(),
+            ButtonId::EditorFormat => {
+                self.ok("Formatting…");
+                self.spawn_editor_request(EditorRequest::Format);
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn diff_click(&mut self, x: u16, y: u16) {
@@ -4250,11 +4720,13 @@ impl App {
         };
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(search::grep(&req).map(|(hits, truncated)| SearchOutcome::Grep {
-                hits,
-                truncated,
-                query,
-            }));
+            let _ = tx.send(
+                search::grep(&req).map(|(hits, truncated)| SearchOutcome::Grep {
+                    hits,
+                    truncated,
+                    query,
+                }),
+            );
         });
         self.search_job = Some(SearchJob {
             rx,
@@ -4318,8 +4790,7 @@ impl App {
                     .collect();
                 // Definitions first, then hits in files under review. A
                 // stable sort keeps git's path ordering inside each group.
-                f.rows
-                    .sort_by_key(|r| (r.tag != "def", !r.in_changeset));
+                f.rows.sort_by_key(|r| (r.tag != "def", !r.in_changeset));
                 f.sel = 0;
                 f.scroll = 0;
                 let scope = if f.repo_scope {
@@ -4653,7 +5124,9 @@ impl App {
         match outcome {
             EditorOutcome::Completions(items) => {
                 let n = items.len();
-                let Some(editor) = &mut self.editor else { return };
+                let Some(editor) = &mut self.editor else {
+                    return;
+                };
                 if !editor.open_completion(items) && n > 0 {
                     // Everything was filtered out by what was typed while
                     // the request was in flight.
@@ -4755,6 +5228,33 @@ impl App {
             format!("{} lines ({which} side)", hi + 1 - lo)
         };
         Some((text, what))
+    }
+
+    /// Right-click on the PR badge: put the PR link on the clipboard.
+    /// A reviewer who spots something here usually hands the PR to a
+    /// coding agent next, and that agent wants the URL.
+    pub fn copy_pr_link(&mut self) {
+        let Some(url) = self.pr_url() else {
+            self.err("No PR link here — this is a local-changes review.");
+            return;
+        };
+        match clipboard::copy(&url) {
+            Ok(via) => self.ok(format!("⧉ Copied {url} to the clipboard via {via}.")),
+            Err(e) => self.err(format!("Couldn't copy: {e:#}")),
+        }
+    }
+
+    /// The web URL of the PR under review, if a PR is under review.
+    /// `gh pr view` reports it, which keeps GitHub Enterprise hosts
+    /// correct; the owner/name form is the fallback for a PR opened
+    /// before that field existed.
+    pub fn pr_url(&self) -> Option<String> {
+        let pr = self.pr.as_ref()?;
+        if !pr.url.is_empty() {
+            return Some(pr.url.clone());
+        }
+        let repo = self.repo.as_ref()?;
+        Some(format!("https://github.com/{repo}/pull/{}", pr.number))
     }
 
     /// `y` / Ctrl+C / the ⧉ Copy button.
@@ -4954,14 +5454,15 @@ impl App {
         // Don't start a job that can only end in "not installed".
         if lsp::which(spec.cmd).is_none() {
             if let Overlay::Finder(f) = &mut self.overlay {
-                f.note = format!(
-                    "{} · pattern matching ({} not installed)",
-                    f.note, spec.cmd
-                );
+                f.note = format!("{} · pattern matching ({} not installed)", f.note, spec.cmd);
             }
             return;
         }
-        let Some(text) = self.new_content.clone().or_else(|| self.old_content.clone()) else {
+        let Some(text) = self
+            .new_content
+            .clone()
+            .or_else(|| self.old_content.clone())
+        else {
             return;
         };
         self.search_gen += 1;
@@ -5178,16 +5679,16 @@ impl App {
             .get(origin_cursor)
             .map(|e| self.entry_row(*e))
             .unwrap_or(0);
-        let next = self
-            .find
-            .rows
-            .iter()
-            .position(|r| *r >= from)
-            .or(if self.find.rows.is_empty() {
-                None
-            } else {
-                Some(0)
-            });
+        let next =
+            self.find
+                .rows
+                .iter()
+                .position(|r| *r >= from)
+                .or(if self.find.rows.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                });
         match next {
             Some(i) => {
                 self.find.at = i;
@@ -5232,10 +5733,7 @@ impl App {
             return;
         }
         if self.find.rows.is_empty() {
-            self.err(format!(
-                "No match for “{}” in this file.",
-                self.find.query
-            ));
+            self.err(format!("No match for “{}” in this file.", self.find.query));
             return;
         }
         let cur = self
@@ -5408,11 +5906,11 @@ impl App {
                 self.restore_workspace(*ws);
                 if to_local {
                     self.ok("⎇ Local changes — rescanning in the background.");
-                    self.spawn_quiet_local();
+                    self.spawn_quiet_local(false);
                 } else {
                     let n = self.pr.as_ref().map(|p| p.number).unwrap_or(0);
                     self.ok(format!("PR #{n} — checking GitHub for updates."));
-                    self.spawn_quiet_pr();
+                    self.spawn_quiet_pr(false);
                 }
             }
             stash => {
@@ -5500,8 +5998,36 @@ impl App {
         self.ensure_file_visible();
     }
 
+    /// ⟳ in the review top bar, and the `r` key: re-read everything the
+    /// review is built from, without a loading screen.
+    ///
+    /// It re-scans the changed-file list and then reloads the open file
+    /// through the same silent path the swap uses, so the scroll position,
+    /// the cursor and the folds all survive. Use it when an agent (or a
+    /// second terminal) has been writing to the tree and the idle re-scan
+    /// has not caught up yet.
+    pub fn refresh_review(&mut self) {
+        if self.editor.is_some() {
+            self.err("Close the editor first (Ctrl+S saves, Esc closes) before refreshing.");
+            return;
+        }
+        if self.quiet.is_some() {
+            self.ok("Already refreshing…");
+            return;
+        }
+        // A manual refresh restarts the idle clock: the tree was just read.
+        self.last_auto_rescan = Instant::now();
+        if self.local {
+            self.ok("⟳ Rescanning local changes…");
+            self.spawn_quiet_local(false);
+        } else {
+            self.ok("⟳ Checking GitHub for updates…");
+            self.spawn_quiet_pr(false);
+        }
+    }
+
     /// Re-fetch the open PR's metadata and file list without blocking.
-    fn spawn_quiet_pr(&mut self) {
+    fn spawn_quiet_pr(&mut self, auto: bool) {
         let (Some(repo), Some(pr)) = (self.repo.clone(), self.pr.as_ref()) else {
             return;
         };
@@ -5527,11 +6053,12 @@ impl App {
             rx,
             label: format!("Refreshing PR #{number}"),
             started: Instant::now(),
+            auto,
         });
     }
 
     /// Re-scan the working tree for uncommitted changes without blocking.
-    fn spawn_quiet_local(&mut self) {
+    fn spawn_quiet_local(&mut self, auto: bool) {
         let root = self.repo_root.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -5549,12 +6076,13 @@ impl App {
             rx,
             label: "Rescanning local changes".into(),
             started: Instant::now(),
+            auto,
         });
     }
 
     /// Reload one file in place — same work as [`Self::spawn_load_file`],
     /// but non-modal, and applied without touching the scroll position.
-    fn spawn_quiet_file(&mut self, idx: usize) {
+    fn spawn_quiet_file(&mut self, idx: usize, auto: bool) {
         let Some(file) = self.files.get(idx).cloned() else {
             return;
         };
@@ -5569,6 +6097,7 @@ impl App {
             rx,
             label,
             started: Instant::now(),
+            auto,
         });
     }
 
@@ -5584,7 +6113,7 @@ impl App {
     /// Apply a finished silent refresh. Each arm re-checks that the app is
     /// still looking at what the refresh was for — a toggle or a new open
     /// since it started just drops the result.
-    fn apply_quiet(&mut self, outcome: QuietOutcome) {
+    fn apply_quiet(&mut self, outcome: QuietOutcome, auto: bool) {
         match outcome {
             QuietOutcome::Pr(data) => {
                 let d = *data;
@@ -5611,9 +6140,11 @@ impl App {
                     self.display.clear();
                     self.ok(format!("PR #{number} has no changed files."));
                 } else if !changed && self.diff.is_some() {
-                    self.ok(format!("✔ PR #{number} is up to date."));
+                    if !auto {
+                        self.ok(format!("✔ PR #{number} is up to date."));
+                    }
                 } else {
-                    self.spawn_quiet_file(self.file_cursor);
+                    self.spawn_quiet_file(self.file_cursor, auto);
                 }
             }
             QuietOutcome::Local(data) => {
@@ -5623,11 +6154,23 @@ impl App {
                 let d = *data;
                 let head = d.head.unwrap_or_default();
                 let changed = self.files != d.files || self.merge_base != head;
-                let cur = self.files.get(self.file_cursor).map(|f| f.path.clone());
                 self.local_branch = d.branch;
+                self.stage = d.stage;
+
+                // Nothing moved. An idle re-scan lands every few seconds,
+                // so it must leave the panel exactly as the reader left it
+                // — rebuilding the tree here would scroll the file panel
+                // back to the cursor while they were browsing it.
+                if !changed && self.diff.is_some() {
+                    if !auto {
+                        self.ok("✔ Local changes are up to date.");
+                    }
+                    return;
+                }
+
+                let cur = self.files.get(self.file_cursor).map(|f| f.path.clone());
                 self.merge_base = head;
                 self.files = d.files;
-                self.stage = d.stage;
                 // The local viewed marks are a session-local reading aid;
                 // keep them for files that still exist.
                 let files = &self.files;
@@ -5640,11 +6183,13 @@ impl App {
                     self.display.clear();
                     self.diff_cursor = 0;
                     self.diff_scroll = 0;
-                    self.ok("Working tree clean — nothing uncommitted. ` swaps back.");
-                } else if !changed && self.diff.is_some() {
-                    self.ok("✔ Local changes are up to date.");
+                    // An idle re-scan of an already-clean tree found what
+                    // it found last time: stay quiet.
+                    if changed || !auto {
+                        self.ok("Working tree clean — nothing uncommitted. ` swaps back.");
+                    }
                 } else {
-                    self.spawn_quiet_file(self.file_cursor);
+                    self.spawn_quiet_file(self.file_cursor, auto);
                 }
             }
             QuietOutcome::File(data) => {
@@ -5673,10 +6218,10 @@ impl App {
                 self.diff_cursor = self.diff_cursor.min(last);
                 self.diff_scroll = self.diff_scroll.min(last);
                 self.diff_hscroll = self.diff_hscroll.min(self.max_hscroll());
-                if same {
-                    self.ok(format!("✔ {} — up to date.", d.path));
-                } else {
+                if !same {
                     self.ok(format!("⟳ {} updated with the latest changes.", d.path));
+                } else if !auto {
+                    self.ok(format!("✔ {} — up to date.", d.path));
                 }
             }
         }
@@ -6012,6 +6557,42 @@ mod tests {
         assert!(full.ends_with("/src/app.rs"), "{full}");
     }
 
+    /// A local-changes review has no PR behind it, so the badge has no
+    /// link to give. Say so instead of copying something wrong.
+    #[test]
+    fn the_local_badge_has_no_pr_link() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.local_branch = Some("feature/x".into());
+        assert_eq!(app.pr_url(), None);
+
+        app.layout.badge = Rect::new(0, 0, 10, 1);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.status_err, "the status line reports it: {}", app.status);
+        assert!(app.status.contains("local-changes"), "{}", app.status);
+    }
+
+    /// The PR badge falls back to github.com only when `gh` gave no url —
+    /// a workspace restored from a stash predates that field.
+    #[test]
+    fn the_pr_link_falls_back_to_the_repo_name() {
+        let mut app = App::new(LaunchMode::Pr, None);
+        app.repo = Some("owner/name".into());
+        let mut detail = pr_detail(7);
+        detail.url = String::new();
+        app.pr = Some(detail);
+        assert_eq!(
+            app.pr_url().as_deref(),
+            Some("https://github.com/owner/name/pull/7")
+        );
+    }
+
     /// Directory rows are worth copying too — a folder path is what you
     /// hand something that should look at the whole subtree.
     #[test]
@@ -6105,6 +6686,290 @@ mod tests {
             height: 40,
         };
         app
+    }
+
+    /// An app parked in local review with the reader long gone, which is
+    /// the only state the idle re-scan is allowed to fire from.
+    fn idle_local_app() -> App {
+        let mut app = folded_app();
+        app.local = true;
+        let long_ago = Instant::now() - Duration::from_secs(60);
+        app.last_input = long_ago;
+        app.last_auto_rescan = long_ago;
+        app
+    }
+
+    /// The whole point of the idle re-scan: an agent writes to the tree
+    /// while nobody touches the keyboard, and the diff catches up on its
+    /// own.
+    #[test]
+    fn the_idle_rescan_fires_only_when_the_reader_has_stopped() {
+        let mut app = idle_local_app();
+        assert!(app.should_auto_rescan(), "idle local review re-scans");
+
+        // A key press just now: wait for the reader to settle again.
+        app.last_input = Instant::now();
+        assert!(!app.should_auto_rescan(), "a live reader is not idle");
+
+        // Idle again, but the last re-scan was moments ago.
+        app.last_input = Instant::now() - Duration::from_secs(60);
+        app.last_auto_rescan = Instant::now();
+        assert!(!app.should_auto_rescan(), "the minimum gap holds it off");
+    }
+
+    /// Every "the reader is in the middle of something" state blocks it.
+    /// A re-scan that pulled a selection or an overlay out from under
+    /// someone would be worse than a stale diff.
+    #[test]
+    fn the_idle_rescan_never_interrupts_anything() {
+        type Case = (&'static str, Box<dyn Fn(&mut App)>);
+        let cases: Vec<Case> = vec![
+            (
+                "switched off",
+                Box::new(|a: &mut App| a.auto_refresh = false),
+            ),
+            ("a pull request", Box::new(|a: &mut App| a.local = false)),
+            (
+                "the pr list",
+                Box::new(|a: &mut App| a.screen = Screen::PrList),
+            ),
+            (
+                "an overlay",
+                Box::new(|a: &mut App| a.overlay = Overlay::Help),
+            ),
+            (
+                "a selection",
+                Box::new(|a: &mut App| a.selection = Some(Selection::lines(Side::Right, 1, 1))),
+            ),
+            ("a drag", Box::new(|a: &mut App| a.drag_select = true)),
+            ("a resize", Box::new(|a: &mut App| a.resizing = true)),
+        ];
+        for (what, setup) in cases {
+            let mut app = idle_local_app();
+            setup(&mut app);
+            assert!(
+                !app.should_auto_rescan(),
+                "the idle re-scan must stand down for {what}"
+            );
+        }
+    }
+
+    /// An automatic re-scan that finds nothing says nothing. Without this
+    /// the status line would repeat "up to date" every few seconds for as
+    /// long as loupe is open.
+    #[test]
+    fn an_idle_rescan_that_finds_nothing_stays_quiet() {
+        let mut app = idle_local_app();
+        app.ok("something the reader was told");
+        let before = app.status.clone();
+
+        let same = |a: &App| FileLoadedData {
+            idx: 0,
+            path: "test.rs".into(),
+            old: a.old_content.clone(),
+            new: a.new_content.clone(),
+            old_hl: Vec::new(),
+            new_hl: Vec::new(),
+            differs: false,
+            diff: FileDiff::compute(a.old_content.as_deref(), a.new_content.as_deref()),
+        };
+        let data = same(&app);
+        app.apply_quiet(QuietOutcome::File(Box::new(data)), true);
+        assert_eq!(
+            app.status, before,
+            "an automatic no-op leaves the line alone"
+        );
+
+        // The same refresh asked for by hand does report back.
+        let data = same(&app);
+        app.apply_quiet(QuietOutcome::File(Box::new(data)), false);
+        assert!(app.status.contains("up to date"), "{}", app.status);
+    }
+
+    /// A change always speaks, however the refresh was started — that is
+    /// the reader's only cue that the diff moved under them.
+    #[test]
+    fn an_idle_rescan_reports_a_real_change() {
+        let mut app = idle_local_app();
+        app.old_content = Some("a\n".into());
+        app.new_content = Some("b\n".into());
+        app.apply_quiet(
+            QuietOutcome::File(Box::new(FileLoadedData {
+                idx: 0,
+                path: "test.rs".into(),
+                old: Some("a\n".into()),
+                new: Some("c\n".into()),
+                old_hl: Vec::new(),
+                new_hl: Vec::new(),
+                differs: false,
+                diff: FileDiff::compute(Some("a\n"), Some("c\n")),
+            })),
+            true,
+        );
+        assert!(app.status.contains("updated"), "{}", app.status);
+        assert_eq!(app.new_content.as_deref(), Some("c\n"));
+    }
+
+    /// An idle re-scan that finds the same files must not move the file
+    /// panel. It lands every few seconds; scrolling the reader back to the
+    /// cursor each time would make the panel unusable.
+    #[test]
+    fn an_idle_rescan_that_changes_nothing_leaves_the_panel_alone() {
+        let mut app = idle_local_app();
+        app.files = vec![cf("a.rs"), cf("b.rs"), cf("c.rs")];
+        app.rebuild_entries();
+        app.file_cursor = 0;
+        // The reader scrolled away from the cursor to look at something.
+        app.file_scroll = 2;
+
+        app.apply_quiet(
+            QuietOutcome::Local(Box::new(LocalOpenedData {
+                branch: app.local_branch.clone(),
+                head: Some(app.merge_base.clone()),
+                files: vec![cf("a.rs"), cf("b.rs"), cf("c.rs")],
+                stage: HashMap::new(),
+            })),
+            true,
+        );
+        assert_eq!(app.file_scroll, 2, "the panel stayed where it was put");
+        assert!(!app.refreshing(), "no file reload when nothing moved");
+    }
+
+    /// ⟳ and `r` re-scan without a loading screen, so the reader keeps
+    /// their place.
+    #[test]
+    fn refresh_review_is_never_modal() {
+        let mut app = idle_local_app();
+        app.diff_scroll = 3;
+        app.refresh_review();
+        assert!(!app.busy(), "no modal job, no loading screen");
+        assert!(app.refreshing(), "the re-scan runs in the background");
+        assert_eq!(app.diff_scroll, 3, "the reader keeps their place");
+    }
+
+    /// The editor owns the screen: refreshing under it would throw away
+    /// unsaved edits, so it says no instead.
+    #[test]
+    fn refresh_review_refuses_with_the_editor_open() {
+        let mut app = idle_local_app();
+        app.editor = Some(Editor::new("test.rs", PathBuf::from("test.rs"), "x\n"));
+        app.refresh_review();
+        assert!(!app.refreshing());
+        assert!(app.status_err, "{}", app.status);
+    }
+
+    /// The ☰ menu is built from the state it is opened in: no Comment line
+    /// in local review, and the swap line names the side you would land on.
+    #[test]
+    fn the_menu_is_built_for_what_is_on_screen() {
+        let labels = |app: &App| -> Vec<String> {
+            let Overlay::Menu(menu) = &app.overlay else {
+                panic!("the menu did not open");
+            };
+            menu.rows
+                .iter()
+                .filter_map(|r| match r {
+                    MenuRow::Item(it) => Some(it.label.clone()),
+                    MenuRow::Heading(_) => None,
+                })
+                .collect()
+        };
+
+        let mut app = idle_local_app();
+        app.open_menu(0, 0);
+        let local = labels(&app);
+        assert!(!local.iter().any(|l| l.contains("Comment")), "{local:?}");
+        assert!(
+            local.iter().any(|l| l.contains("Swap to the pull request")),
+            "{local:?}"
+        );
+        assert!(
+            local.iter().any(|l| l.contains("Refresh while idle")),
+            "the idle switch belongs to local review: {local:?}"
+        );
+
+        app.overlay = Overlay::None;
+        app.local = false;
+        app.open_menu(0, 0);
+        let pr = labels(&app);
+        assert!(pr.iter().any(|l| l.contains("Comment")), "{pr:?}");
+        assert!(
+            pr.iter().any(|l| l.contains("Swap to local changes")),
+            "{pr:?}"
+        );
+        assert!(
+            !pr.iter().any(|l| l.contains("Refresh while idle")),
+            "a pull request never polls: {pr:?}"
+        );
+    }
+
+    /// A line that cannot do anything right now is drawn but inert, and the
+    /// keyboard steps over it rather than landing on it.
+    #[test]
+    fn the_menu_skips_lines_that_do_not_apply() {
+        let mut app = idle_local_app();
+        app.open_menu(0, 0);
+        let Overlay::Menu(menu) = &app.overlay else {
+            panic!("the menu did not open");
+        };
+        let copy = menu
+            .rows
+            .iter()
+            .position(|r| matches!(r, MenuRow::Item(it) if it.label.contains("Copy")))
+            .expect("a Copy line");
+        assert!(
+            matches!(&menu.rows[copy], MenuRow::Item(it) if !it.enabled),
+            "nothing is selected, so Copy is inert"
+        );
+        // Walking down from the top never stops on it.
+        let mut at = menu.first_selectable();
+        let mut seen = vec![at];
+        loop {
+            let next = menu.next_selectable(at, 1);
+            if next == at {
+                break;
+            }
+            at = next;
+            seen.push(at);
+        }
+        assert!(!seen.contains(&copy), "the cursor stepped onto a dead line");
+        assert!(
+            seen.iter()
+                .all(|i| matches!(&menu.rows[*i], MenuRow::Item(it) if it.enabled)),
+            "every stop is a live line"
+        );
+    }
+
+    /// Picking a menu line runs it and puts the menu away — the same
+    /// dispatch the toolbar buttons use, so the two can never disagree.
+    #[test]
+    fn a_menu_line_runs_and_closes() {
+        let mut app = idle_local_app();
+        let before = app.view;
+        app.open_menu(0, 0);
+        let Overlay::Menu(menu) = &app.overlay else {
+            panic!("the menu did not open");
+        };
+        let toggle = menu
+            .rows
+            .iter()
+            .position(|r| matches!(r, MenuRow::Item(it) if it.id == ButtonId::ViewToggle))
+            .expect("a view line");
+        app.menu_activate(toggle);
+        assert!(matches!(app.overlay, Overlay::None), "the menu closed");
+        assert_ne!(app.view, before, "the view flipped");
+    }
+
+    /// The idle switch in the menu turns the polling off for the session.
+    #[test]
+    fn the_menu_switch_turns_the_idle_rescan_off() {
+        let mut app = idle_local_app();
+        assert!(app.should_auto_rescan());
+        app.activate(ButtonId::AutoRefreshToggle);
+        assert!(!app.auto_refresh);
+        assert!(!app.should_auto_rescan(), "switched off means switched off");
+        app.activate(ButtonId::AutoRefreshToggle);
+        assert!(app.auto_refresh);
     }
 
     fn folds(app: &App) -> usize {
@@ -6473,6 +7338,7 @@ mod tests {
             base_ref_oid: "b".repeat(40),
             base_ref_name: "main".into(),
             head_ref_name: "feat".into(),
+            url: format!("https://github.com/o/r/pull/{number}"),
         }
     }
 
@@ -6588,7 +7454,7 @@ mod tests {
         };
 
         // Identical content: position and selection survive untouched.
-        app.apply_quiet(QuietOutcome::File(Box::new(reload(&old, &new))));
+        app.apply_quiet(QuietOutcome::File(Box::new(reload(&old, &new))), false);
         assert_eq!(app.diff_scroll, 3);
         assert_eq!(app.diff_cursor, 4);
         assert!(app.selection.is_some());
@@ -6597,7 +7463,7 @@ mod tests {
         // Changed content: no jump to the top, but the selection goes —
         // its lines may not exist any more.
         let new2 = new.replace("line3\n", "line3 changed\n");
-        app.apply_quiet(QuietOutcome::File(Box::new(reload(&old, &new2))));
+        app.apply_quiet(QuietOutcome::File(Box::new(reload(&old, &new2))), false);
         assert_eq!(app.new_content.as_deref(), Some(new2.as_str()));
         assert!(app.selection.is_none());
         assert_eq!(app.diff_scroll, 3, "position kept, only clamped");
@@ -6612,12 +7478,15 @@ mod tests {
         app.repo = Some("acme/repo".into());
         app.pr = Some(pr_detail(7));
         app.merge_base = "c".repeat(40);
-        app.apply_quiet(QuietOutcome::Pr(Box::new(PrRefreshData {
-            detail: pr_detail(7),
-            merge_base: "c".repeat(40),
-            files: vec![cf("test.rs")],
-            viewed: HashSet::new(),
-        })));
+        app.apply_quiet(
+            QuietOutcome::Pr(Box::new(PrRefreshData {
+                detail: pr_detail(7),
+                merge_base: "c".repeat(40),
+                files: vec![cf("test.rs")],
+                viewed: HashSet::new(),
+            })),
+            false,
+        );
         assert!(app.status.contains("up to date"), "{}", app.status);
         assert!(!app.refreshing(), "no chained reload when nothing moved");
         assert!(app.diff.is_some());
@@ -7070,7 +7939,10 @@ mod tests {
         assert!(!sel.linewise);
         let (text, what) = app.copy_target().unwrap();
         assert_eq!(text, "beta");
-        assert!(what.contains("4 characters") && what.contains("removed"), "{what}");
+        assert!(
+            what.contains("4 characters") && what.contains("removed"),
+            "{what}"
+        );
 
         // Across lines, it runs to the end of the first and into the next.
         app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), left(11), 3));
@@ -7129,7 +8001,10 @@ mod tests {
         app.selection = Some(Selection::lines(Side::Left, 9, 11));
         let (text, what) = app.copy_target().expect("something to copy");
         assert_eq!(text, "line9\nline10\nline11");
-        assert!(what.contains("3 lines") && what.contains("removed"), "{what}");
+        assert!(
+            what.contains("3 lines") && what.contains("removed"),
+            "{what}"
+        );
 
         // The new side of the same range is the replacement text.
         app.selection = Some(Selection::lines(Side::Right, 10, 10));
@@ -7239,7 +8114,11 @@ mod tests {
         // The bar beside an unchanged line has nothing to offer.
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 34, 1));
         assert!(matches!(app.overlay, Overlay::None));
-        assert!(app.status_err && app.status.contains("No change"), "{}", app.status);
+        assert!(
+            app.status_err && app.status.contains("No change"),
+            "{}",
+            app.status
+        );
 
         // `u` works off the cursor for keyboard users.
         app.diff_cursor = 1;

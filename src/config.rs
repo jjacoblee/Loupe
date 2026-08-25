@@ -48,6 +48,12 @@ pub struct Config {
     /// nobody asked for. `Ctrl+T` (or the ⇥ Format button) formats on
     /// demand either way.
     pub format_on_save: Option<bool>,
+    /// Re-scan the working tree while local review sits idle, so edits
+    /// made by an agent (or a second terminal) show up without a key
+    /// press. Default true. It only ever runs after input stops, never
+    /// with the editor or an overlay open, and never for a pull request —
+    /// that side is refreshed on demand with `r` or the ⟳ button.
+    pub auto_refresh: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -110,6 +116,7 @@ impl Config {
             file_panel_width: over.file_panel_width.or(self.file_panel_width),
             language_servers: over.language_servers.or(self.language_servers),
             format_on_save: over.format_on_save.or(self.format_on_save),
+            auto_refresh: over.auto_refresh.or(self.auto_refresh),
         }
     }
 }
@@ -222,6 +229,7 @@ mod tests {
             "file_panel_width = 40\n",
             "language_servers = false\n",
             "format_on_save = true\n",
+            "auto_refresh = false\n",
         ))
         .unwrap();
         assert_eq!(
@@ -235,6 +243,7 @@ mod tests {
                 file_panel_width: Some(40),
                 language_servers: Some(false),
                 format_on_save: Some(true),
+                auto_refresh: Some(false),
             }
         );
     }

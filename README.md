@@ -44,6 +44,14 @@ leaving your terminal or touching a browser.
   its own. Click the section marker to put just those lines back
   (working tree only — what you staged stays staged), or the file marker
   to take the whole file back to where it started. Both ask first.
+- **Keeps up with an agent** — local review re-scans the working tree
+  whenever you pause, so files a coding agent rewrites under an open
+  review appear without a key press. It never interrupts (no re-scan
+  with the editor, a menu or a selection open) and never moves your
+  place. `r` or the `⟳` button pulls changes in right now.
+- **A top bar that fits** — the toolbar shows the two or three things
+  that match what you are doing; `☰` holds the rest, grouped and
+  labelled with the key that does the same thing.
 - **Editor-grade diffs** — side-by-side or inline, syntax highlighting
   from bat's extended syntax set (32 themes), unchanged stretches folded
   away, pinned gutters with horizontal scrolling for wide lines,
@@ -138,8 +146,9 @@ for the list.
 The first launch runs a quick setup wizard (theme + default mode, saved
 for you). Then: click files, read diffs (`v` toggles split/inline, `z`
 folds), select lines (click, drag, or `V` + motions) and `c` to comment,
-`e` to edit, `x` to mark viewed or stage, `t` to switch themes, `?` for
-help, `q` to quit — the full keyboard and mouse reference is in
+`e` to edit, `x` to mark viewed or stage, `r` to refresh, `m` (or `☰`)
+for the menu, `?` for help, `q` to quit — the full keyboard and mouse
+reference is in
 [docs/keys-and-mouse.md](docs/keys-and-mouse.md).
 
 ## Documentation

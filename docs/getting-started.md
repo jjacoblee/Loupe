@@ -111,8 +111,8 @@ You can make either behavior the default in the
   list — click the `Tree`/`Flat` buttons). Click a file to open its diff.
   The icon column on the left is the *viewed* checkbox on a PR (syncs to
   GitHub) or the *staging* control in local mode.
-- **Right panel**: the diff — side-by-side (`◫ Split`) or stacked
-  (`≡ Inline`), with editor-grade syntax highlighting. Long unchanged
+- **Right panel**: the diff — side-by-side or stacked inline (`v`, or
+  `☰ → Switch to inline`), with editor-grade syntax highlighting. Long unchanged
   stretches fold away; click a `··· N unchanged lines ···` row to expand.
 - **Drag the divider** between the panels to resize; double-click it to
   reset.

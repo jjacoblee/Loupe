@@ -13,11 +13,74 @@ for the built-in help overlay.
 | `q` | Quit |
 | `?` | Help overlay |
 | `Esc` | Clear the selection, then back / close overlay / close editor / cancel a load |
-| `r` | Reload the current file (or the PR list) |
+| `r` or `⟳` | Refresh — re-scan the changed files and reload the open one, keeping your place |
+| `m` or `☰` | Open the menu (see [The top bar and the ☰ menu](#the-top-bar-and-the--menu)) |
 | `b` | Open the PR list (from an auto-opened PR) |
 | `l` | Switch to local-changes review (from the PR list) |
-| `t` or `🎨 Theme` | Open the theme picker — live preview; Enter keeps & saves, Esc reverts; `a` switches light ⇄ dark |
+| `t` or `☰ → Theme` | Open the theme picker — live preview; Enter keeps & saves, Esc reverts; `a` switches light ⇄ dark |
 | `c` | Cancel a cancellable background load |
+
+## The top bar and the ☰ menu
+
+The top bar shows only what fits what you are doing right now. Everything
+else lives behind `☰`.
+
+| What you are doing | What the bar offers |
+| --- | --- |
+| Reading a diff | `🔍 Find` · `✎ Edit` · `⟳` · `☰` |
+| Lines selected | `💬 Comment` (pull request only) · `⧉ Copy` · `⟳` · `☰` |
+| Editor open | `⇥ Format` · `💾 Save` · `✕ Close` · `☰` |
+| Pull request list | `⎇ Local changes` · `⟳` · `☰` |
+
+The badge at the left of the bar names what you review: `PR #123`, or
+`⎇ LOCAL` for a local-changes review. **Right-click the `PR #123` badge
+to copy the link to the pull request.** That is the URL a coding agent
+needs, and the badge is the one place on screen that always carries it.
+The status line repeats the link and names the clipboard route. The
+`⎇ LOCAL` badge has no pull request behind it, so it says so instead.
+
+`☰` (or `m`) opens the full menu, grouped under **View**, **Find**,
+**Actions**, **Go** and **Settings**. It is built from the state you open
+it in: no *Comment* line in local review, no *Refresh while idle* switch
+on a pull request, and lines that cannot do anything right now (*Copy*
+with nothing selected) are drawn dim and are skipped by the cursor.
+
+| Key in the menu | Action |
+| --- | --- |
+| `j` / `k`, `↑` / `↓` | Move to the next live line |
+| `Enter` / `Space` | Run the selected line |
+| The key in the right-hand column | Run that line straight away |
+| `Esc` | Put the menu away |
+| Click a line | Run it · click anywhere else closes the menu |
+
+Every line names the key that does the same thing outside the menu, so
+the menu is a way to learn the keys rather than a second set of them.
+
+## Refreshing
+
+Loupe re-reads what it is showing you in two ways.
+
+- **`r`, or the `⟳` button** — re-scans the changed-file list and reloads
+  the open file. There is no loading screen and no jump: your scroll
+  position, the cursor row and the folds all survive. Use it whenever you
+  think the diff has gone stale.
+- **While you sit idle** — in local review only, Loupe re-scans the
+  working tree about 2 seconds after your last key press or mouse move,
+  and at most once every 5 seconds. This is what keeps the diff current
+  while an agent (or a second terminal) writes to your files.
+
+The idle re-scan never interrupts you. It stands down while the editor is
+open, while any overlay or menu is open, while lines are selected, and
+during a drag or a panel resize. When it finds nothing it says nothing
+and moves nothing — the file panel stays exactly where you scrolled it.
+When it does find a change, the status line says so.
+
+A pull request is never polled: its head lives on GitHub, and checking it
+on a timer would spend API calls on a commit that moves a few times a
+day. Press `r` (or click `⟳`) to fetch it.
+
+Turn the idle re-scan off for one session from `☰ → Refresh while idle`,
+or for good with `auto_refresh = false` in your config.
 
 ## File panel
 
@@ -70,8 +133,8 @@ cursor.
 | `Enter` / `Space` | Expand or fold the run at the cursor |
 | Click `··· N unchanged lines ···` | Expand a folded run |
 | Click `⌃⌃⌃ … click to fold ⌃⌃⌃` | Re-fold that run |
-| `z` or `⇕ Fold` | Fold / unfold every unchanged section |
-| `v` or `◫ Split` / `≡ Inline` | Toggle side-by-side vs. inline layout |
+| `z` or `☰ → Fold unchanged lines` | Fold / unfold every unchanged section |
+| `v` or `☰ → Switch to inline` / `Switch to split` | Toggle side-by-side vs. inline layout |
 | `e` / `i`, double-click a new-side line, or `✎ Edit` | Edit the file at the cursor line |
 | `x` | Toggle *viewed* (stages the file in local review) |
 | Click `↺` in the change bar | Put that section of the diff back (asks first) |

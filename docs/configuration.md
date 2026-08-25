@@ -131,7 +131,7 @@ staying in the same family where a counterpart exists. `theme =
 `solarized-light` alone gives you `solarized-dark` on a dark one. Themes
 with no counterpart fall back to the default for that appearance.
 
-The comfortable way to choose: press **`t`** (or click **🎨 Theme**)
+The comfortable way to choose: press **`t`** (or pick **Theme** from **☰**)
 inside loupe. The picker previews each theme live on a code sample —
 against the theme's own background, with diff backgrounds — as you move
 through the list; Enter keeps the selection *and saves it into the slot
@@ -207,6 +207,31 @@ It is off by default on purpose: Loupe is a review tool, and reformatting
 a file in the middle of a review would add changes to the diff that
 nobody asked for. `Ctrl+T` (or the `⇥ Format` button) formats on demand
 whatever this is set to, and `Ctrl+Z` undoes a format in one keystroke.
+
+### `auto_refresh` — re-scan local changes while you sit idle
+
+```toml
+auto_refresh = true   # the default
+```
+
+Local review re-reads the working tree about 2 seconds after your last
+key press or mouse move, and at most once every 5 seconds. This is what
+keeps the diff current while an agent (or a second terminal) writes to
+your files — nothing in a terminal tells Loupe that happened.
+
+It never interrupts you. The re-scan stands down while the editor is
+open, while any overlay or menu is open, while lines are selected, and
+during a drag or a panel resize. A re-scan that finds nothing says
+nothing and moves nothing; one that finds a change reloads the open file
+in place, keeping your scroll position, cursor row and folds.
+
+Pull requests are never polled whatever this is set to: a PR head lives
+on GitHub, and checking it on a timer would spend API calls on a commit
+that moves a few times a day. `r` (or the `⟳` button) fetches it, and
+`r` refreshes local review on demand too.
+
+Set `false` to turn the idle re-scan off for good, or flip it for one
+session from `☰ → Refresh while idle`.
 
 ## Command line
 

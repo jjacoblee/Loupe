@@ -75,6 +75,33 @@ about to happen, and nothing moves until you confirm.
 - Nothing syncs to GitHub — no viewed-state sync, no network calls beyond
   what git itself does.
 
+## Keeping up with an agent
+
+The working tree is not only yours. A coding agent in another pane, a
+`cargo fix`, a rebase in a second terminal — any of them can rewrite the
+files under an open review, and nothing in a terminal tells Loupe that
+it happened.
+
+So local review re-scans by itself. About 2 seconds after your last key
+press or mouse move, and at most once every 5 seconds, Loupe re-reads
+the changed-file list and reloads the open file. Your scroll position,
+your cursor row and your folds all survive; the status line says
+`⟳ <path> updated with the latest changes.` when something moved, and
+says nothing at all when nothing did.
+
+The re-scan waits for you. It stands down while the editor is open,
+while any overlay or menu is open, while lines are selected, and during
+a drag or a panel resize — a refresh that pulled a selection out from
+under you would be worse than a stale diff.
+
+Two ways to take over:
+
+- **`r`, or the `⟳` button in the top bar** — re-scan now. Use it when
+  the idle timer is too slow for you, or when you have been clicking
+  around for a while and suspect the diff is behind.
+- **`☰ → Refresh while idle`** — turn the polling off for this session.
+  `auto_refresh = false` in your config turns it off for good.
+
 ## A typical flow
 
 1. Hack until the feature works; run `loupe`.
@@ -82,5 +109,7 @@ about to happen, and nothing moves until you confirm.
    in place with the editor.
 3. Stage each file as you finish reviewing it — `x`, or click the icon.
    Something you didn't mean to keep? `↺` beside it puts it back.
+   Hand a fix to an agent and keep reading: its edits appear on their
+   own, or press `r` to pull them in now.
 4. Quit (`q`) and `git commit`: the index already contains exactly what
    you reviewed.

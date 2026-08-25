@@ -95,6 +95,11 @@ pub struct PrDetail {
     pub base_ref_oid: String,
     pub base_ref_name: String,
     pub head_ref_name: String,
+    /// Web URL of the PR, as `gh pr view --json url` reports it. Right-click
+    /// on the PR badge copies this, so the link works on GitHub Enterprise
+    /// too, where github.com is the wrong host.
+    #[serde(default)]
+    pub url: String,
 }
 
 /// The open PR associated with the currently checked-out branch, if any.

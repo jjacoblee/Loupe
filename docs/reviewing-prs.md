@@ -54,8 +54,8 @@ double-click the divider to reset. A starting width can be set with the
 
 ## The diff view
 
-- **Layouts**: side-by-side (`◫ Split`) or inline stacked (`≡ Inline`) —
-  click the buttons or press `v`.
+- **Layouts**: side-by-side or inline stacked. Press `v`, or pick
+  **Switch to inline** / **Switch to split** from the `☰` menu.
 
   ![The inline layout (shown here reviewing local changes)](assets/inline-diff.png)
 - **Syntax highlighting** is computed per file in the background using
@@ -64,7 +64,7 @@ double-click the divider to reset. A starting width can be set with the
   a theme with the `theme` config key (`loupe --themes` lists all 32).
 - **Folding**: unchanged stretches collapse to a
   `··· N unchanged lines ···` row; click to expand. Expanded runs keep a
-  `⌃⌃⌃ … click to fold ⌃⌃⌃` header to put them back. The `⇕ Fold` button
+  `⌃⌃⌃ … click to fold ⌃⌃⌃` header to put them back. `☰ → Fold unchanged lines`
   (or `z`) re-folds all expanded runs first, then toggles the whole file.
 - **Horizontal scrolling**: long lines scroll sideways with `h`/`l` or
   `←`/`→`, a horizontal trackpad swipe, or the wheel with a modifier

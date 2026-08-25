@@ -65,7 +65,10 @@ are optional:
   light_theme = \"catppuccin-latte\" # …and on a light one (defaults to the
                            # light counterpart of `theme`)
   file_panel_width = 34    # starting width of the file panel, in columns
-                           # (drag the divider, or < / >, to change it)";
+                           # (drag the divider, or < / >, to change it)
+  auto_refresh = true      # re-scan local changes while you sit idle, so
+                           # an agent's edits appear on their own; a pull
+                           # request still refreshes on demand (r or ⟳)";
 
 enum CliCmd {
     /// Start the TUI. `mode`/`theme` override the configured defaults for
@@ -242,6 +245,8 @@ struct Startup {
     language_servers: bool,
     /// `format_on_save` — run the server's formatter on every save.
     format_on_save: bool,
+    /// `auto_refresh` — re-scan local changes while the reader is idle.
+    auto_refresh: bool,
     wizard: bool,
     /// Forced by `--light`/`--dark` or the `appearance` config key; `None`
     /// means "ask the terminal".
@@ -394,6 +399,7 @@ fn main() -> Result<()> {
         file_panel_width: cfg.file_panel_width,
         language_servers: cfg.language_servers.unwrap_or(true),
         format_on_save: cfg.format_on_save.unwrap_or(false),
+        auto_refresh: cfg.auto_refresh.unwrap_or(true),
         // First launch (no global config yet) — or an explicit `loupe setup`
         // — runs the wizard before anything else.
         wizard: force_setup || !config::global_path().is_some_and(|p| p.is_file()),
@@ -437,6 +443,7 @@ fn run_tui(startup: Startup) -> Result<()> {
             startup.file_panel_width,
             startup.language_servers,
             startup.format_on_save,
+            startup.auto_refresh,
         )
     })();
 
@@ -452,10 +459,12 @@ fn run(
     file_panel_width: Option<u16>,
     language_servers: bool,
     format_on_save: bool,
+    auto_refresh: bool,
 ) -> Result<()> {
     let mut app = App::new(mode, org);
     app.lsp_enabled = language_servers;
     app.format_on_save = format_on_save;
+    app.auto_refresh = auto_refresh;
     if let Some(w) = file_panel_width {
         // The real clamp happens at draw time, once the area is known.
         app.file_panel_w = w.max(app::FILE_PANEL_MIN);
@@ -545,6 +554,7 @@ mod tests {
             file_panel_width: None,
             language_servers: true,
             format_on_save: false,
+            auto_refresh: true,
             wizard: false,
             appearance: None,
             dark_theme: by(dark),

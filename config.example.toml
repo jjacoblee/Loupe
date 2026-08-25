@@ -53,3 +53,10 @@
 # file mid-review would add changes to the diff nobody asked for. Ctrl+T
 # formats on demand either way, and Ctrl+Z undoes it in one keystroke.
 #format_on_save = false
+
+# Re-scan the working tree while local review sits idle, so edits made by
+# an agent (or a second terminal) appear without a key press. It waits for
+# input to stop, never runs with the editor, an overlay or a selection
+# open, and never touches GitHub — a pull request refreshes on demand with
+# `r` or the ⟳ button. Toggle it for one session from the ☰ menu.
+#auto_refresh = true
