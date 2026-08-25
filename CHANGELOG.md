@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-25
+
 ### Added
 
 - **Pinned files, and a row of tabs to hold them.** A review sends you
@@ -447,5 +449,6 @@ Initial public release.
 - **Hardening**: PR-controlled paths, oids, and refs validated before
   reaching `git`; no shell execution anywhere; symlink-safe editing.
 
-[Unreleased]: https://github.com/jjacoblee/Loupe/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jjacoblee/Loupe/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jjacoblee/Loupe/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jjacoblee/Loupe/releases/tag/v0.1.0
