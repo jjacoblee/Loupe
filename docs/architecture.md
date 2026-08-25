@@ -14,6 +14,8 @@ threading model, and the invariants that are easy to break by accident.
 | `diff.rs` | The diff engine: `FileDiff` computation, folding, display entries, line widths |
 | `blame.rs` | `git blame --porcelain` parsing, the age heat ramp, the change set |
 | `editor.rs` | The in-place editor: a custom renderer over `tui-textarea` |
+| `markdown.rs` | Markdown → styled lines: the block/inline parser and the width-dependent layout |
+| `preview.rs` | The preview pane: scrolling, the source-line map, reload, and the scrollbar |
 | `gitops.rs` | Everything that shells out to `git`: local scans, staging, refs, file content |
 | `github.rs` | Everything that shells out to `gh`: PR lists, details, comments, viewed sync |
 | `highlight.rs` | Syntax highlighting via syntect + two-face: themes, caching, incremental editor highlighting |
@@ -290,11 +292,55 @@ terminal itself and is the only thing that works over SSH — where the
 commands above would set the clipboard of the wrong machine. No
 clipboard crate: the fallback needs base64 and nothing else.
 
+## The markdown preview
+
+A `.md` file has three views, and all three use the same pane:
+
+- the **diff**, for what changed;
+- the **editor** (`preview.rs` calls it the source view), for changing it;
+- the **preview**, for reading it.
+
+`markdown.rs` splits the work in two, because the halves have different
+costs. `parse` reads the source once into a flat list of blocks, and
+syntax-highlights every fenced code block while it is there — that is the
+expensive part, and it does not depend on how wide the pane is. `lay_out`
+turns those blocks into ratatui lines for one width, so dragging the
+divider re-runs only the cheap half. Block structure is flat rather than a
+tree: a block quote sets a depth on the blocks inside it, which keeps the
+layout pass a single loop.
+
+The layout also builds two maps. `src_of` gives the source line behind
+every rendered row, and `heads` lists the rows that are headings. The
+first is what makes `P` a *toggle* rather than two separate commands: it
+carries the reader's place across in both directions, so the editor opens
+on the line that was at the top of the preview and the preview comes back
+scrolled to the line that was just edited. The second is what `}` and `{`
+walk.
+
+`App::preview` and `App::editor` are never both set — they are two ways of
+holding the same file, and `toggle_preview` swaps one for the other.
+Toggling from the editor renders the *buffer*, not the file, so unsaved
+text is what the reader sees. The blame pane stands down while the
+preview is open: one source line is any number of rendered rows there, or
+none, and there is no honest way to line the column up against that.
+
+The reload check rides the same idle tick as the local re-scan. It
+compares the file's modification time, re-reads only when it moved, and
+re-anchors by source line rather than by row, because a rewrite changes
+the row count and staying on row 200 of a different document is not
+staying put. A buffer with unsaved changes is never overwritten this way.
+
+`loupe md <path>` sets `App::preview_only`, which gives the pane the whole
+window and makes `q` the way out. It is the one launch mode that needs no
+repository.
+
 ## Files outside the changeset
 
 A search result, or a jump to a definition, can land in a file the change
 never touches. There is nothing to diff it against, so it opens in the
-**editor** rather than the diff view — a file shown as a file. The review
+**editor** rather than the diff view — a file shown as a file. A markdown
+file opens in the **preview** instead: reaching for the finder to open a
+plan file means wanting to read it, and `P` gets to its source. The review
 state is not disturbed at all, which is what makes closing it free:
 no reload, no restored scroll position, nothing to get wrong.
 

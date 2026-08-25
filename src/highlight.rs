@@ -292,6 +292,69 @@ fn find_syntax(path: &str, first_line: &str) -> &'static SyntaxReference {
         .unwrap_or_else(|| ss.find_syntax_plain_text())
 }
 
+/// Resolve a fenced-code-block info string ("rust", "sh", "```yaml") to a
+/// syntax. The tag is a language name, not a file name, so the lookup goes
+/// by name and by extension and ignores case. `None` means "draw it plain".
+fn syntax_for_tag(tag: &str) -> Option<&'static SyntaxReference> {
+    // The info string can carry attributes after the language
+    // ("```rust,ignore", "```js title=x"); only the first word names it.
+    let tag = tag
+        .trim()
+        .split([' ', ',', '\t', '{'])
+        .next()
+        .unwrap_or("")
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    if tag.is_empty() {
+        return None;
+    }
+    // Tags whose spelling neither the name table nor the extension table
+    // knows. Everything else falls through to the two lookups below.
+    let tag = match tag.as_str() {
+        "shell" | "bash" | "zsh" | "console" | "shell-session" | "ksh" => "sh",
+        "node" | "javascript" | "mjs" | "cjs" => "js",
+        "typescript" => "ts",
+        "python" | "python3" => "py",
+        "rust" => "rs",
+        "golang" => "go",
+        "yml" => "yaml",
+        "markdown" => "md",
+        "dockerfile" => "Dockerfile",
+        "csharp" => "cs",
+        "kotlin" => "kt",
+        "docker" | "makefile" | "make" => "make",
+        // Nothing to color, and asking syntect for a syntax by these names
+        // finds odd matches.
+        "text" | "txt" | "plain" | "plaintext" | "none" | "output" | "log" => return None,
+        other => other,
+    };
+    let ss = syntaxes();
+    ss.find_syntax_by_extension(tag)
+        .or_else(|| ss.find_syntax_by_token(tag))
+        .or_else(|| {
+            ss.syntaxes()
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(tag))
+        })
+}
+
+/// Highlight one fenced code block. Returns one entry per line of `code`,
+/// or an empty vector when the tag names no syntax loupe has — the caller
+/// then draws the block in the plain code color.
+pub fn highlight_block(tag: &str, code: &str) -> Vec<HlLine> {
+    let Some(syntax) = syntax_for_tag(tag) else {
+        return Vec::new();
+    };
+    let ss = syntaxes();
+    let mut hl = HighlightLines::new(syntax, theme());
+    let mut out = Vec::new();
+    for line in LinesWithEndings::from(code) {
+        let segs = hl.highlight_line(line, ss).map(to_segs).unwrap_or_default();
+        out.push(segs);
+    }
+    out
+}
+
 fn to_segs(regions: Vec<(syntect::highlighting::Style, &str)>) -> HlLine {
     let mut segs = HlLine::new();
     for (style, text) in regions {

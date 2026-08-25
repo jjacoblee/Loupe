@@ -18,6 +18,7 @@ for the built-in help overlay.
 | `b` | Open the PR list (from an auto-opened PR) |
 | `l` | Switch to local-changes review (from the PR list) |
 | `B` or `☰ → Blame column` | Show / hide the blame pane (see [The blame pane](#the-blame-pane)) |
+| `P` | Render the open markdown file as a document (see [Markdown preview](#markdown-preview)) |
 | `t` or `☰ → Theme` | Open the theme picker — live preview; Enter keeps & saves, Esc reverts; `a` switches light ⇄ dark |
 | `c` | Cancel a cancellable background load |
 
@@ -28,9 +29,10 @@ else lives behind `☰`.
 
 | What you are doing | What the bar offers |
 | --- | --- |
-| Reading a diff | `🔍 Find` · `✎ Edit` · `⟳` · `☰` |
+| Reading a diff | `🔍 Find` · `📖 Preview` (markdown only) · `✎ Edit` · `⟳` · `☰` |
 | Lines selected | `💬 Comment` (pull request only) · `⧉ Copy` · `⟳` · `☰` |
-| Editor open | `⇥ Format` · `💾 Save` · `✕ Close` · `☰` |
+| Editor open | `⇥ Format` · `💾 Save` · `📖 Preview` (markdown only) · `✕ Close` · `☰` |
+| Preview open | `✎ Source` · `⟳` · `✕ Close` · `☰` |
 | Pull request list | `⎇ Local changes` · `⟳` · `☰` |
 
 The badge at the left of the bar names what you review: `PR #123`, or
@@ -137,6 +139,7 @@ cursor.
 | `z` or `☰ → Fold unchanged lines` | Fold / unfold every unchanged section |
 | `v` or `☰ → Switch to inline` / `Switch to split` | Toggle side-by-side vs. inline layout |
 | `e` / `i`, double-click a new-side line, or `✎ Edit` | Edit the file at the cursor line |
+| `P` or `📖 Preview` | Render a markdown file as a document (see [Markdown preview](#markdown-preview)) |
 | `x` | Toggle *viewed* (stages the file in local review) |
 | Click `↺` in the change bar | Put that section of the diff back (asks first) |
 | `u` / `U` | Revert the change at the cursor / every change in the file |
@@ -376,6 +379,7 @@ Set `language_servers = false` in your config to switch all of this off.
 | `Ctrl+C` | Copy the selection, or the cursor line |
 | `Ctrl+Z` or `Ctrl+U` | Undo (`Ctrl+U` is tui-textarea's own binding; `Ctrl+Z` is an alias) |
 | `Ctrl+R` | Redo |
+| `Alt+P` | Preview the buffer as markdown, saved or not (`.md` files) |
 | `PgUp` / `PgDn` | Page through the file |
 | `Esc` | Close (press twice to discard unsaved changes) |
 
@@ -406,6 +410,59 @@ disk.
 changes in the diff that nobody asked for. Either way `Ctrl+Z` undoes a
 format in one keystroke.
 
+## Markdown preview
+
+A `.md` file has a document view as well as a diff and a source view.
+Press `P` on a markdown file and the pane renders it: headings, wrapped
+paragraphs, bold and italic text, inline code, links, nested and task
+lists, block quotes, tables, thematic rules, YAML front matter, and
+fenced code blocks colored by your syntax theme.
+
+It exists for the files agents write. A plan file, a build ladder, a
+review write-up — all markdown, all previously readable only by leaving
+Loupe for another app.
+
+| Key / mouse | Action |
+| --- | --- |
+| `P` | Preview the markdown file, and from the preview open its source |
+| `Alt+P` | The same, from inside the editor (plain `P` is text in there) |
+| `j` / `k`, `↑` / `↓`, wheel | Scroll |
+| `Ctrl+D` / `Ctrl+U`, `Ctrl+F` / `Ctrl+B`, `PgUp` / `PgDn` | Half page / full page |
+| `gg` / `G`, `Home` / `End` | First / last row |
+| `}` / `{`, `Tab` / `Shift+Tab` | Next / previous heading |
+| `e` or `i` | Open the source in the editor |
+| `r` | Re-read the file now |
+| `]` / `[` | Next / previous file |
+| `Esc` | Back to the diff |
+| Click the file panel | Switch files, the way the diff does |
+
+**The preview and the source are two views of one file.** `P` moves
+between them and both keep their place: from the preview you land in the
+editor on the line you were reading, and from the editor you land in the
+preview at the line you just changed. Unsaved text renders as it stands,
+so you can change a heading, look at it, and change it again without
+saving in between. `Ctrl+S` in the source view writes the file.
+
+**It follows the file.** Loupe checks the modification time while you sit
+idle and re-renders when something else rewrites it, keeping your place
+by source line rather than by row. That is a plan file updating on screen
+as an agent writes it. Unsaved text in the source view is never
+overwritten this way.
+
+The blame pane stands down while the preview is open — one source line is
+any number of rendered rows there, or none — and comes back with the
+source view.
+
+### Reading a file that is not in the change
+
+Two ways in:
+
+- `Ctrl+P` and pick any `.md` file in the repository. A markdown file
+  opens as a document rather than in the editor.
+- `loupe md <path>` from the shell, for a file anywhere on the machine —
+  a review write-up in a central tree, a note in `/tmp`. There is no
+  review behind it, so the document takes the whole window and `q` quits.
+
 ## Theme picker
 
 | Key / mouse | Action |
@@ -431,3 +488,4 @@ format in one keystroke.
 | `set-theme [--light] <name>` | Save a theme to the global config, in the dark (or light) slot |
 | `appearance` | Report what your terminal says its background is |
 | `setup` | Re-run the first-launch setup wizard |
+| `md <file.md>` | Read one markdown file in the preview, with no review beside it |

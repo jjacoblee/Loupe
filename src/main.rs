@@ -8,6 +8,8 @@ mod github;
 mod gitops;
 mod highlight;
 mod lsp;
+mod markdown;
+mod preview;
 mod search;
 mod theme;
 mod ui;
@@ -24,6 +26,7 @@ use theme::Appearance;
 const USAGE: &str = "loupe — a mouse-first TUI for reviewing GitHub pull requests and local changes
 
 USAGE: loupe [--pr | --local | --auto] [--theme <name>] [--light | --dark]
+       loupe md <file.md>
        loupe set-theme [--light] <name>
        loupe setup
 
@@ -41,12 +44,19 @@ USAGE: loupe [--pr | --local | --auto] [--theme <name>] [--light | --dark]
   --lsp      report which language servers loupe can find
   --help     show this help
 
+  md <file.md>       read one markdown file in the preview, with no
+                     review beside it — for a plan or a review write-up
+                     that lives outside the repository. P shows its
+                     source, Ctrl+S saves, q quits.
   set-theme [--light] <name>
                      save <name> as your theme (in the global config);
                      --light saves it as the light-terminal theme
   appearance         report what your terminal says its background is
                      (run this if loupe guessed light/dark wrong)
   setup              re-run the first-launch setup wizard
+
+Inside a review, P renders the markdown file you are looking at, and
+P again goes back to its source.
 
 Inside loupe, press t (or click 🎨 Theme) for the theme picker — it
 previews live and saves your choice. The wizard runs on first launch.
@@ -85,6 +95,12 @@ enum CliCmd {
         appearance: Option<Appearance>,
         setup: bool,
     },
+    /// Read one markdown file and nothing else (`loupe md <path>`).
+    Md {
+        path: std::path::PathBuf,
+        theme: Option<String>,
+        appearance: Option<Appearance>,
+    },
     Help,
     Themes,
     /// Report which language servers are installed.
@@ -107,6 +123,8 @@ fn parse_cli<I: Iterator<Item = String>>(args: I) -> Result<CliCmd, String> {
     let mut setup = false;
     let mut set_theme = false;
     let mut set_theme_name: Option<String> = None;
+    let mut md = false;
+    let mut md_path: Option<std::path::PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--pr" | "-p" | "pr" => mode = Some(LaunchMode::Pr),
@@ -122,6 +140,9 @@ fn parse_cli<I: Iterator<Item = String>>(args: I) -> Result<CliCmd, String> {
             // `--light` may come before or after the name, so the rest of
             // the arguments are parsed normally and resolved at the end.
             "set-theme" => set_theme = true,
+            // The path may come after the theme flags, so it is collected
+            // like the set-theme name and resolved at the end.
+            "md" | "--md" => md = true,
             "--themes" => return Ok(CliCmd::Themes),
             "--lsp" => return Ok(CliCmd::Lsp),
             "appearance" => return Ok(CliCmd::Appearance),
@@ -131,9 +152,22 @@ fn parse_cli<I: Iterator<Item = String>>(args: I) -> Result<CliCmd, String> {
                 _ if set_theme && set_theme_name.is_none() && !other.starts_with('-') => {
                     set_theme_name = Some(other.to_string());
                 }
+                _ if md && md_path.is_none() && !other.starts_with('-') => {
+                    md_path = Some(std::path::PathBuf::from(other));
+                }
                 _ => return Err(other.to_string()),
             },
         }
+    }
+    if md {
+        return match md_path {
+            Some(path) => Ok(CliCmd::Md {
+                path,
+                theme,
+                appearance,
+            }),
+            None => Err("md needs the path of a markdown file".to_string()),
+        };
     }
     if set_theme {
         return match set_theme_name {
@@ -261,6 +295,8 @@ struct Startup {
     /// belongs to when its subject does not say.
     blame_pr_lookup: bool,
     wizard: bool,
+    /// `loupe md <path>`: read this one file instead of starting a review.
+    md: Option<std::path::PathBuf>,
     /// Forced by `--light`/`--dark` or the `appearance` config key; `None`
     /// means "ask the terminal".
     appearance: Option<Appearance>,
@@ -335,7 +371,7 @@ impl Startup {
 }
 
 fn main() -> Result<()> {
-    let (cli_mode, cli_theme, cli_appearance, force_setup) = match parse_cli(
+    let (cli_mode, cli_theme, cli_appearance, force_setup, cli_md) = match parse_cli(
         std::env::args().skip(1),
     ) {
         Ok(CliCmd::Run {
@@ -343,7 +379,14 @@ fn main() -> Result<()> {
             theme,
             appearance,
             setup,
-        }) => (mode, theme, appearance, setup),
+        }) => (mode, theme, appearance, setup, None),
+        // `loupe md <path>` takes the same theme handling as a review and
+        // then opens one document instead of one.
+        Ok(CliCmd::Md {
+            path,
+            theme,
+            appearance,
+        }) => (None, theme, appearance, false, Some(path)),
         Ok(CliCmd::Help) => {
             println!("{USAGE}");
             return Ok(());
@@ -418,7 +461,11 @@ fn main() -> Result<()> {
         blame_pr_lookup: cfg.blame_pr_lookup.unwrap_or(true),
         // First launch (no global config yet) — or an explicit `loupe setup`
         // — runs the wizard before anything else.
-        wizard: force_setup || !config::global_path().is_some_and(|p| p.is_file()),
+        // Reading one file is not a reason to run the first-launch
+        // wizard: it asks about reviews, and there is no review here.
+        wizard: cli_md.is_none()
+            && (force_setup || !config::global_path().is_some_and(|p| p.is_file())),
+        md: cli_md,
         appearance: cli_appearance.or_else(|| cfg.appearance.and_then(|a| a.resolved())),
         dark_theme: cfg.theme.as_deref().map(theme_or_exit),
         light_theme: cfg.light_theme.as_deref().map(theme_or_exit),
@@ -474,7 +521,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal, startup: Startup) -> Result<()> 
     if let Some(w) = startup.blame_width {
         app.blame_w = w.max(app::BLAME_MIN);
     }
-    app.start();
+    match &startup.md {
+        Some(path) => app.start_preview_only(path),
+        None => app.start(),
+    }
     let mut dirty = true;
 
     loop {
@@ -564,6 +614,7 @@ mod tests {
             blame_width: None,
             blame_pr_lookup: true,
             wizard: false,
+            md: None,
             appearance: None,
             dark_theme: by(dark),
             light_theme: by(light),

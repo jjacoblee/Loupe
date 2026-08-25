@@ -265,6 +265,7 @@ colors mean and what a click on a row offers.
 
 ```
 loupe [--pr | --local | --auto] [--theme <name>] [--light | --dark]
+loupe md <file.md>
 loupe set-theme [--light] <name>
 loupe appearance
 loupe setup
@@ -280,6 +281,9 @@ loupe setup
   --lsp      report which language servers loupe can find
   --help,-h  show usage
 
+  md <file.md>       read one markdown file in the preview, with no
+                     review beside it. The path may be anywhere on the
+                     machine. P shows its source, Ctrl+S saves, q quits.
   set-theme [--light] <name>
                      save <name> as your dark- (or light-) terminal theme
   appearance         report what your terminal says its background is

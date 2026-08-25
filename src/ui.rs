@@ -241,6 +241,14 @@ fn draw_topbar_prlist(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// True while the ☰ menu is open, so its button draws as pressed.
+/// True when the editor holds a markdown file, so the toolbar can offer
+/// the way back to the preview.
+fn markdown_buffer(app: &App) -> bool {
+    app.editor
+        .as_ref()
+        .is_some_and(|e| crate::markdown::is_markdown(&e.path))
+}
+
 fn menu_open(app: &App) -> bool {
     matches!(app.overlay, Overlay::Menu(_))
 }
@@ -249,6 +257,43 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
     // Badge + title: "PR #N — <title>" for a PR review, "LOCAL — <branch>,
     // uncommitted changes" when reviewing the working tree.
     let p = palette();
+    // `loupe md <path>` has no review to name, so the bar names the
+    // document instead and carries only the keys that still do anything.
+    if app.preview_only {
+        let name = app
+            .preview
+            .as_ref()
+            .map(|pv| pv.path.clone())
+            .unwrap_or_default();
+        let shown = tail_truncate(&name, area.width.saturating_sub(28) as usize);
+        let left = Line::from(vec![
+            Span::styled(
+                " 📖 MARKDOWN ".to_string(),
+                Style::default()
+                    .bg(p.badge_pr)
+                    .fg(p.badge_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                shown,
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(left), area);
+        buttons_right(
+            f,
+            app,
+            area,
+            18,
+            &[
+                ("✎ Source", ButtonId::PreviewToggle, false),
+                ("⟳", ButtonId::Refresh, false),
+                ("☰", ButtonId::Menu, menu_open(app)),
+            ],
+        );
+        return;
+    }
     let (badge, badge_bg, title, note) = if app.local {
         let branch = app
             .local_branch
@@ -300,19 +345,31 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
     // The toolbar carries only what fits what you are doing right now;
     // ☰ holds the rest. Eleven buttons on one row left no space for the
     // PR title, and most of them were one keystroke away anyway.
-    if app.editor.is_some() {
+    if app.previewing() {
         buttons_right(
             f,
             app,
             area,
             reserve,
             &[
-                ("⇥ Format", ButtonId::EditorFormat, false),
-                ("💾 Save", ButtonId::EditorSave, true),
-                ("✕ Close", ButtonId::EditorClose, false),
+                ("✎ Source", ButtonId::PreviewToggle, false),
+                ("⟳", ButtonId::Refresh, false),
+                ("✕ Close", ButtonId::PreviewClose, false),
                 ("☰", ButtonId::Menu, menu_open(app)),
             ],
         );
+    } else if app.editor.is_some() {
+        let md = markdown_buffer(app);
+        let mut buttons: Vec<(&str, ButtonId, bool)> = vec![
+            ("⇥ Format", ButtonId::EditorFormat, false),
+            ("💾 Save", ButtonId::EditorSave, true),
+        ];
+        if md {
+            buttons.push(("📖 Preview", ButtonId::PreviewToggle, false));
+        }
+        buttons.push(("✕ Close", ButtonId::EditorClose, false));
+        buttons.push(("☰", ButtonId::Menu, menu_open(app)));
+        buttons_right(f, app, area, reserve, &buttons);
     } else {
         let mut buttons: Vec<(&str, ButtonId, bool)> = Vec::new();
         if app.selection.is_some() {
@@ -325,6 +382,11 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
             buttons.push(("⧉ Copy", ButtonId::Copy, true));
         } else {
             buttons.push(("🔍 Find", ButtonId::Find, false));
+            // The 📖 button only appears for a file it can render, so the
+            // toolbar never offers something that answers with an error.
+            if app.can_preview() {
+                buttons.push(("📖 Preview", ButtonId::PreviewToggle, false));
+            }
             buttons.push(("✎ Edit", ButtonId::Edit, false));
         }
         buttons.push(("⟳", ButtonId::Refresh, app.refreshing()));
@@ -392,11 +454,26 @@ fn draw_pr_list(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
     app.layout.review = area;
+    // `loupe md <path>`: one document and nothing else, so it gets the
+    // whole window rather than a file panel with nothing in it.
+    if app.preview_only {
+        if let Some(pv) = &mut app.preview {
+            pv.render(f, area);
+        }
+        return;
+    }
     // Both panel widths are user-set; re-clamp here so a terminal resize
     // can never leave the diff pane starved. `blame_gutter` is zero when
     // the pane is off, and also when three panes will not fit — a narrow
     // terminal shows two rather than a diff too thin to read.
-    let bw = app.blame_gutter();
+    // The blame pane cannot line up beside a rendered document — one
+    // source line is any number of rows there, or none — so it stands
+    // down while the preview is open and comes back with the source.
+    let bw = if app.previewing() {
+        0
+    } else {
+        app.blame_gutter()
+    };
     let fw = app.clamp_panel_w(app.file_panel_w);
     app.file_panel_w = fw;
     if bw > 0 {
@@ -464,7 +541,9 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
         draw_blame(f, app, cols[1], rows, cursor, note);
     }
 
-    if let Some(editor) = &mut app.editor {
+    if let Some(pv) = &mut app.preview {
+        pv.render(f, cols[2]);
+    } else if let Some(editor) = &mut app.editor {
         editor.render(f, cols[2], true);
     } else {
         draw_diff(f, app, cols[2]);
@@ -2403,6 +2482,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             ("t", "theme picker (live preview)"),
         ),
         row(
+            ("P", "read a .md file as a document"),
+            ("P (in the preview)", "back to its source"),
+        ),
+        row(
             ("y or Ctrl+C", "copy the selected lines"),
             ("x", "mark viewed / stage file"),
         ),
@@ -2432,7 +2515,11 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ),
         Line::from(""),
         Line::from(Span::styled(
-            "  Editor: Ctrl+S save · Ctrl+C copy · Ctrl+Z or Ctrl+U undo · Ctrl+R redo · Esc close",
+            "  Editor: Ctrl+S save · Ctrl+C copy · Ctrl+Z or Ctrl+U undo · Ctrl+R redo · Alt+P preview markdown · Esc close",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  Markdown preview: } / { walk the headings · r reloads · it reloads itself when an agent rewrites the file · loupe md <path> reads one from the shell",
             dim,
         )),
         Line::from(Span::styled(
@@ -2574,8 +2661,18 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
     let hints: String = match app.screen {
         Screen::PrList => "l local changes · r refresh · m menu · q quit".into(),
         Screen::Review => {
-            if app.editor.is_some() {
-                "Ctrl+S save · Esc close · ? help".into()
+            if app.previewing() {
+                if app.preview_only {
+                    "j/k scroll · } { sections · P source · r reload · q quit".into()
+                } else {
+                    "j/k scroll · } { sections · P source · e edit · Esc diff".into()
+                }
+            } else if app.editor.is_some() {
+                if markdown_buffer(app) {
+                    "Ctrl+S save · Alt+P preview · Esc close · ? help".into()
+                } else {
+                    "Ctrl+S save · Esc close · ? help".into()
+                }
             } else if app.find.active() {
                 format!("n/N matches · / search · y copy{undo} · ? help")
             } else if app.local {
@@ -2613,6 +2710,45 @@ mod tests {
     use crate::highlight;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    /// The preview takes the pane the diff and the editor share, keeps the
+    /// file panel beside it, and puts its own keys in the status bar.
+    #[test]
+    fn the_preview_draws_in_the_diff_pane() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.files = vec![ChangedFile {
+            path: "PLAN.md".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 0,
+            previous: None,
+        }];
+        app.rebuild_entries();
+        app.preview = Some(crate::preview::Preview::new(
+            "PLAN.md",
+            "/repo/PLAN.md".into(),
+            "# STEP 1\n\n- [x] done\n- [ ] todo\n",
+        ));
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let screen: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("STEP 1"), "the document is drawn: {screen}");
+        assert!(screen.contains("☑ done"), "task boxes render: {screen}");
+        assert!(screen.contains("☐ todo"), "and unticked ones: {screen}");
+        assert!(screen.contains("PLAN.md"), "the file panel is still there");
+        assert!(screen.contains("P source"), "the way back is offered");
+    }
 
     /// End-to-end guard for "editor colors in the diff": highlight a Rust
     /// snippet, push it through App state, render with a TestBackend, and

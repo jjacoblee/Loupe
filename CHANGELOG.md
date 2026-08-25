@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A markdown preview** (`P`, the `📖 Preview` button, or
+  `☰ → Actions → Preview the markdown`). A `.md` file now has a document
+  view as well as a diff and a source view, in the pane the diff and the
+  editor share.
+
+  - **A full render.** Headings with rules under them, wrapped
+    paragraphs, bold, italic, strikethrough, inline code, links that keep
+    their address, nested and ordered lists, `[ ]` / `[x]` task boxes,
+    block quotes at any depth, GitHub tables with column alignment,
+    thematic rules, YAML front matter, and fenced code blocks colored by
+    the same syntax themes the diff uses. Underscored identifiers such as
+    `MAX_RETRY_COUNT` are left alone rather than read as emphasis, which
+    is what the files this pane exists for are full of.
+  - **The preview and the source are two views of one file.** `P` moves
+    between them (`Alt+P` from inside the editor, where plain letters are
+    text) and both keep their place: from the preview you land in the
+    editor on the line you were reading, and from the editor you land in
+    the preview at the line you just changed. Unsaved text renders as it
+    stands, so a heading can be changed, looked at, and changed again
+    without saving in between.
+  - **It follows the file.** The idle tick watches the modification time
+    and re-renders when something else rewrites it, holding your place by
+    source line rather than by row — a plan file updating on screen as an
+    agent writes it. Unsaved text is never overwritten this way.
+  - **Reaching a file that is not in the change.** `Ctrl+P` opens any
+    `.md` file in the repository as a document, and `loupe md <path>`
+    reads one from anywhere on the machine with no review behind it.
+  - `}` and `{` walk the headings, `r` re-reads the file now, and the
+    blame pane stands down while the preview is open — one source line is
+    any number of rendered rows there, or none.
+
 - **A blame pane between the file panel and the diff** (`B`, or
   `☰ → View → Blame column`). Every visible diff row gets a blame row
   beside it: who last touched the line, how long ago, and the pull

@@ -15,6 +15,8 @@ use crate::github::{self, ChangedFile, CommentSide, PrDetail, PrRef, PrSummary};
 use crate::gitops::{self, StageState};
 use crate::highlight::{self, HlLine};
 use crate::lsp::{self, Lsp};
+use crate::markdown;
+use crate::preview::{self, Preview};
 use crate::search;
 use crate::theme::Appearance;
 use anyhow::Result;
@@ -746,6 +748,11 @@ pub enum ButtonId {
     EditorClose,
     /// ⇥ Format in the editor top bar (also Ctrl+T).
     EditorFormat,
+    /// 📖 Preview / ✎ Source — the toggle between the rendered markdown
+    /// and the text it came from (also the `P` key).
+    PreviewToggle,
+    /// ✕ on the preview: back to the diff.
+    PreviewClose,
     Theme,
     ThemeApply,
     ThemeCancel,
@@ -1143,6 +1150,8 @@ pub struct ExternalFile {
     /// The working tree is on another branch, so this text came from the
     /// commit under review and must not be written back over the file.
     read_only: bool,
+    /// Open it in the markdown preview rather than the editor.
+    preview: bool,
 }
 
 /// One place a symbol is used, with the source line to show for it.
@@ -1335,6 +1344,14 @@ pub struct App {
     last_click: Option<(Instant, u16, u16)>,
 
     pub editor: Option<Editor>,
+    /// The markdown preview, when one is open. It shares the pane with
+    /// the diff and the editor, and never coexists with the editor —
+    /// `P` swaps one for the other on the same file.
+    pub preview: Option<Preview>,
+    /// True when loupe was launched to read one file (`loupe md <path>`)
+    /// and there is no review beside it: the preview takes the whole
+    /// window and quitting is the only way out.
+    pub preview_only: bool,
     pub overlay: Overlay,
 
     pub status: String,
@@ -1528,6 +1545,8 @@ impl App {
             drag_select: false,
             last_click: None,
             editor: None,
+            preview: None,
+            preview_only: false,
             overlay: Overlay::None,
             status: String::new(),
             status_err: false,
@@ -1786,6 +1805,12 @@ impl App {
 
         // The blame pane fills in after the diff it sits beside.
         if self.poll_blame() {
+            changed = true;
+        }
+
+        // A previewed file that something else rewrote — the plan file an
+        // agent is still writing — is re-rendered where it stands.
+        if self.poll_preview_reload() {
             changed = true;
         }
 
@@ -2096,6 +2121,11 @@ impl App {
                 self.select_mode = false;
                 self.selection = None;
                 self.editor = None;
+                // Switching files from the preview stays in the preview
+                // when the next file is one it can render, and drops to
+                // the diff when it is not: the pane follows what the
+                // reader was doing, not what they last clicked.
+                let keep_preview = self.preview.take().is_some() && markdown::is_markdown(&d.path);
                 self.recompute_matches();
                 self.reveal_current_file();
                 // The blame of the file that just landed, on its own job.
@@ -2119,6 +2149,9 @@ impl App {
                 match self.auto_open_note.take() {
                     Some(note) => self.ok(format!("{note} · {msg}")),
                     None => self.ok(msg),
+                }
+                if keep_preview {
+                    self.preview_current_file();
                 }
             }
             Outcome::CommentPosted { path, lo, hi } => {
@@ -2181,6 +2214,25 @@ impl App {
     /// columns. The review underneath is untouched, so closing the editor
     /// puts the reader back exactly where they were with no reload.
     fn apply_external(&mut self, d: ExternalFile) {
+        // A markdown file opens as a document. That is the whole point of
+        // reaching for the finder: a plan file or a review write-up is
+        // meant to be read, and `P` gets to its source when it is not.
+        if d.preview {
+            let mut pv = Preview::new(&d.path, d.abs_path.clone(), &d.content);
+            pv.standalone = true;
+            pv.mtime = preview::mtime_of(&d.abs_path);
+            if let Some(line) = d.line {
+                pv.go_to_source(line);
+            }
+            self.preview = Some(pv);
+            self.blame_new = None;
+            self.blame_old = None;
+            self.ok(format!(
+                "📖 {} — P shows the source, Esc goes back to the diff.",
+                d.path
+            ));
+            return;
+        }
         let mut editor = Editor::new(&d.path, d.abs_path, &d.content);
         editor.standalone = true;
         editor.read_only = d.read_only;
@@ -3200,6 +3252,11 @@ impl App {
         if reload {
             self.spawn_load_file(self.file_cursor);
         }
+        // The preview caches its rendered lines with the colors they were
+        // built from, so it has to be told the palette moved.
+        if let Some(pv) = &mut self.preview {
+            pv.restyle();
+        }
     }
 
     fn cancel_theme_pick(&mut self) {
@@ -3207,6 +3264,9 @@ impl App {
             highlight::set_theme(tp.prev);
             crate::theme::set_appearance(tp.prev_appearance);
             self.overlay = Overlay::None;
+            if let Some(pv) = &mut self.preview {
+                pv.restyle();
+            }
             self.ok("Theme unchanged.");
         }
     }
@@ -3466,6 +3526,64 @@ impl App {
             return;
         }
 
+        // Preview mode. Reading keys only: everything that changes the
+        // document happens in the source view, one `P` away.
+        if self.preview.is_some() {
+            let page = self.preview.as_ref().map(|p| p.page()).unwrap_or(10);
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if self.pending_g {
+                self.pending_g = false;
+                if let (KeyCode::Char('g'), Some(pv)) = (key.code, &mut self.preview) {
+                    pv.scroll_to_top();
+                    return;
+                }
+            }
+            match key.code {
+                KeyCode::Char('P') | KeyCode::Char('e') | KeyCode::Char('i') => {
+                    self.toggle_preview();
+                }
+                KeyCode::Esc => self.close_preview(),
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('r') => self.reload_preview(),
+                KeyCode::Char('g') => self.pending_g = true,
+                KeyCode::Char('m') => self.open_menu_from_key(),
+                KeyCode::Char('t') => self.open_theme_picker(),
+                KeyCode::Char('?') => self.overlay = Overlay::Help,
+                KeyCode::Char('p') if ctrl => self.open_finder(FinderMode::Files),
+                KeyCode::Char('<') => self.resize_file_panel(-2),
+                KeyCode::Char('>') => self.resize_file_panel(2),
+                KeyCode::Char(']') if !self.preview_only => self.step_file(1),
+                KeyCode::Char('[') if !self.preview_only => self.step_file(-1),
+                _ => {
+                    let Some(pv) = &mut self.preview else { return };
+                    match key.code {
+                        KeyCode::Down | KeyCode::Char('j') => pv.scroll_rows(1),
+                        KeyCode::Up | KeyCode::Char('k') => pv.scroll_rows(-1),
+                        KeyCode::Char('d') if ctrl => pv.scroll_rows(page / 2),
+                        KeyCode::Char('u') if ctrl => pv.scroll_rows(-page / 2),
+                        KeyCode::Char('f') if ctrl => pv.scroll_rows(page),
+                        KeyCode::Char('b') if ctrl => pv.scroll_rows(-page),
+                        KeyCode::PageDown | KeyCode::Char(' ') => pv.scroll_rows(page),
+                        KeyCode::PageUp => pv.scroll_rows(-page),
+                        KeyCode::Home => pv.scroll_to_top(),
+                        KeyCode::Char('G') | KeyCode::End => pv.scroll_to_bottom(),
+                        // Section-at-a-time, the way `}` walks hunks in
+                        // the diff. A long plan file is read this way.
+                        // Past the last heading, `}` runs on to the end of
+                        // the document rather than doing nothing.
+                        KeyCode::Char('}') | KeyCode::Tab if !pv.jump_heading(true) => {
+                            pv.scroll_to_bottom();
+                        }
+                        KeyCode::Char('{') | KeyCode::BackTab if !pv.jump_heading(false) => {
+                            pv.scroll_to_top();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return;
+        }
+
         // Editor mode.
         if self.editor.is_some() {
             // The completion popup owns a few keys while it is open, and
@@ -3544,6 +3662,13 @@ impl App {
                 }
                 (KeyCode::Char(' '), KeyModifiers::CONTROL) => {
                     self.spawn_editor_request(EditorRequest::Complete);
+                }
+                // Back to the rendered document. Alt rather than Ctrl:
+                // Ctrl+P is tui-textarea's cursor-up, and taking it away
+                // would break moving around the buffer.
+                (KeyCode::Char('p'), KeyModifiers::ALT)
+                | (KeyCode::Char('P'), KeyModifiers::ALT) => {
+                    self.toggle_preview();
                 }
                 // tui-textarea's own undo is Ctrl+U; Ctrl+Z is what
                 // everyone reaches for, so both work. A format is undone
@@ -3753,6 +3878,9 @@ impl App {
                         };
                         self.open_editor(line);
                     }
+                    // Render this file as a document. Shift, because `p`
+                    // belongs to search and the diff takes bare letters.
+                    KeyCode::Char('P') => self.toggle_preview(),
                     KeyCode::Char('c') => self.open_comment(),
                     KeyCode::Char('`') => self.toggle_workspace(),
                     KeyCode::Char('r') => self.refresh_review(),
@@ -3919,6 +4047,56 @@ impl App {
                 return;
             }
             Overlay::None => {}
+        }
+
+        // Preview mode: the file panel still switches files, because a
+        // rendered document has nothing unsaved to lose.
+        if self.preview.is_some() {
+            if self.divider_mouse(m, x, y) {
+                return;
+            }
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    match self.layout.button_at(x, y) {
+                        Some(ButtonId::Menu) => {
+                            self.open_menu(x, y);
+                            return;
+                        }
+                        Some(id) if self.activate(id) => return,
+                        _ => {}
+                    }
+                    if contains(self.layout.file_list, x, y) {
+                        self.file_list_click(x, y);
+                        return;
+                    }
+                    if let Some(pv) = &mut self.preview {
+                        pv.on_click(x, y);
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Right) => {
+                    if contains(self.layout.file_list, x, y) {
+                        self.open_path_menu(x, y);
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    if contains(self.layout.file_list, x, y) {
+                        self.file_scroll = self.file_scroll.saturating_sub(3);
+                    } else if let Some(pv) = &mut self.preview {
+                        pv.scroll_rows(-preview::WHEEL_ROWS);
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if contains(self.layout.file_list, x, y) {
+                        let h = self.layout.file_list.height as usize;
+                        let max = self.entries.len().saturating_sub(h.max(1));
+                        self.file_scroll = (self.file_scroll + 3).min(max);
+                    } else if let Some(pv) = &mut self.preview {
+                        pv.scroll_rows(preview::WHEEL_ROWS);
+                    }
+                }
+                _ => {}
+            }
+            return;
         }
 
         // Editor mode: top-bar buttons, the file list, and the editor surface.
@@ -4566,10 +4744,39 @@ impl App {
             return rows;
         }
 
+        if self.preview.is_some() {
+            rows.push(MenuRow::Heading("PREVIEW"));
+            rows.push(item(
+                "✎  Show the source".into(),
+                "P",
+                ButtonId::PreviewToggle,
+            ));
+            rows.push(item("⟳  Reload from disk".into(), "r", ButtonId::Refresh));
+            if !self.preview_only {
+                rows.push(item(
+                    "✕  Back to the diff".into(),
+                    "Esc",
+                    ButtonId::PreviewClose,
+                ));
+            }
+            rows.push(MenuRow::Heading("SETTINGS"));
+            rows.push(item("🎨 Theme".into(), "t", ButtonId::Theme));
+            rows.push(item("?  Help".into(), "?", ButtonId::Help));
+            rows.push(item("✕  Quit".into(), "q", ButtonId::Quit));
+            return rows;
+        }
+
         if self.editor.is_some() {
             rows.push(MenuRow::Heading("EDITOR"));
             rows.push(item("💾 Save".into(), "Ctrl+S", ButtonId::EditorSave));
             rows.push(item("⇥  Format".into(), "Ctrl+T", ButtonId::EditorFormat));
+            if markdown::is_markdown(self.editor.as_ref().map(|e| e.path.as_str()).unwrap_or("")) {
+                rows.push(item(
+                    "📖 Preview the markdown".into(),
+                    "Alt+P",
+                    ButtonId::PreviewToggle,
+                ));
+            }
             rows.push(item(
                 "✕  Close the editor".into(),
                 "Esc",
@@ -4629,6 +4836,12 @@ impl App {
 
         rows.push(MenuRow::Heading("ACTIONS"));
         rows.push(item("✎  Edit this file".into(), "e", ButtonId::Edit));
+        rows.push(maybe(
+            "📖 Preview the markdown".into(),
+            "P",
+            ButtonId::PreviewToggle,
+            self.can_preview(),
+        ));
         if !self.local {
             rows.push(maybe(
                 "💬 Comment on the selection".into(),
@@ -4748,10 +4961,13 @@ impl App {
             ButtonId::FindSymbols => self.open_finder(FinderMode::Symbols),
             ButtonId::FindInDiff => self.start_find(),
             ButtonId::Edit => self.open_editor(None),
+            ButtonId::PreviewToggle => self.toggle_preview(),
+            ButtonId::PreviewClose => self.close_preview(),
             ButtonId::Comment => self.open_comment(),
             ButtonId::Copy => self.yank(),
             ButtonId::RevertSection => self.ask_revert_section(self.diff_cursor),
             ButtonId::RevertFile => self.ask_revert_file(self.file_cursor),
+            ButtonId::Refresh if self.preview.is_some() => self.reload_preview(),
             ButtonId::Refresh => match self.screen {
                 Screen::PrList => self.spawn_load_prs(),
                 Screen::Review => self.refresh_review(),
@@ -5791,6 +6007,8 @@ impl App {
             self.err("Close the editor first (Ctrl+S saves, Esc closes).");
             return;
         }
+        // A preview holds nothing unsaved, so it simply gives way.
+        self.preview = None;
         let root = self.repo_root.clone();
         let rev = self.search_rev();
         // In local review the working tree *is* what is under review.
@@ -5822,6 +6040,7 @@ impl App {
                 }
             };
             Ok(Outcome::ExternalOpened(Box::new(ExternalFile {
+                preview: markdown::is_markdown(&path),
                 path,
                 abs_path,
                 content,
@@ -6573,6 +6792,253 @@ impl App {
         }));
     }
 
+    // ------------------------------------------------ the markdown preview
+
+    /// `P`, the 📖 button and the ☰ line: move between the rendered
+    /// document and the text it came from.
+    ///
+    /// Which way it goes depends on what is open. From the diff or the
+    /// editor it renders; from the preview it opens the source in the
+    /// editor, on the line that was at the top of the pane. Nothing is
+    /// lost either way — the source view is the editor, so an edit made
+    /// there and a toggle back shows the change immediately, saved or not.
+    pub fn toggle_preview(&mut self) {
+        if self.preview.is_some() {
+            self.preview_to_source();
+        } else if self.editor.is_some() {
+            self.source_to_preview();
+        } else {
+            self.preview_current_file();
+        }
+    }
+
+    /// Render the changeset file under the file cursor.
+    fn preview_current_file(&mut self) {
+        let Some(file) = self.files.get(self.file_cursor).cloned() else {
+            self.err("No file to preview.");
+            return;
+        };
+        if !markdown::is_markdown(&file.path) {
+            self.err(format!(
+                "{} is not markdown — P previews .md files (Ctrl+P finds one).",
+                file.path
+            ));
+            return;
+        }
+        if file.status == "removed" {
+            self.err("This file is deleted in the change — there is nothing to render.");
+            return;
+        }
+        let Some(abs_path) = gitops::safe_repo_path(&self.repo_root, &file.path) else {
+            self.err(format!("Refusing to open “{}” — unsafe path.", file.path));
+            return;
+        };
+        // The new side is already in memory from the diff load; disk is
+        // only consulted when it is not (a file loaded before the diff).
+        let content = match &self.new_content {
+            Some(c) => c.clone(),
+            None => match std::fs::read_to_string(&abs_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    self.err(format!("Cannot read {}: {e}", file.path));
+                    return;
+                }
+            },
+        };
+        let mut pv = Preview::new(&file.path, abs_path.clone(), &content);
+        pv.mtime = preview::mtime_of(&abs_path);
+        // Land on the line the diff cursor is on, so previewing a hunk
+        // shows the part of the document that hunk changed.
+        if let Some((Side::Right, n)) = self.cursor_pos() {
+            pv.go_to_source(n);
+        }
+        self.preview = Some(pv);
+        self.ok(format!(
+            "📖 {} — P shows the source, e edits it, Esc goes back to the diff.",
+            file.path
+        ));
+    }
+
+    /// Render whatever the editor currently holds, saved or not.
+    fn source_to_preview(&mut self) {
+        let Some(ed) = &self.editor else { return };
+        if !markdown::is_markdown(&ed.path) {
+            self.err(format!("{} is not markdown — nothing to preview.", ed.path));
+            return;
+        }
+        let path = ed.path.clone();
+        let abs_path = ed.abs_path.clone();
+        let standalone = ed.standalone;
+        let dirty = ed.dirty;
+        let line = ed.cursor_pos().0;
+        let content = ed.content();
+        if dirty {
+            // The buffer is what the reader wants to see; the file on disk
+            // is a different document until they save.
+            self.ok("📖 Previewing unsaved text — Ctrl+S in the source view writes it.");
+        } else {
+            self.ok(format!("📖 {path} — P goes back to the source."));
+        }
+        self.editor = None;
+        let mut pv = Preview::new(&path, abs_path.clone(), &content);
+        pv.standalone = standalone;
+        pv.from_editor = true;
+        pv.from_buffer = dirty;
+        pv.mtime = preview::mtime_of(&abs_path);
+        pv.go_to_source(line);
+        self.preview = Some(pv);
+        // The blame pane cannot follow a rendered document: one source
+        // line is any number of rows, or none. It comes back with the
+        // source view.
+        self.blame_new = None;
+        self.blame_old = None;
+    }
+
+    /// Open the source of what the preview is showing, in the editor.
+    fn preview_to_source(&mut self) {
+        let Some(pv) = self.preview.take() else {
+            return;
+        };
+        let line = pv.source_line();
+        // A file in the changeset goes through the same door the diff's
+        // `e` key uses, so the checkout and symlink guards still apply.
+        if !pv.standalone && !self.preview_only {
+            self.open_editor(Some(line));
+            if self.editor.is_none() {
+                // A guard refused: put the reader back where they were
+                // rather than into an empty pane.
+                self.preview = Some(pv);
+            }
+            return;
+        }
+        let mut ed = Editor::new(&pv.path, pv.abs_path.clone(), &pv.src);
+        ed.standalone = true;
+        ed.dirty = pv.from_buffer;
+        ed.jump_to_line(line);
+        self.editor = Some(ed);
+        if !self.preview_only {
+            self.spawn_blame_external(pv.path.clone(), false);
+        }
+        self.ok(format!(
+            "✎ {} — Ctrl+S saves, P shows the preview again.",
+            pv.path
+        ));
+    }
+
+    /// `r` in the preview: re-read the file now, without waiting for the
+    /// idle check to notice it moved.
+    pub fn reload_preview(&mut self) {
+        let Some(pv) = &self.preview else { return };
+        let abs = pv.abs_path.clone();
+        let path = pv.path.clone();
+        match std::fs::read_to_string(&abs) {
+            Ok(text) => {
+                let mtime = preview::mtime_of(&abs);
+                if let Some(pv) = &mut self.preview {
+                    pv.reload(&text);
+                    pv.mtime = mtime;
+                    pv.from_buffer = false;
+                }
+                self.ok(format!("📖 {path} reloaded."));
+            }
+            Err(e) => self.err(format!("Cannot re-read {path}: {e}")),
+        }
+    }
+
+    /// Esc / ✕: leave the preview. In `loupe md` there is nothing behind
+    /// it, so that is the way out of loupe.
+    pub fn close_preview(&mut self) {
+        if self.preview_only {
+            self.should_quit = true;
+            return;
+        }
+        let was = self.preview.take();
+        if was.is_some() {
+            // The blame pane goes back to the file under review.
+            self.spawn_blame(self.file_cursor);
+            self.ok("Back to the diff.");
+        }
+    }
+
+    /// True when the pane is showing a rendered document.
+    pub fn previewing(&self) -> bool {
+        self.preview.is_some()
+    }
+
+    /// Whether a 📖 toggle makes sense right now — the file in front of
+    /// the reader is markdown.
+    pub fn can_preview(&self) -> bool {
+        if self.preview.is_some() {
+            return true;
+        }
+        match &self.editor {
+            Some(ed) => markdown::is_markdown(&ed.path),
+            None => self
+                .files
+                .get(self.file_cursor)
+                .is_some_and(|f| markdown::is_markdown(&f.path) && f.status != "removed"),
+        }
+    }
+
+    /// Re-read the previewed file when something else rewrites it — the
+    /// case this pane exists for, since the plan file being read is often
+    /// one an agent is still writing.
+    fn poll_preview_reload(&mut self) -> bool {
+        let Some(pv) = &self.preview else {
+            return false;
+        };
+        // Unsaved editor text is the reader's own; disk does not win.
+        if pv.from_buffer {
+            return false;
+        }
+        let now = preview::mtime_of(&pv.abs_path);
+        if now.is_none() || now == pv.mtime {
+            return false;
+        }
+        let Ok(text) = std::fs::read_to_string(&pv.abs_path) else {
+            return false;
+        };
+        let Some(pv) = &mut self.preview else {
+            return false;
+        };
+        if text == pv.src {
+            // The timestamp moved but the bytes did not (a rewrite with
+            // the same content). Adopt the new time and stay quiet.
+            pv.mtime = now;
+            return false;
+        }
+        pv.mtime = now;
+        pv.reload(&text);
+        let path = pv.path.clone();
+        self.ok(format!("📖 {path} changed on disk — reloaded."));
+        true
+    }
+
+    /// Open a markdown file by path, with no review behind it
+    /// (`loupe md <path>`). The path may be anywhere on this machine.
+    pub fn start_preview_only(&mut self, path: &std::path::Path) {
+        self.preview_only = true;
+        self.screen = Screen::Review;
+        let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let content = match std::fs::read_to_string(&abs_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.err(format!("Cannot read {}: {e}", path.display()));
+                String::new()
+            }
+        };
+        // The whole path is the name here: there is no repository to show
+        // it relative to.
+        let name = abs_path.to_string_lossy().to_string();
+        let mut pv = Preview::new(&name, abs_path.clone(), &content);
+        pv.standalone = true;
+        pv.mtime = preview::mtime_of(&abs_path);
+        self.preview = Some(pv);
+        if !self.status_err {
+            self.ok("📖 P shows the source · Ctrl+S saves · q quits.");
+        }
+    }
+
     pub fn open_editor(&mut self, jump_line: Option<usize>) {
         if !self.checked_out {
             self.err("Editing needs the PR branch checked out — reopen the PR and pick “Checkout & review”.");
@@ -7090,6 +7556,218 @@ mod tests {
             deletions: 0,
             previous: None,
         }
+    }
+
+    // ------------------------------------------------- the markdown preview
+
+    /// A review of one markdown file, with its new side already loaded —
+    /// the state the `P` key acts on.
+    fn md_review_app(dir: &std::path::Path, body: &str) -> App {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.checked_out = true;
+        app.repo_root = dir.to_path_buf();
+        app.files = vec![ChangedFile {
+            path: "PLAN.md".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 0,
+            previous: None,
+        }];
+        app.rebuild_entries();
+        std::fs::write(dir.join("PLAN.md"), body).expect("fixture written");
+        app.new_content = Some(body.to_string());
+        app
+    }
+
+    /// A scratch directory of this test's own, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("loupe-preview-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch directory");
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn p_renders_the_markdown_file_under_the_cursor() {
+        let dir = TempDir::new("open");
+        let mut app = md_review_app(&dir.0, "# Plan\n\n- one\n");
+        app.handle_key(key(KeyCode::Char('P')));
+        let pv = app.preview.as_ref().expect("the preview is open");
+        assert_eq!(pv.path, "PLAN.md");
+        assert!(!pv.standalone, "it is the file under review");
+    }
+
+    #[test]
+    fn p_refuses_a_file_it_cannot_render() {
+        let mut app = folded_app();
+        app.handle_key(key(KeyCode::Char('P')));
+        assert!(app.preview.is_none());
+        assert!(app.status_err, "it says why: {}", app.status);
+        assert!(app.status.contains("not markdown"));
+    }
+
+    /// The round trip the reader makes to change something they just read:
+    /// preview → source → edit → preview, with the edit showing up.
+    #[test]
+    fn the_preview_and_the_source_swap_places() {
+        let dir = TempDir::new("swap");
+        let mut app = md_review_app(&dir.0, "# Plan\n\nfirst paragraph.\n");
+        app.handle_key(key(KeyCode::Char('P')));
+        assert!(app.preview.is_some());
+
+        // P again opens the source in the editor.
+        app.handle_key(key(KeyCode::Char('P')));
+        assert!(app.preview.is_none());
+        let ed = app.editor.as_mut().expect("the editor is open");
+        assert_eq!(ed.path, "PLAN.md");
+        ed.textarea.move_cursor(tui_textarea::CursorMove::End);
+        ed.textarea.insert_str(" edited");
+        ed.dirty = true;
+
+        // Alt+P renders the buffer as it stands, saved or not.
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        let pv = app.preview.as_ref().expect("back in the preview");
+        assert!(app.editor.is_none());
+        assert!(pv.from_buffer, "it is showing unsaved text");
+        assert!(pv.src.contains("edited"), "the edit is in the render");
+    }
+
+    #[test]
+    fn switching_files_keeps_the_preview_only_for_markdown() {
+        let dir = TempDir::new("switch");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        app.files.push(ChangedFile {
+            path: "NOTES.md".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 0,
+            previous: None,
+        });
+        app.files.push(cf("src/main.rs"));
+        app.rebuild_entries();
+        std::fs::write(dir.0.join("NOTES.md"), "# Notes\n").unwrap();
+        app.handle_key(key(KeyCode::Char('P')));
+        assert!(app.preview.is_some());
+
+        // A second markdown file stays in the preview.
+        app.apply(Outcome::FileLoaded(Box::new(FileLoadedData {
+            idx: 1,
+            path: "NOTES.md".into(),
+            old: None,
+            new: Some("# Notes\n".into()),
+            old_hl: Vec::new(),
+            new_hl: Vec::new(),
+            differs: false,
+            diff: FileDiff::compute(None, Some("# Notes\n")),
+        })));
+        assert_eq!(
+            app.preview.as_ref().map(|p| p.path.as_str()),
+            Some("NOTES.md")
+        );
+
+        // Something it cannot render drops back to the diff.
+        app.apply(Outcome::FileLoaded(Box::new(FileLoadedData {
+            idx: 2,
+            path: "src/main.rs".into(),
+            old: None,
+            new: Some("fn main() {}\n".into()),
+            old_hl: Vec::new(),
+            new_hl: Vec::new(),
+            differs: false,
+            diff: FileDiff::compute(None, Some("fn main() {}\n")),
+        })));
+        assert!(app.preview.is_none());
+    }
+
+    #[test]
+    fn esc_leaves_the_preview_for_the_diff() {
+        let dir = TempDir::new("esc");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        app.handle_key(key(KeyCode::Char('P')));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.preview.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn a_markdown_file_from_the_finder_opens_as_a_document() {
+        let mut app = folded_app();
+        app.apply_external(ExternalFile {
+            path: "docs/notes.md".into(),
+            abs_path: "/repo/docs/notes.md".into(),
+            content: "# Notes\n".into(),
+            line: None,
+            read_only: false,
+            preview: true,
+        });
+        let pv = app.preview.as_ref().expect("the preview is open");
+        assert!(pv.standalone, "it is not part of the changeset");
+        assert!(app.editor.is_none(), "the editor stayed out of the way");
+    }
+
+    /// The case the pane exists for: an agent rewrites the plan file while
+    /// it is on screen.
+    #[test]
+    fn a_rewritten_file_is_picked_up() {
+        let dir = TempDir::new("reload");
+        let mut app = md_review_app(&dir.0, "# Plan\n\nSTEP 1.\n");
+        app.handle_key(key(KeyCode::Char('P')));
+        assert!(app
+            .preview
+            .as_ref()
+            .is_some_and(|p| p.src.contains("STEP 1")));
+
+        // Nothing has changed, so nothing is re-read.
+        assert!(!app.poll_preview_reload());
+
+        // The mtime resolution on some filesystems is coarse, so the
+        // recorded time is cleared rather than raced against.
+        if let Some(pv) = &mut app.preview {
+            pv.mtime = None;
+        }
+        std::fs::write(dir.0.join("PLAN.md"), "# Plan\n\nSTEP 2.\n").unwrap();
+        assert!(app.poll_preview_reload(), "the change was noticed");
+        let pv = app.preview.as_ref().expect("still open");
+        assert!(pv.src.contains("STEP 2"), "the new text is in the pane");
+    }
+
+    #[test]
+    fn unsaved_text_is_never_overwritten_by_the_file_on_disk() {
+        let dir = TempDir::new("unsaved");
+        let mut app = md_review_app(&dir.0, "# Plan\n");
+        app.handle_key(key(KeyCode::Char('P')));
+        if let Some(pv) = &mut app.preview {
+            pv.from_buffer = true;
+            pv.mtime = None;
+        }
+        std::fs::write(dir.0.join("PLAN.md"), "# Something else\n").unwrap();
+        assert!(!app.poll_preview_reload(), "the reader's own text wins");
+    }
+
+    #[test]
+    fn loupe_md_opens_one_file_with_no_review_behind_it() {
+        let dir = TempDir::new("standalone");
+        let path = dir.0.join("REVIEW.md");
+        std::fs::write(&path, "# Review\n\nAll good.\n").unwrap();
+        let mut app = App::new(LaunchMode::Auto, None);
+        app.start_preview_only(&path);
+        assert!(app.preview_only);
+        assert!(app.preview.is_some());
+        // There is nothing behind the document, so Esc is the way out.
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.should_quit);
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -9076,6 +9754,7 @@ mod tests {
             content: "one\ntwo\nthree\nfour\n".into(),
             line: Some(3),
             read_only: false,
+            preview: false,
         });
         let ed = app.editor.as_ref().expect("the editor is open");
         assert!(ed.standalone, "it is not the changeset file");
@@ -9107,6 +9786,7 @@ mod tests {
             content: "one\n".into(),
             line: None,
             read_only: true,
+            preview: false,
         });
         assert!(app.editor.as_ref().unwrap().read_only);
         assert!(app.status.contains("read-only"));

@@ -53,6 +53,15 @@ leaving your terminal or touching a browser.
   moved — so *"is this related to what I am doing now?"* is answered at a
   glance. Click a row for the commit itself, and `o` opens its pull
   request. Works in a PR review, in local review, and beside the editor.
+- **Read the markdown, not the markup** — `P` renders a `.md` file as a
+  document in the pane the diff uses: headings, wrapped paragraphs,
+  nested and task lists, tables, block quotes, front matter, and fenced
+  code blocks colored by your syntax theme. `P` again opens its source in
+  the editor, on the line you were reading, so you can change a plan file
+  and look at the result without saving in between. It re-renders on its
+  own when an agent rewrites the file. `Ctrl+P` reaches any `.md` file in
+  the repository, and `loupe md <path>` reads one from anywhere on the
+  machine.
 - **Keeps up with an agent** — local review re-scans the working tree
   whenever you pause, so files a coding agent rewrites under an open
   review appear without a key press. It never interrupts (no re-scan
@@ -144,6 +153,7 @@ cd your-repo
 loupe           # local changes if any, else the PR flow
 loupe --pr      # straight to pull requests
 loupe --local   # review uncommitted work even when the tree is clean
+loupe md PLAN.md   # read one markdown file, with no review beside it
 ```
 
 Opening a PR from the picker offers **Checkout & review** (switches your
@@ -155,7 +165,8 @@ for the list.
 The first launch runs a quick setup wizard (theme + default mode, saved
 for you). Then: click files, read diffs (`v` toggles split/inline, `z`
 folds), select lines (click, drag, or `V` + motions) and `c` to comment,
-`e` to edit, `x` to mark viewed or stage, `B` for blame, `r` to refresh, `m` (or `☰`)
+`e` to edit, `P` to read a markdown file as a document, `x` to mark
+viewed or stage, `B` for blame, `r` to refresh, `m` (or `☰`)
 for the menu, `?` for help, `q` to quit — the full keyboard and mouse
 reference is in
 [docs/keys-and-mouse.md](docs/keys-and-mouse.md).
