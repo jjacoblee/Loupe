@@ -513,15 +513,21 @@ fn read_message(r: &mut impl BufRead) -> Result<Option<Value>> {
 
 impl Client {
     fn start(spec: &'static ServerSpec, root: &Path) -> Result<Client> {
-        if which(spec.cmd).is_none() {
+        // Spawn what `which` resolved, not the bare name. They differ for
+        // a rustup stand-in: `which` asks rustup for the real binary,
+        // while the bare name goes back through the stand-in and fails
+        // with "Unknown binary" when the component is missing from the
+        // active toolchain. Starting the resolved path is what makes the
+        // "is it installed?" answer and the spawn agree.
+        let Some(bin) = which(spec.cmd) else {
             bail!(
                 "{} is not installed (no `{}` on PATH). Install it with:  {}",
                 spec.lang,
                 spec.cmd,
                 spec.install
             );
-        }
-        let mut child = Command::new(spec.cmd)
+        };
+        let mut child = Command::new(&bin)
             .args(spec.args)
             .current_dir(root)
             .stdin(Stdio::piped())
@@ -1539,14 +1545,20 @@ mod tests {
     /// match what actually happens when the binary runs.
     #[test]
     fn rust_analyzer_is_reported_only_when_it_runs() {
-        let found = which("rust-analyzer").is_some();
-        let runs = Command::new("rust-analyzer")
-            .arg("--version")
-            .output()
-            .is_ok_and(|out| out.status.success());
+        // The resolved path, because that is what `Client::start` spawns.
+        // Running the bare name instead would go back through the rustup
+        // stand-in and could fail on a machine where loupe works.
+        let found = which("rust-analyzer");
+        let runs = found.as_ref().is_some_and(|bin| {
+            Command::new(bin)
+                .arg("--version")
+                .output()
+                .is_ok_and(|out| out.status.success())
+        });
         assert_eq!(
-            found, runs,
-            "which() said {found} but running it said {runs}"
+            found.is_some(),
+            runs,
+            "which() said {found:?} but running it said {runs}"
         );
     }
 

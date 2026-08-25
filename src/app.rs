@@ -11492,9 +11492,13 @@ b2
         assert!(!menu.is_dir);
         assert_eq!(menu.items.len(), 2);
         assert_eq!(menu.items[0].text, "src/app.rs");
-        let full = &menu.items[1].text;
-        assert!(full.starts_with('/'), "{full}");
-        assert!(full.ends_with("/src/app.rs"), "{full}");
+        // Spelled with `Path` rather than `/`: on Windows the absolute
+        // form is `C:\…\src\app.rs` (canonicalize adds a `\\?\` prefix
+        // as well), so a check for a leading slash would test the
+        // platform instead of the menu.
+        let full = std::path::Path::new(&menu.items[1].text);
+        assert!(full.is_absolute(), "{full:?}");
+        assert!(full.ends_with("src/app.rs"), "{full:?}");
     }
 
     /// A local-changes review has no PR behind it, so the badge has no

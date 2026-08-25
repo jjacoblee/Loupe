@@ -569,6 +569,11 @@ mod tests {
     fn theme_switch_changes_highlight_output() {
         let _guard = test_theme_lock();
         let src = "fn main() { let s = \"hi\"; }\n";
+        // Set the theme rather than trusting the one already in place: a
+        // test that panicked mid-switch leaves its theme behind, and
+        // `before` would then be colored by that one while `after` is
+        // colored by DEFAULT_THEME.
+        set_theme(DEFAULT_THEME);
         let before = highlight("t.rs", src);
         set_theme(EmbeddedThemeName::CatppuccinLatte);
         let latte = highlight("t.rs", src);

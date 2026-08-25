@@ -678,6 +678,9 @@ mod tests {
         git(&["init", "-q", "."]);
         git(&["config", "user.email", "loupe@test"]);
         git(&["config", "user.name", "loupe"]);
+        // Pin the line endings: git for Windows checks out CRLF by
+        // default, and these tests compare file contents byte for byte.
+        git(&["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("a.txt"), "one\n").unwrap();
         std::fs::write(root.join("old.txt"), "keep\n").unwrap();
         git(&["add", "-A"]);
@@ -779,6 +782,9 @@ mod tests {
         git(&["init", "-q", "."]);
         git(&["config", "user.email", "loupe@test"]);
         git(&["config", "user.name", "loupe"]);
+        // Pin the line endings: git for Windows checks out CRLF by
+        // default, and these tests compare file contents byte for byte.
+        git(&["config", "core.autocrlf", "false"]);
         std::fs::write(root.join("edited.txt"), "one\n").unwrap();
         std::fs::write(root.join("staged.txt"), "two\n").unwrap();
         std::fs::write(root.join("gone.txt"), "three\n").unwrap();
@@ -884,6 +890,9 @@ mod tests {
         git(&["init", "-q", "-b", "main", "."]);
         git(&["config", "user.email", "loupe@test"]);
         git(&["config", "user.name", "loupe"]);
+        // Pin the line endings: git for Windows checks out CRLF by
+        // default, and these tests compare file contents byte for byte.
+        git(&["config", "core.autocrlf", "false"]);
         // Pin the conflict style: a developer with diff3 configured and one
         // without must get the same test.
         git(&["config", "merge.conflictStyle", "merge"]);
@@ -1002,6 +1011,9 @@ mod tests {
         };
         git(&["config", "user.email", "loupe@test"]);
         git(&["config", "user.name", "loupe"]);
+        // Pin the line endings: git for Windows checks out CRLF by
+        // default, and these tests compare file contents byte for byte.
+        git(&["config", "core.autocrlf", "false"]);
 
         // `tracking` reads the current branch, which comes from the process
         // working directory — so run this half from inside the clone.

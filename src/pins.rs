@@ -266,7 +266,14 @@ pub fn dropped_paths(text: &str) -> Option<Vec<PathBuf>> {
 /// together, a backslash escapes the character after it, and unquoted
 /// whitespace ends the token. A dropped path with a space in it arrives
 /// in one of those three forms depending on the terminal.
+///
+/// On Windows a backslash is the path separator, not an escape — reading
+/// `C:\Users\me\notes.md` as escapes yields `C:Usersmenotes.md`, which is
+/// not absolute, so every drop was refused. Windows terminals quote a
+/// path with spaces instead, which the quote handling below already
+/// covers.
 fn tokens(text: &str) -> Vec<String> {
+    let escapes = !cfg!(windows);
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -279,7 +286,7 @@ fn tokens(text: &str) -> Vec<String> {
         }
         match ch {
             // A backslash is a literal inside single quotes, as in a shell.
-            '\\' if quote != Some('\'') => escaped = true,
+            '\\' if escapes && quote != Some('\'') => escaped = true,
             '\'' | '"' => match quote {
                 Some(q) if q == ch => quote = None,
                 Some(_) => cur.push(ch),
