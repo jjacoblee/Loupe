@@ -1778,12 +1778,26 @@ mod tests {
         assert!(read_message(&mut r).unwrap().is_none());
     }
 
+    /// True when the error says the server never started, rather than that
+    /// it answered loupe's question wrongly.
+    ///
+    /// Finding the binary on `PATH` proves less than it looks. The server
+    /// still needs a `typescript` package it can load, and TypeScript 7
+    /// ships no `tsserver.js` for typescript-language-server 6 to use — so
+    /// a machine can have both installed and still have no working server.
+    /// That machine is a supported one: loupe falls back to pattern
+    /// matching. Only a failure to start is skipped; every other error
+    /// still fails the test, because that one would be loupe's fault.
+    fn server_unavailable(e: &anyhow::Error) -> bool {
+        format!("{e:#}").contains("Request initialize failed")
+    }
+
     /// The real thing: start `typescript-language-server`, ask it the four
     /// questions loupe asks, and check the answers line up with the file.
     ///
-    /// Skipped (not failed) when the server isn't installed — the whole
+    /// Skipped (not failed) when no working server is installed — the whole
     /// design is that loupe uses what you already have, so a machine
-    /// without it is a supported state, not a broken one.
+    /// without one is a supported state, not a broken one.
     #[test]
     fn talks_to_a_real_typescript_server() {
         if which("typescript-language-server").is_none() {
@@ -1802,7 +1816,15 @@ mod tests {
         std::fs::write(root.join("a.ts"), src).unwrap();
 
         let lsp = Lsp::default();
-        let syms = lsp.symbols(&root, "a.ts", src).expect("documentSymbol");
+        let syms = match lsp.symbols(&root, "a.ts", src) {
+            Ok(syms) => syms,
+            Err(e) if server_unavailable(&e) => {
+                eprintln!("skipping: {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            Err(e) => panic!("documentSymbol: {e}"),
+        };
         assert!(
             syms.iter().any(|s| s.name == "handleClick" && s.line == 1),
             "expected handleClick among {syms:?}"
@@ -1899,8 +1921,8 @@ mod tests {
     }
 
     /// Diagnostics, completion and formatting against a real server —
-    /// the three editor features, end to end. Skipped when
-    /// typescript-language-server isn't installed.
+    /// the three editor features, end to end. Skipped when no working
+    /// typescript-language-server is installed.
     #[test]
     fn the_editor_features_work_against_a_real_server() {
         if which("typescript-language-server").is_none() {
@@ -1922,7 +1944,15 @@ mod tests {
         let lsp = Lsp::default();
         // Any request opens the document, which is what makes the server
         // start publishing diagnostics for it.
-        let _ = lsp.symbols(&root, "a.ts", src).expect("symbols");
+        match lsp.symbols(&root, "a.ts", src) {
+            Ok(_) => {}
+            Err(e) if server_unavailable(&e) => {
+                eprintln!("skipping: {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            Err(e) => panic!("symbols: {e}"),
+        }
 
         // Diagnostics are pushed, so they arrive on their own schedule.
         let mut found = Vec::new();
