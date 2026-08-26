@@ -909,6 +909,8 @@ impl ThemePicker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonId {
     ViewTree,
+    /// Copy the block that tells an agent what is on screen.
+    CopyContext,
     ViewFlat,
     FoldToggle,
     Edit,
@@ -6354,6 +6356,14 @@ impl App {
             ButtonId::Copy,
             has_sel,
         ));
+        // Always offered, unlike the copy above: an agent is told where the
+        // reader is even when the reader is pointing at nothing in
+        // particular, and that is often the whole answer it needed.
+        rows.push(item(
+            "🤖  Copy the context for your agent".into(),
+            "Y",
+            ButtonId::CopyContext,
+        ));
         rows.extend(self.pin_menu_rows());
         let revert = self.can_revert();
         // Conflicts first: they block the commit, so they outrank
@@ -6530,6 +6540,7 @@ impl App {
             }
             ButtonId::Comment => self.open_comment(),
             ButtonId::Copy => self.yank(),
+            ButtonId::CopyContext => self.yank_context(),
             ButtonId::RevertSection => self.ask_revert_section(self.diff_cursor),
             ButtonId::RevertFile => self.ask_revert_file(self.file_cursor),
             ButtonId::ReviewBody => self.focus_review(),
