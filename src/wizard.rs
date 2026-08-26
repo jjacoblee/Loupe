@@ -1,5 +1,6 @@
-//! First-launch setup wizard: a big logo, a live theme picker, and a default
-//! mode choice, ending with the config file written for the user. Runs when
+//! First-launch setup wizard: a big logo, a live theme picker, a default
+//! mode choice, and the agent hook, ending with the config file written for
+//! the user. Runs when
 //! no global config exists yet, and on demand via `loupe setup`.
 //!
 //! Deliberately self-contained: it owns its own tiny event loop, draw
@@ -8,6 +9,7 @@
 
 use crate::config;
 use crate::highlight::{self, HlLine};
+use crate::hooks;
 use crate::theme::{self, palette, Appearance};
 use anyhow::Result;
 use crossterm::event::{
@@ -99,6 +101,8 @@ enum Step {
     Welcome,
     Theme,
     Mode,
+    /// Offer the agent hook. Skipped when the machine has no agent.
+    Agent,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -110,6 +114,9 @@ enum Btn {
     Appearance,
     ThemeRow(usize),
     ModeRow(usize),
+    AgentRow(usize),
+    /// Finish without touching any agent's files.
+    AgentSkip,
 }
 
 const MODES: [(&str, &str, &str); 3] = [
@@ -121,6 +128,28 @@ const MODES: [(&str, &str, &str); 3] = [
     ("pr", "Pull requests", "always go straight to the PR picker"),
     ("local", "Local changes", "always review the working tree"),
 ];
+
+/// One agent on the agent step.
+struct Choice {
+    agent: hooks::Agent,
+    /// Ticked. Loupe offers the hook rather than waiting to be asked, so
+    /// this starts true; the reader unticks what they do not want.
+    on: bool,
+    /// Whether the hook was already in place when the wizard opened. Only
+    /// the label uses it — the write is the same either way.
+    already: bool,
+}
+
+impl Choice {
+    fn new(agent: hooks::Agent) -> Self {
+        let already = agent.installed();
+        Choice {
+            agent,
+            on: true,
+            already,
+        }
+    }
+}
 
 struct Wizard {
     step: Step,
@@ -137,6 +166,12 @@ struct Wizard {
     remembered: [Option<usize>; 2],
     /// Sample highlighted with the currently selected theme.
     preview: Vec<HlLine>,
+    /// Agents found on this machine. Empty on a machine with no agent,
+    /// which drops the step entirely.
+    agents: Vec<Choice>,
+    agent_sel: usize,
+    /// What went wrong the last time the agent step tried to write.
+    agent_error: Option<String>,
     /// Clickable regions recorded during the last draw.
     hits: Vec<(Rect, Btn)>,
 }
@@ -157,6 +192,9 @@ impl Wizard {
             prev_appearance: theme::appearance(),
             remembered: [None, None],
             preview: Vec::new(),
+            agents: hooks::detected().into_iter().map(Choice::new).collect(),
+            agent_sel: 0,
+            agent_error: None,
             hits: Vec::new(),
         };
         w.rehighlight();
@@ -214,6 +252,67 @@ impl Wizard {
         Ok(())
     }
 
+    /// True when the agent step has something to offer. A machine with no
+    /// agent never sees it.
+    fn has_agent_step(&self) -> bool {
+        !self.agents.is_empty()
+    }
+
+    /// Continue from the current step. Returns true when setup is over.
+    /// Both the keyboard and the mouse come through here, so there is one
+    /// answer to "what follows this step" rather than two that can drift.
+    fn advance(&mut self) -> Result<bool> {
+        match self.step {
+            Step::Welcome => self.step = Step::Theme,
+            Step::Theme => self.step = Step::Mode,
+            Step::Mode if self.has_agent_step() => self.step = Step::Agent,
+            Step::Mode => {
+                self.finish()?;
+                return Ok(true);
+            }
+            // A failed write keeps the reader on the step, with the reason
+            // in front of them and `s` to move on without it.
+            Step::Agent => {
+                if !self.apply_agents() {
+                    return Ok(false);
+                }
+                self.finish()?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Write every ticked agent's hook, and take back every unticked one.
+    ///
+    /// One failure stops the run and is reported on the step, because the
+    /// files here belong to the reader: a half-finished write they never
+    /// heard about is worse than a wizard that waits.
+    fn apply_agents(&mut self) -> bool {
+        // Settled before anything is written, so a refusal here leaves
+        // every agent as it was rather than some of them changed.
+        let exe = match hooks::exe() {
+            Ok(path) => path,
+            Err(e) => {
+                self.agent_error = Some(format!("{e:#}"));
+                return false;
+            }
+        };
+        for choice in &self.agents {
+            let result = if choice.on {
+                hooks::install(&choice.agent, &exe)
+            } else {
+                hooks::uninstall(&choice.agent)
+            };
+            if let Err(e) = result {
+                self.agent_error = Some(format!("{}: {e:#}", choice.agent.name));
+                return false;
+            }
+        }
+        self.agent_error = None;
+        true
+    }
+
     fn skip(&self) -> Result<()> {
         highlight::set_theme(self.prev_theme);
         theme::set_appearance(self.prev_appearance);
@@ -237,7 +336,9 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<WizardEnd> {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 match (w.step, key.code) {
                     // ---- welcome
-                    (Step::Welcome, KeyCode::Enter | KeyCode::Char(' ')) => w.step = Step::Theme,
+                    (Step::Welcome, KeyCode::Enter | KeyCode::Char(' ')) => {
+                        w.advance()?;
+                    }
                     (Step::Welcome, KeyCode::Esc | KeyCode::Char('q')) => {
                         w.skip()?;
                         return Ok(WizardEnd::Skipped);
@@ -256,7 +357,9 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<WizardEnd> {
                     (Step::Theme, KeyCode::Home) => w.select_theme(0),
                     (Step::Theme, KeyCode::End) => w.select_theme(usize::MAX),
                     (Step::Theme, KeyCode::Char('a')) => w.toggle_appearance(),
-                    (Step::Theme, KeyCode::Enter) => w.step = Step::Mode,
+                    (Step::Theme, KeyCode::Enter) => {
+                        w.advance()?;
+                    }
                     (Step::Theme, KeyCode::Esc) => w.step = Step::Welcome,
                     // ---- mode list
                     (Step::Mode, KeyCode::Up | KeyCode::Char('k')) => {
@@ -266,10 +369,35 @@ pub fn run(terminal: &mut DefaultTerminal) -> Result<WizardEnd> {
                         w.mode_sel = (w.mode_sel + 1).min(MODES.len() - 1);
                     }
                     (Step::Mode, KeyCode::Enter) => {
+                        if w.advance()? {
+                            return Ok(WizardEnd::Done);
+                        }
+                    }
+                    (Step::Mode, KeyCode::Esc) => w.step = Step::Theme,
+                    // ---- agent hook
+                    (Step::Agent, KeyCode::Up | KeyCode::Char('k')) => {
+                        w.agent_sel = w.agent_sel.saturating_sub(1);
+                    }
+                    (Step::Agent, KeyCode::Down | KeyCode::Char('j')) => {
+                        w.agent_sel = (w.agent_sel + 1).min(w.agents.len().saturating_sub(1));
+                    }
+                    (Step::Agent, KeyCode::Char(' ')) => {
+                        if let Some(choice) = w.agents.get_mut(w.agent_sel) {
+                            choice.on = !choice.on;
+                        }
+                    }
+                    (Step::Agent, KeyCode::Enter) => {
+                        if w.advance()? {
+                            return Ok(WizardEnd::Done);
+                        }
+                    }
+                    // The reader who cannot get past a write error still
+                    // gets their theme and mode.
+                    (Step::Agent, KeyCode::Char('s')) => {
                         w.finish()?;
                         return Ok(WizardEnd::Done);
                     }
-                    (Step::Mode, KeyCode::Esc) => w.step = Step::Theme,
+                    (Step::Agent, KeyCode::Esc) => w.step = Step::Mode,
                     // ---- global
                     (_, KeyCode::Char('q')) => {
                         w.skip()?;
@@ -296,19 +424,27 @@ fn handle_mouse(w: &mut Wizard, m: MouseEvent) -> Result<Option<WizardEnd>> {
     };
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => match at(&w.hits, m.column, m.row) {
-            Some(Btn::Continue) => match w.step {
-                Step::Welcome => w.step = Step::Theme,
-                Step::Theme => w.step = Step::Mode,
-                Step::Mode => {
-                    w.finish()?;
+            Some(Btn::Continue) => {
+                if w.advance()? {
                     return Ok(Some(WizardEnd::Done));
                 }
-            },
+            }
             Some(Btn::Back) => match w.step {
                 Step::Welcome => {}
                 Step::Theme => w.step = Step::Welcome,
                 Step::Mode => w.step = Step::Theme,
+                Step::Agent => w.step = Step::Mode,
             },
+            Some(Btn::AgentRow(i)) => {
+                w.agent_sel = i;
+                if let Some(choice) = w.agents.get_mut(i) {
+                    choice.on = !choice.on;
+                }
+            }
+            Some(Btn::AgentSkip) => {
+                w.finish()?;
+                return Ok(Some(WizardEnd::Done));
+            }
             Some(Btn::Skip) => {
                 w.skip()?;
                 return Ok(Some(WizardEnd::Skipped));
@@ -336,6 +472,7 @@ fn draw(f: &mut Frame, w: &mut Wizard) {
         Step::Welcome => draw_welcome(f, w),
         Step::Theme => draw_theme(f, w),
         Step::Mode => draw_mode(f, w),
+        Step::Agent => draw_agent(f, w),
     }
 }
 
@@ -607,7 +744,11 @@ fn draw_mode(f: &mut Frame, w: &mut Wizard) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(p.accent))
         .title(" What should `loupe` open by default? ")
-        .title_bottom(" j/k or click · Enter to finish · Esc back ");
+        .title_bottom(if w.has_agent_step() {
+            " j/k or click · Enter next · Esc back "
+        } else {
+            " j/k or click · Enter to finish · Esc back "
+        });
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -651,7 +792,149 @@ fn draw_mode(f: &mut Frame, w: &mut Wizard) {
         w,
         btn_area,
         &[
+            (
+                if w.has_agent_step() {
+                    "Continue (Enter)"
+                } else {
+                    "Finish setup (Enter)"
+                },
+                Btn::Continue,
+                true,
+            ),
+            ("Back (Esc)", Btn::Back, false),
+        ],
+    );
+}
+
+/// Write a path with `~` for the home directory, so a row stays inside the
+/// panel on a machine with a long user name.
+fn tilde(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    match std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        Some(home) => match path.strip_prefix(&home) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => shown,
+        },
+        None => shown,
+    }
+}
+
+fn draw_agent(f: &mut Frame, w: &mut Wizard) {
+    let p = palette();
+    let area = f.area();
+    let rect = centered(area, 70, 15);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .title(" Let your coding agent see what you are reading? ")
+        .title_bottom(" Space toggles · Enter to finish · s skips · Esc back ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let dim = Style::default().fg(p.dim);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Loupe is the only program that knows which lines you are reading.",
+            Style::default().fg(p.text),
+        )),
+        Line::from(Span::styled(
+            "Tick an agent and loupe adds one UserPromptSubmit hook to it, so",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "“rename this” means the lines under your cursor. Your other hooks",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "are kept, and the old file is saved beside the new one.",
+            dim,
+        )),
+    ];
+    // Codex skips a hook it has not been shown, and says nothing about it,
+    // so the reader needs this before they walk away thinking it is done.
+    if w.agents.iter().any(|c| c.agent.kind == hooks::Kind::Codex) {
+        lines.push(Line::from(Span::styled(
+            "Codex asks you to approve a new hook the next time you start it.",
+            Style::default().fg(p.accent),
+        )));
+    }
+    lines.push(Line::from(""));
+    let head = lines.len() as u16;
+    f.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            height: head,
+            ..inner
+        },
+    );
+
+    for (i, choice) in w.agents.iter().enumerate() {
+        let y = inner.y + head + i as u16;
+        let row = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: 1,
+        };
+        let selected = i == w.agent_sel;
+        let marker = if selected { "▸ " } else { "  " };
+        let tick = if choice.on { "[x]" } else { "[ ]" };
+        let style = if selected {
+            Style::default()
+                .bg(p.selected)
+                .fg(p.text)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.text)
+        };
+        let file = tilde(&choice.agent.hooks_file());
+        let note = if choice.already {
+            "  already set up"
+        } else {
+            ""
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{marker}{tick} {:<14}", choice.agent.name), style),
+                Span::styled(format!("{file}{note}"), dim),
+            ])),
+            row,
+        );
+        w.hits.push((row, Btn::AgentRow(i)));
+    }
+
+    if let Some(err) = &w.agent_error {
+        let y = inner.y + head + w.agents.len() as u16 + 1;
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!("Could not write it — {err}"),
+                    Style::default().fg(p.err),
+                )),
+                Line::from(Span::styled("Press s to finish without the hook.", dim)),
+            ]),
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 2,
+            },
+        );
+    }
+
+    let btn_area = Rect {
+        x: inner.x,
+        y: inner.y + inner.height.saturating_sub(1),
+        width: inner.width,
+        height: 1,
+    };
+    buttons(
+        f,
+        w,
+        btn_area,
+        &[
             ("Finish setup (Enter)", Btn::Continue, true),
+            ("Not now (s)", Btn::AgentSkip, false),
             ("Back (Esc)", Btn::Back, false),
         ],
     );
@@ -686,6 +969,30 @@ mod tests {
         let distinct: std::collections::HashSet<String> =
             hl.iter().flatten().map(|(c, _)| format!("{c:?}")).collect();
         assert!(distinct.len() >= 4, "sample should show several colors");
+    }
+
+    #[test]
+    fn the_agent_step_comes_after_the_mode_step() {
+        let mut w = Wizard::new();
+        w.agents = vec![Choice {
+            agent: hooks::Agent {
+                kind: hooks::Kind::Claude,
+                name: "Claude Code",
+                home: std::path::PathBuf::from("/nowhere/.claude"),
+            },
+            on: true,
+            already: false,
+        }];
+        w.step = Step::Mode;
+        assert!(!w.advance().unwrap(), "the mode step must not finish setup");
+        assert!(w.step == Step::Agent);
+    }
+
+    #[test]
+    fn a_machine_with_no_agent_has_no_agent_step() {
+        let mut w = Wizard::new();
+        w.agents.clear();
+        assert!(!w.has_agent_step());
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod editor;
 mod github;
 mod gitops;
 mod highlight;
+mod hooks;
 mod lsp;
 mod markdown;
 mod pins;
@@ -32,7 +33,7 @@ const USAGE: &str = "loupe — a mouse-first TUI for reviewing GitHub pull reque
 
 USAGE: loupe [--pr | --local | --auto] [--theme <name>] [--light | --dark]
        loupe md <file.md>
-       loupe ctl context
+       loupe ctl context [--json] | install | uninstall
        loupe set-theme [--light] <name>
        loupe setup
 
@@ -57,6 +58,12 @@ USAGE: loupe [--pr | --local | --auto] [--theme <name>] [--light | --dark]
   ctl context        print what loupe has on screen, for an agent's
                      UserPromptSubmit hook to feed to its model — see
                      docs/agent-context.md. Silent when no loupe is open.
+                     --json wraps it for an agent that will not read plain
+                     stdout (Codex does not; Claude Code does).
+  ctl install        add that hook to every coding agent on this machine
+                     (the first-launch wizard offers the same thing).
+                     Your other hooks are kept and the old file is saved.
+  ctl uninstall      take the hook back out again.
   set-theme [--light] <name>
                      save <name> as your theme (in the global config);
                      --light saves it as the light-terminal theme
@@ -122,8 +129,12 @@ enum CliCmd {
     /// Report what the terminal says its background is.
     Appearance,
     /// Talk to the loupe that is reviewing this repository
-    /// (`loupe ctl context`).
-    Ctl { verb: String },
+    /// (`loupe ctl context`). `json` wraps the block in the envelope an
+    /// agent wants when it will not read plain stdout.
+    Ctl {
+        verb: String,
+        json: bool,
+    },
 }
 
 /// Parse argv. Err carries the offending argument (or a message).
@@ -159,9 +170,12 @@ fn parse_cli<I: Iterator<Item = String>>(args: I) -> Result<CliCmd, String> {
             "--lsp" => return Ok(CliCmd::Lsp),
             "appearance" => return Ok(CliCmd::Appearance),
             "ctl" => {
-                return Ok(CliCmd::Ctl {
-                    verb: args.next().unwrap_or_default(),
-                })
+                let verb = args.next().unwrap_or_default();
+                // The marker the installer leaves behind is a shell
+                // comment, so nothing after it reaches loupe; only real
+                // flags do.
+                let json = args.any(|a| a == "--json");
+                return Ok(CliCmd::Ctl { verb, json });
             }
             "--help" | "-h" => return Ok(CliCmd::Help),
             other => match other.strip_prefix("--theme=") {
@@ -211,27 +225,124 @@ fn parse_cli<I: Iterator<Item = String>>(args: I) -> Result<CliCmd, String> {
 /// and an agent that finds loupe closed should simply carry on. Errors go
 /// to stderr, where hook debugging will show them, and the exit status
 /// stays 0 so the agent never reports a broken hook.
-fn report_context(verb: &str) {
-    if verb != "context" {
-        let what = if verb.is_empty() {
-            "ctl needs a verb".to_string()
+fn run_ctl(verb: &str, json: bool) {
+    match verb {
+        "context" => report_context(json),
+        "install" => manage_hook(true),
+        "uninstall" => manage_hook(false),
+        other => {
+            let what = if other.is_empty() {
+                "ctl needs a verb".to_string()
+            } else {
+                format!("unknown verb “{other}”")
+            };
+            eprintln!(
+                "loupe ctl: {what}\n\nUSAGE: loupe ctl context | install | uninstall\n\n  \
+                 context    print what the loupe reviewing this repository has\n  \
+                            on screen — for an agent's UserPromptSubmit hook.\n  \
+                 install    add that hook to every agent on this machine.\n  \
+                 uninstall  take it back out.\n\n  \
+                 See docs/agent-context.md."
+            );
+        }
+    }
+}
+
+/// `loupe ctl install` / `uninstall`: put the hook in every agent found on
+/// this machine, or take it out again. The wizard offers the same thing on
+/// first launch; this is the way in for everyone already past it.
+fn manage_hook(install: bool) {
+    let agents = hooks::detected();
+    if agents.is_empty() {
+        // Off unix `detected` is empty whatever the machine has, so say
+        // which of the two reasons applies rather than blame the agent.
+        if cfg!(unix) {
+            eprintln!(
+                "loupe ctl: no coding agent found — looked for ~/.claude and ~/.codex.\n\n  \
+                 Run your agent once so it creates its directory, then try again."
+            );
         } else {
-            format!("unknown verb “{verb}”")
-        };
-        eprintln!("loupe ctl: {what}\n\nUSAGE: loupe ctl context\n\n  \
-             Print what the loupe reviewing this repository has on screen.\n  \
-             Wire it into your agent's UserPromptSubmit hook — see\n  \
-             docs/agent-context.md.");
+            eprintln!(
+                "loupe ctl: the context provider needs a unix platform. The standard \
+                 library\n  has no unix sockets on Windows, so a hook here would have \
+                 nothing to ask.\n\n  Press Y in loupe to copy the same block by hand."
+            );
+        }
         return;
     }
+    // Only needed for an install, and it can fail — but failing after
+    // writing half the agents would be worse, so it is settled first.
+    let exe = if install {
+        match hooks::exe() {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("loupe ctl: {e:#}");
+                return;
+            }
+        }
+    } else {
+        std::path::PathBuf::new()
+    };
+    let mut codex = false;
+    for agent in &agents {
+        let file = agent.hooks_file();
+        let result = if install {
+            hooks::install(agent, &exe)
+        } else {
+            hooks::uninstall(agent)
+        };
+        let word = if install { "installed" } else { "removed" };
+        match result {
+            Ok(()) => {
+                println!("{:<12} {}  — {word}", agent.name, file.display());
+                codex |= agent.kind == hooks::Kind::Codex;
+            }
+            Err(e) => eprintln!("{:<12} {}  — {e:#}", agent.name, file.display()),
+        }
+    }
+    if install {
+        println!("\nOpen loupe on a repository, then ask your agent what you are looking at.");
+        if codex {
+            // Undiscoverable otherwise: Codex skips a hook it has not been
+            // shown and says nothing about it, so the hook looks installed
+            // and does nothing.
+            println!(
+                "\nCodex will not run a hook it has not been shown. Start `codex` once \
+                 and\napprove loupe's hook; the approval holds from then on."
+            );
+        }
+    }
+}
+
+fn report_context(json: bool) {
     let Some(root) = gitops::repo_root() else {
         return;
     };
     match ctx::ask(&root) {
-        Ok(Some(body)) => print!("{body}"),
+        Ok(Some(body)) => print_context(&body, json),
         Ok(None) => {}
         Err(e) => eprintln!("loupe ctl: {e:#}"),
     }
+}
+
+/// Print the block the way the caller asked for it.
+///
+/// Claude Code reads a hook's plain stdout as context, and so does a human
+/// who runs the command to see whether the chain works. Codex reads one
+/// JSON object and ignores stdout otherwise, so `--json` wraps the block in
+/// the envelope its own schema names.
+fn print_context(body: &str, json: bool) {
+    if !json {
+        print!("{body}");
+        return;
+    }
+    let envelope = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": body,
+        }
+    });
+    println!("{envelope}");
 }
 
 /// `loupe appearance`: say what the terminal reports and what loupe would
@@ -454,8 +565,8 @@ fn main() -> Result<()> {
             report_language_servers();
             return Ok(());
         }
-        Ok(CliCmd::Ctl { verb }) => {
-            report_context(&verb);
+        Ok(CliCmd::Ctl { verb, json }) => {
+            run_ctl(&verb, json);
             return Ok(());
         }
         Ok(CliCmd::Appearance) => {
