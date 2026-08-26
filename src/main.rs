@@ -32,6 +32,7 @@ const USAGE: &str = "loupe — a mouse-first TUI for reviewing GitHub pull reque
 
 USAGE: loupe [--pr | --local | --auto] [--theme <name>] [--light | --dark]
        loupe md <file.md>
+       loupe ctl context
        loupe set-theme [--light] <name>
        loupe setup
 
@@ -53,6 +54,9 @@ USAGE: loupe [--pr | --local | --auto] [--theme <name>] [--light | --dark]
                      review beside it — for a plan or a review write-up
                      that lives outside the repository. P shows its
                      source, Ctrl+S saves, q quits.
+  ctl context        print what loupe has on screen, for an agent's
+                     UserPromptSubmit hook to feed to its model — see
+                     docs/agent-context.md. Silent when no loupe is open.
   set-theme [--light] <name>
                      save <name> as your theme (in the global config);
                      --light saves it as the light-terminal theme
@@ -155,10 +159,9 @@ fn parse_cli<I: Iterator<Item = String>>(args: I) -> Result<CliCmd, String> {
             "--lsp" => return Ok(CliCmd::Lsp),
             "appearance" => return Ok(CliCmd::Appearance),
             "ctl" => {
-                return match args.next() {
-                    Some(verb) => Ok(CliCmd::Ctl { verb }),
-                    None => Err("ctl needs a verb — try `loupe ctl context`".to_string()),
-                }
+                return Ok(CliCmd::Ctl {
+                    verb: args.next().unwrap_or_default(),
+                })
             }
             "--help" | "-h" => return Ok(CliCmd::Help),
             other => match other.strip_prefix("--theme=") {
@@ -210,7 +213,15 @@ fn parse_cli<I: Iterator<Item = String>>(args: I) -> Result<CliCmd, String> {
 /// stays 0 so the agent never reports a broken hook.
 fn report_context(verb: &str) {
     if verb != "context" {
-        eprintln!("loupe ctl: unknown verb “{verb}” — try `loupe ctl context`");
+        let what = if verb.is_empty() {
+            "ctl needs a verb".to_string()
+        } else {
+            format!("unknown verb “{verb}”")
+        };
+        eprintln!("loupe ctl: {what}\n\nUSAGE: loupe ctl context\n\n  \
+             Print what the loupe reviewing this repository has on screen.\n  \
+             Wire it into your agent's UserPromptSubmit hook — see\n  \
+             docs/agent-context.md.");
         return;
     }
     let Some(root) = gitops::repo_root() else {
