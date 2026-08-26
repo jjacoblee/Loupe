@@ -3431,6 +3431,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             ("x", "mark viewed / stage file"),
         ),
         row(
+            ("Y", "copy the context for your agent"),
+            ("", ""),
+        ),
+        row(
             ("u", "revert the change at the cursor"),
             ("U", "revert every change in the file"),
         ),

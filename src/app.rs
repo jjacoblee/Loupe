@@ -5170,6 +5170,7 @@ impl App {
                     KeyCode::Char('0') => self.scroll_diff_h(i32::MIN / 2),
                     KeyCode::Char('$') => self.scroll_diff_h(i32::MAX / 2),
                     // --- selection and actions on the cursor row
+                    KeyCode::Char('Y') => self.yank_context(),
                     KeyCode::Char('V') => self.toggle_select_mode(),
                     // Copy what is selected (or the cursor line). Ctrl+C
                     // does nothing else here — `q` is how you quit.
@@ -7840,6 +7841,27 @@ impl App {
         let Some(shared) = &self.context else {
             return;
         };
+        let snapshot = self.context_snapshot();
+        if let Ok(mut slot) = shared.lock() {
+            *slot = snapshot;
+        }
+    }
+
+    /// `Y`: copy the context block, for an agent that has no hook — or for
+    /// a loupe on the far end of an SSH connection, where the socket cannot
+    /// reach the machine the agent runs on.
+    pub fn yank_context(&mut self) {
+        let text = self.context_snapshot().render();
+        match clipboard::copy(&text) {
+            Ok(via) => self.ok(format!(
+                "⧉ Copied the context for your agent via {via} — paste it before your instruction."
+            )),
+            Err(e) => self.err(format!("Couldn't copy: {e:#}")),
+        }
+    }
+
+    /// What is on screen, as owned data the socket thread can hold.
+    fn context_snapshot(&self) -> ctx::Snapshot {
         let (selection, hunk) = match self.selection {
             Some(sel) => {
                 let (lo, hi) = sel.range();
@@ -7863,7 +7885,7 @@ impl App {
                 .map(|f| f.path.clone())
                 .collect()
         };
-        let snapshot = ctx::Snapshot {
+        ctx::Snapshot {
             // A pull request knows its `owner/name`; a local review has no
             // reason to have asked GitHub anything, so fall back to what
             // the clone is called on disk.
@@ -7887,9 +7909,6 @@ impl App {
                 .iter()
                 .map(|c| (c.path.clone(), c.line))
                 .collect(),
-        };
-        if let Ok(mut slot) = shared.lock() {
-            *slot = snapshot;
         }
     }
 
