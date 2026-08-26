@@ -70,9 +70,15 @@ loupe
 
 The very first launch opens a short **setup wizard**: pick a syntax
 theme from a live preview (Catppuccin Mocha is the default), choose what
-`loupe` should open by default, and both are saved to your config —
-you'll never see the wizard again unless you ask for it with
-`loupe setup`.
+`loupe` should open by default, and — if you have a coding agent on this
+machine — let loupe tell that agent which lines you are reading. The
+choices are saved to your config, and you'll never see the wizard again
+unless you ask for it with `loupe setup`.
+
+The agent step only appears when loupe finds `~/.claude` or `~/.codex`.
+It adds one hook and keeps every hook already there; see
+[the context provider](agent-context.md). Press `s` to move past it, or
+run `loupe ctl install` later.
 
 ![The first-launch setup wizard](assets/setup-wizard.png)
 

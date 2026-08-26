@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Loupe tells your coding agent what you are reading.** Loupe is the
+  only process on the machine that knows which lines a human has on
+  screen and is judging. An agent in the next pane has to guess, and it
+  pays for the guess in grep calls. `loupe ctl context` publishes the
+  file, the line range, the hunk, the comments you are holding, and the
+  files you have not marked viewed. Wired into an agent's
+  `UserPromptSubmit` hook, every instruction you type carries that block,
+  so *"rename this"* means the lines under your cursor. Nothing is typed
+  into your prompt and no pane ids are involved: the repository root is
+  the address, so tmux, terminal splits, and separate windows all behave
+  the same. `Y` copies the same block by hand, for an agent with no hooks
+  or a review at the far end of an SSH connection. Unix only — the
+  standard library has no unix sockets on Windows. See
+  [docs/agent-context.md](docs/agent-context.md).
+
+- **`loupe ctl install` sets that hook up for you**, and the first-launch
+  wizard offers it as a last step when it finds a coding agent. Claude
+  Code and Codex are both supported. The installer keeps every hook and
+  setting already in the file, saves the old file beside the new one as
+  `<name>.loupe.bak`, and marks its own hook so a second run replaces
+  that hook rather than adding another. `loupe ctl uninstall` takes it
+  back out.
+
+  The two agents take the answer differently, and the installer writes the
+  right command for each. Claude Code reads a hook's plain stdout as
+  context. Codex ignores stdout and reads one JSON object, so its hook
+  calls `loupe ctl context --json`. Codex also refuses to run a hook it has
+  not been shown: approve loupe's once in an interactive `codex` session.
+
+  The installer refuses to write a hook pointing inside a Cargo build
+  directory. Such a path works until the next `cargo clean` and then fails
+  the way hooks fail — quietly, in somebody else's process.
+
+### Notes
+
+- The hook gives up after about a second. A suspended loupe cannot answer
+  (`SIGSTOP` stops the socket thread with the rest of it), and a prompt
+  that waits on a stopped process is worse than a prompt with no context.
+  Loupe serves each question on its own thread, so one client that
+  connects and says nothing cannot hold up the next.
+
+- The context block names at most 8 files in each list and then says how
+  many it left out. Holding 40 review comments no longer puts 40 lines in
+  every prompt you type.
+
+- Loupe clears socket files left behind by loupes that were killed. The
+  accept loop only ends when the process does, so nothing on the way out
+  can do it; the sweep runs at startup instead and leaves any socket
+  another loupe still answers.
+
 ## [0.2.1] - 2026-08-25
 
 Two fixes for 0.2.0, both for bugs that only showed up on a machine the

@@ -20,6 +20,7 @@ and finds any file in the repository without leaving the review.
 | [Reviewing local changes](local-changes.md) | Uncommitted changes, the staging column, merge conflicts, keeping up with an agent |
 | [Configuration](configuration.md) | Config files, every key, CLI flags, syntax themes |
 | [Keyboard & mouse reference](keys-and-mouse.md) | Every binding and clickable control, and how each feature works |
+| [Agent context](agent-context.md) | Publishing what you are reading to a coding agent, and installing the hook |
 | [Architecture](architecture.md) | How Loupe is built — for contributors |
 
 ## By feature
@@ -39,6 +40,7 @@ reference rather than in one mode's page:
 | [Swapping the two reviews](keys-and-mouse.md#swapping-between-the-two-reviews) | `` ` `` moves between the pull request and your working tree, keeping your place in both |
 | [Refreshing](keys-and-mouse.md#refreshing) | `r` on demand, and an idle re-scan that keeps local review current under an agent |
 | [The theme picker](keys-and-mouse.md#theme-picker) | 32 themes, previewed live, in a light and a dark slot |
+| [Agent context](agent-context.md) | The file and lines you are reading, handed to a coding agent in another pane with no key press |
 
 ## Quick orientation
 

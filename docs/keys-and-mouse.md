@@ -181,6 +181,7 @@ cursor.
 | `u` / `U` | Revert the change at the cursor / every change in the file |
 | `o`, or click `⚑` in the change bar | Resolve the merge conflict there (see [Merge conflicts](#merge-conflicts)) |
 | `y`, `Ctrl+C`, or `⧉ Copy` | Copy the selected lines — or the cursor line — to the clipboard |
+| `Y`, or `🤖 Copy the context for your agent` | Copy the block that says what you are looking at, for a coding agent (see [the context provider](agent-context.md)) |
 | `B` | Show / hide the blame pane |
 
 ### Putting changes back
@@ -641,4 +642,7 @@ loupe reads the file back.
 | `set-theme [--light] <name>` | Save a theme to the global config, in the dark (or light) slot |
 | `appearance` | Report what your terminal says its background is |
 | `setup` | Re-run the first-launch setup wizard |
+| `ctl context [--json]` | Print what loupe has on screen, for an agent's `UserPromptSubmit` hook. `--json` wraps it for an agent that ignores plain stdout (Codex) |
+| `ctl install` | Add that hook to every coding agent on this machine |
+| `ctl uninstall` | Take the hook back out |
 | `md <file.md>` | Read one markdown file in the preview, with no review beside it |

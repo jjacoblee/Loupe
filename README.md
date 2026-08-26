@@ -107,6 +107,21 @@ leaving your terminal or touching a browser.
   review appear without a key press. It never interrupts (no re-scan
   with the editor, a menu or a selection open) and never moves your
   place. `r` or the `⟳` button pulls changes in right now.
+- **Your agent knows what you are looking at** — loupe is the only
+  process on the machine that knows which lines a human is reading and
+  judging. `loupe ctl context` publishes them: the file, the line range,
+  the hunk on both sides, the comments you are holding, and the files you
+  have not marked viewed. `loupe ctl install` wires it into the
+  `UserPromptSubmit` hook that Claude Code and Codex both support — the
+  setup wizard offers the same thing on first launch — and every
+  instruction you type carries that block, so *"rename this"* means the
+  lines under your cursor and the agent stops grepping for what you
+  already had on screen.
+  Nothing is typed into your prompt and no pane ids are involved — the
+  repository root is the address, so tmux, terminal splits, and separate
+  windows all behave the same. `Y` copies the same block by hand, for an
+  agent with no hooks or a review on the far end of an SSH connection.
+  See [docs/agent-context.md](docs/agent-context.md).
 - **Two reviews, one window** — a review asks two questions: *what does
   this branch do?* and *what have I changed in reply?* `` ` `` swaps
   between the pull request and your own uncommitted changes and keeps
@@ -227,6 +242,7 @@ reference is in
 | [Reviewing local changes](docs/local-changes.md) | Local mode, the staging column, merge conflicts, keeping up with an agent |
 | [Configuration](docs/configuration.md) | Config file, all keys, CLI flags, themes |
 | [Keyboard & mouse reference](docs/keys-and-mouse.md) | Every binding and clickable control, and how each feature works |
+| [Agent context](docs/agent-context.md) | Give your coding agent the file and lines you are reading, with one hook |
 | [Architecture](docs/architecture.md) | How Loupe works inside — start here to contribute |
 
 The features that work in both review modes — [pinned
@@ -234,8 +250,9 @@ files](docs/keys-and-mouse.md#pinned-files), the [markdown
 preview](docs/keys-and-mouse.md#markdown-preview), the [blame
 pane](docs/keys-and-mouse.md#the-blame-pane),
 [find](docs/keys-and-mouse.md#find), [language
-servers](docs/keys-and-mouse.md#language-servers) and the
-[editor](docs/keys-and-mouse.md#editor) — are written up in the
+servers](docs/keys-and-mouse.md#language-servers), the
+[editor](docs/keys-and-mouse.md#editor) and [agent
+context](docs/agent-context.md) — are written up in the
 reference and listed in the [documentation index](docs/README.md).
 
 Configuration lives in `~/.config/loupe/config.toml` plus an optional

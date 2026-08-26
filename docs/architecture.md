@@ -27,6 +27,9 @@ threading model, and the invariants that are easy to break by accident.
 | `search.rs` | Fuzzy path matching, the pattern-based definition scanner, and `git grep` |
 | `lsp.rs` | Language servers: process lifecycle, JSON-RPC over stdio, symbols/definition/references/hover |
 | `clipboard.rs` | Copying out: a clipboard command when there is one, OSC 52 when there isn't |
+| `ctx.rs` | The context provider: the snapshot of what is on screen, and the unix socket that serves it |
+| `hooks.rs` | Installing that context into a coding agent: the `UserPromptSubmit` merge for Claude Code and Codex |
+| `wizard.rs` | The first-launch setup wizard: theme, default mode, and the agent hook |
 
 There is no shell anywhere: `git` and `gh` are always invoked with
 argv-style `Command` arguments, never through `sh -c`.

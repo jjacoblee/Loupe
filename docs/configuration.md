@@ -13,8 +13,10 @@ one).
 
 The first time you run `loupe` (no global config file yet), a short
 wizard walks you through picking a syntax theme — with a live preview —
-and a default startup mode, then saves both to the global config.
-Re-run it any time with:
+and a default startup mode, then saves both to the global config. If you
+have a coding agent on this machine it offers one more thing: the hook
+that tells that agent which lines you are reading (see
+[the context provider](agent-context.md)). Re-run it any time with:
 
 ```sh
 loupe setup
