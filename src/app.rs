@@ -10,6 +10,7 @@
 use crate::blame::{self, Blame};
 use crate::clipboard;
 use crate::conflict::{Conflicted, Resolution};
+use crate::ctx;
 use crate::diff::{DisplayEntry, FileDiff, Pos, RowKind, Selection, Side};
 use crate::editor::Editor;
 use crate::github::{
@@ -1643,6 +1644,9 @@ pub struct App {
     pub screen: Screen,
     pub repo: Option<String>,
     pub repo_root: PathBuf,
+    /// Where the context provider publishes what is on screen, when
+    /// loupe managed to bind its socket. See [`crate::ctx`].
+    pub context: Option<ctx::Shared>,
 
     /// True while reviewing local uncommitted changes instead of a PR
     /// (`pr` is None then; commenting and viewed-sync are off).
@@ -1902,6 +1906,7 @@ impl App {
             screen: Screen::PrList,
             repo: None,
             repo_root: PathBuf::from("."),
+            context: None,
             local: false,
             local_branch: None,
             merge_op: None,
@@ -7826,6 +7831,68 @@ impl App {
     }
 
     /// `y` / Ctrl+C / the ⧉ Copy button.
+    /// Publish what is on screen for the context provider.
+    ///
+    /// The socket thread cannot borrow `App`, so the UI thread leaves it a
+    /// snapshot of owned strings instead. This runs only when something
+    /// changed, and it costs one short clone of the selected text.
+    pub fn publish_context(&self) {
+        let Some(shared) = &self.context else {
+            return;
+        };
+        let (selection, hunk) = match self.selection {
+            Some(sel) => {
+                let (lo, hi) = sel.range();
+                let side = if sel.side == Side::Left { "old" } else { "new" };
+                let text = self
+                    .side_content(sel.side)
+                    .map(|content| sel.text(content))
+                    .filter(|t| !t.is_empty());
+                (Some((side, lo, hi)), text)
+            }
+            None => (None, None),
+        };
+        // In local review the file panel stages instead of marking viewed,
+        // so "not yet read" is a question only a pull request can answer.
+        let unviewed = if self.local {
+            Vec::new()
+        } else {
+            self.files
+                .iter()
+                .filter(|f| !self.viewed.contains(&f.path))
+                .map(|f| f.path.clone())
+                .collect()
+        };
+        let snapshot = ctx::Snapshot {
+            // A pull request knows its `owner/name`; a local review has no
+            // reason to have asked GitHub anything, so fall back to what
+            // the clone is called on disk.
+            repo: self.repo.clone().or_else(|| {
+                self.repo_root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            }),
+            branch: match &self.pr {
+                Some(pr) => Some(pr.head_ref_name.clone()),
+                None => self.local_branch.clone(),
+            },
+            pr: self.pr.as_ref().map(|pr| (pr.number, pr.title.clone())),
+            local: self.local,
+            file: self.files.get(self.file_cursor).map(|f| f.path.clone()),
+            selection,
+            hunk,
+            unviewed,
+            held: self
+                .pending
+                .iter()
+                .map(|c| (c.path.clone(), c.line))
+                .collect(),
+        };
+        if let Ok(mut slot) = shared.lock() {
+            *slot = snapshot;
+        }
+    }
+
     pub fn yank(&mut self) {
         let Some((text, what)) = self.copy_target() else {
             self.err("Nothing to copy — click or drag over the lines you want, or press V.");

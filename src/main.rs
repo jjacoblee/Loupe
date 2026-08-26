@@ -3,6 +3,7 @@ mod blame;
 mod clipboard;
 mod config;
 mod conflict;
+mod ctx;
 mod diff;
 mod editor;
 mod github;
@@ -116,6 +117,9 @@ enum CliCmd {
     },
     /// Report what the terminal says its background is.
     Appearance,
+    /// Talk to the loupe that is reviewing this repository
+    /// (`loupe ctl context`).
+    Ctl { verb: String },
 }
 
 /// Parse argv. Err carries the offending argument (or a message).
@@ -150,6 +154,12 @@ fn parse_cli<I: Iterator<Item = String>>(args: I) -> Result<CliCmd, String> {
             "--themes" => return Ok(CliCmd::Themes),
             "--lsp" => return Ok(CliCmd::Lsp),
             "appearance" => return Ok(CliCmd::Appearance),
+            "ctl" => {
+                return match args.next() {
+                    Some(verb) => Ok(CliCmd::Ctl { verb }),
+                    None => Err("ctl needs a verb — try `loupe ctl context`".to_string()),
+                }
+            }
             "--help" | "-h" => return Ok(CliCmd::Help),
             other => match other.strip_prefix("--theme=") {
                 Some(name) if !name.is_empty() => theme = Some(name.to_string()),
@@ -188,6 +198,29 @@ fn parse_cli<I: Iterator<Item = String>>(args: I) -> Result<CliCmd, String> {
         appearance,
         setup,
     })
+}
+
+/// `loupe ctl context`: print what the loupe reviewing this repository has
+/// on screen, for an agent's `UserPromptSubmit` hook to feed to its model.
+///
+/// Silence is the correct answer to every ordinary failure — no repository,
+/// no running loupe, no socket. A hook that prints nothing does nothing,
+/// and an agent that finds loupe closed should simply carry on. Errors go
+/// to stderr, where hook debugging will show them, and the exit status
+/// stays 0 so the agent never reports a broken hook.
+fn report_context(verb: &str) {
+    if verb != "context" {
+        eprintln!("loupe ctl: unknown verb “{verb}” — try `loupe ctl context`");
+        return;
+    }
+    let Some(root) = gitops::repo_root() else {
+        return;
+    };
+    match ctx::ask(&root) {
+        Ok(Some(body)) => print!("{body}"),
+        Ok(None) => {}
+        Err(e) => eprintln!("loupe ctl: {e:#}"),
+    }
 }
 
 /// `loupe appearance`: say what the terminal reports and what loupe would
@@ -410,6 +443,10 @@ fn main() -> Result<()> {
             report_language_servers();
             return Ok(());
         }
+        Ok(CliCmd::Ctl { verb }) => {
+            report_context(&verb);
+            return Ok(());
+        }
         Ok(CliCmd::Appearance) => {
             report_appearance();
             return Ok(());
@@ -540,6 +577,15 @@ fn run(terminal: &mut ratatui::DefaultTerminal, startup: Startup) -> Result<()> 
         Some(path) => app.start_preview_only(path),
         None => app.start(),
     }
+    // The repository root is settled by now, and it is the address the
+    // agent's hook will use to find this session. A socket that will not
+    // bind is never fatal: loupe reviews code first.
+    // A failure here is silent on purpose: the alternate screen is already
+    // up, so stderr would land on top of it. `loupe ctl context` reports
+    // what went wrong when the reader goes looking.
+    if let Ok(shared) = ctx::serve(&app.repo_root) {
+        app.context = Some(shared);
+    }
     let mut dirty = true;
 
     loop {
@@ -552,6 +598,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal, startup: Startup) -> Result<()> 
         }
 
         if dirty {
+            // Anything that changes the screen changes the answer, so the
+            // snapshot rides along with the draw and nothing else has to
+            // remember to refresh it.
+            app.publish_context();
             terminal.draw(|f| ui::draw(f, &mut app))?;
             dirty = false;
         }
