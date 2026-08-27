@@ -55,6 +55,15 @@ pub enum Screen {
     Review,
 }
 
+/// Which list the file panel is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelMode {
+    /// The files this change touches. The panel loupe has always had.
+    Changes,
+    /// Every file in the repository.
+    Files,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     SideBySide,
@@ -912,6 +921,9 @@ pub enum ButtonId {
     /// Copy the block that tells an agent what is on screen.
     CopyContext,
     ViewFlat,
+    /// The Changes/Files toggle above the file panel.
+    PanelChanges,
+    PanelFiles,
     FoldToggle,
     Edit,
     Comment,
@@ -1205,16 +1217,6 @@ fn is_symlink(path: &std::path::Path) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowSrc {
     Changed(usize),
-    // The file tree that lists the whole repository is the only thing
-    // that builds one of these, and it is not written yet. The tests do
-    // build one, so the attribute is scoped to the binary.
-    //
-    // `expect` rather than `allow`, so it cleans itself up: the day the
-    // tree lands, the expectation goes unfulfilled and the build says so.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "constructed once the file tree lands")
-    )]
     Path(usize),
 }
 
@@ -1261,15 +1263,15 @@ pub struct TreeNodes {
 #[derive(Default)]
 struct Node {
     dirs: BTreeMap<String, Node>,
-    /// (base name, index into `App::files`), sorted at build time. Sorting
+    /// (base name, what the row points at), sorted at build time. Sorting
     /// here rather than in `emit` is what lets `emit` borrow the vector
     /// instead of cloning it once per directory.
-    files: Vec<(String, usize)>,
+    files: Vec<(String, RowSrc)>,
 }
 
 impl TreeNodes {
     fn build(files: &[ChangedFile]) -> TreeNodes {
-        let mut root = Node::default();
+        let mut tree = TreeNodes::default();
         for (i, f) in files.iter().enumerate() {
             // Conflicted files are listed above the tree, not inside it
             // (see `App::rebuild_entries`), so the tree never shows them
@@ -1277,25 +1279,74 @@ impl TreeNodes {
             if f.conflicted {
                 continue;
             }
-            let mut parts: Vec<&str> = f.path.split('/').collect();
-            let base = parts.pop().unwrap_or("").to_string();
-            let mut node = &mut root;
-            for p in parts {
-                node = node.dirs.entry(p.to_string()).or_default();
-            }
-            node.files.push((base, i));
+            tree.insert(&f.path, RowSrc::Changed(i));
         }
+        tree.finish(files.len());
+        tree
+    }
+
+    /// The whole repository, from the two `git ls-files` calls.
+    ///
+    /// A stub is a directory git would not walk into, so it goes in as a
+    /// directory with nothing under it. Reading what is inside costs a
+    /// `read_dir` and happens when somebody expands it.
+    fn from_listing(listing: &search::RepoListing) -> TreeNodes {
+        let mut tree = TreeNodes::default();
+        for (i, path) in listing.paths.iter().enumerate() {
+            tree.insert(path, RowSrc::Path(i));
+        }
+        for dir in &listing.stubs {
+            tree.dir_at(dir);
+        }
+        tree.finish(listing.paths.len());
+        tree
+    }
+
+    fn insert(&mut self, path: &str, src: RowSrc) {
+        let mut parts: Vec<&str> = path.split('/').collect();
+        let base = parts.pop().unwrap_or("").to_string();
+        let mut node = &mut self.root;
+        for p in parts {
+            node = node.dirs.entry(p.to_string()).or_default();
+        }
+        node.files.push((base, src));
+    }
+
+    /// Make sure a directory exists in the tree, with nothing in it.
+    fn dir_at(&mut self, path: &str) {
+        let mut node = &mut self.root;
+        for p in path.split('/') {
+            node = node.dirs.entry(p.to_string()).or_default();
+        }
+    }
+
+    fn finish(&mut self, built_from: usize) {
         fn sort(node: &mut Node) {
-            node.files.sort();
+            node.files.sort_by(|a, b| a.0.cmp(&b.0));
             for child in node.dirs.values_mut() {
                 sort(child);
             }
         }
-        sort(&mut root);
-        TreeNodes {
-            root,
-            built_from: files.len(),
-        }
+        sort(&mut self.root);
+        self.built_from = built_from;
+    }
+
+    /// Every directory path this tree would draw, which is what
+    /// "everything collapsed" has to hold.
+    ///
+    /// It has to come from the same walk that emits the rows: single-child
+    /// directory chains are compressed into one row with a joined label,
+    /// and a collapse set built from raw path prefixes would not match any
+    /// of them.
+    fn all_dirs(&self) -> HashSet<String> {
+        let mut rows = Vec::new();
+        walk(&self.root, "", 0, &HashSet::new(), &mut rows);
+        rows.into_iter()
+            .filter_map(|e| match e {
+                FileEntry::Dir { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect()
     }
 
     fn emit(&self, collapsed: &HashSet<String>, out: &mut Vec<FileEntry>) {
@@ -1334,11 +1385,8 @@ fn walk(
             walk(cur, &path, depth + 1, collapsed, out);
         }
     }
-    for (_, idx) in &node.files {
-        out.push(FileEntry::File {
-            src: RowSrc::Changed(*idx),
-            depth,
-        });
+    for (_, src) in &node.files {
+        out.push(FileEntry::File { src: *src, depth });
     }
 }
 
@@ -1769,9 +1817,24 @@ pub struct App {
     /// emits rows without rebuilding it. See [`TreeNodes`].
     tree: TreeNodes,
     /// Every path in the repository, for rows the change does not touch.
-    /// [`RowSrc::Path`] indexes into it. Empty until the file tree fills
-    /// it.
+    /// [`RowSrc::Path`] indexes into it. Empty until the listing lands.
     pub repo_paths: Vec<String>,
+    /// Where the ignored paths start in `repo_paths`. Rows at or past it
+    /// are drawn dim.
+    repo_ignored_from: usize,
+    /// Directories git would not walk into. See [`search::RepoListing`].
+    repo_stubs: Vec<String>,
+    /// The repository tree, built once from the listing.
+    file_tree: TreeNodes,
+    /// Which list the panel is showing.
+    pub panel: PanelMode,
+    /// Collapse state for Files mode. Kept apart from `collapsed_dirs`
+    /// because the two lists hold different folders: collapsing `src` in
+    /// one view must not collapse it in the other, where the reader never
+    /// touched it.
+    collapsed_files: HashSet<String>,
+    /// The in-flight repository listing.
+    repo_job: Option<Receiver<Result<search::RepoListing>>>,
     /// Width of the file panel in columns; dragged by the divider, seeded
     /// from the `file_panel_width` config key.
     pub file_panel_w: u16,
@@ -2009,6 +2072,12 @@ impl App {
             entries: Vec::new(),
             tree: TreeNodes::default(),
             repo_paths: Vec::new(),
+            repo_ignored_from: 0,
+            repo_stubs: Vec::new(),
+            file_tree: TreeNodes::default(),
+            panel: PanelMode::Changes,
+            collapsed_files: HashSet::new(),
+            repo_job: None,
             file_panel_w: FILE_PANEL_DEFAULT,
             dragging: Dragging::None,
             diff: None,
@@ -2332,6 +2401,25 @@ impl App {
         // A debounced query whose quiet period has elapsed becomes a job.
         if self.maybe_spawn_search() {
             changed = true;
+        }
+        if let Some(rx) = &self.repo_job {
+            match rx.try_recv() {
+                Ok(Ok(listing)) => {
+                    self.repo_job = None;
+                    self.apply_repo_listing(listing);
+                    changed = true;
+                }
+                Ok(Err(e)) => {
+                    self.repo_job = None;
+                    self.err(format!("Couldn't list the repository: {e:#}"));
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.repo_job = None;
+                    changed = true;
+                }
+            }
         }
         if let Some(job) = &self.search_job {
             match job.rx.try_recv() {
@@ -4524,12 +4612,87 @@ impl App {
         }
     }
 
+    /// The collapse set for whichever list the panel is showing.
+    fn collapsed(&mut self) -> &mut HashSet<String> {
+        match self.panel {
+            PanelMode::Changes => &mut self.collapsed_dirs,
+            PanelMode::Files => &mut self.collapsed_files,
+        }
+    }
+
     /// The path a row names, whichever list it came from.
     pub fn row_path(&self, src: RowSrc) -> Option<&str> {
         match src {
             RowSrc::Changed(i) => self.files.get(i).map(|f| f.path.as_str()),
             RowSrc::Path(i) => self.repo_paths.get(i).map(String::as_str),
         }
+    }
+
+    /// Switch the panel between the change and the whole repository.
+    ///
+    /// The listing is not waited for. Flipping to Files with nothing
+    /// loaded shows an empty panel and a note for the moment the job takes;
+    /// flipping back is instant, because both trees stay built.
+    pub fn set_panel(&mut self, panel: PanelMode) {
+        if self.panel == panel {
+            return;
+        }
+        self.panel = panel;
+        self.file_scroll = 0;
+        if panel == PanelMode::Files {
+            if self.repo_paths.is_empty() && self.repo_job.is_none() {
+                self.spawn_repo_listing();
+            }
+            self.ok("Files — every file in the repository. F goes back to the change.");
+        } else {
+            self.ok("Back to the files this change touches.");
+            self.ensure_file_visible();
+        }
+        self.rebuild_entries();
+    }
+
+    pub fn toggle_panel(&mut self) {
+        self.set_panel(match self.panel {
+            PanelMode::Changes => PanelMode::Files,
+            PanelMode::Files => PanelMode::Changes,
+        });
+    }
+
+    /// Read the repository's file list on a worker thread.
+    ///
+    /// Two `git ls-files` calls — about 93 ms for 16,761 tracked files, and
+    /// 14 ms for the ignored half — so this can never be on the drawing
+    /// thread. It is not modal either: the change under review is already
+    /// on screen and stays readable while this lands.
+    fn spawn_repo_listing(&mut self) {
+        let root = self.repo_root.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(search::list_repo(&root));
+        });
+        self.repo_job = Some(rx);
+    }
+
+    /// The listing arrived: build the tree, and collapse all of it.
+    ///
+    /// Collapsed is not a nicety. Emitting a fully expanded 400,000-path
+    /// tree costs 2.1 ms and a 400,000-entry `Vec` on every toggle;
+    /// collapsed it costs about 2 µs and seven entries.
+    fn apply_repo_listing(&mut self, listing: search::RepoListing) {
+        self.file_tree = TreeNodes::from_listing(&listing);
+        self.collapsed_files = self.file_tree.all_dirs();
+        self.repo_ignored_from = listing.ignored_from;
+        self.repo_stubs = listing.stubs;
+        self.repo_paths = listing.paths;
+        if self.panel == PanelMode::Files {
+            self.rebuild_entries();
+        }
+    }
+
+    /// Whether a row names a file git is ignoring, which the panel draws
+    /// dim — `.env` is worth opening, and worth knowing is not committed.
+    pub fn row_ignored(&self, src: RowSrc) -> bool {
+        matches!(src, RowSrc::Path(i) if i >= self.repo_ignored_from)
     }
 
     /// The file list changed: rebuild the directory tree, then the rows.
@@ -4547,15 +4710,29 @@ impl App {
     /// This is on the click path for every collapse and expand, so it must
     /// stay free of the tree build. See [`TreeNodes`].
     pub fn rebuild_entries(&mut self) {
+        let mut out: Vec<FileEntry> = Vec::new();
+        match self.panel {
+            PanelMode::Changes => self.emit_changes(&mut out),
+            PanelMode::Files => self.emit_files(&mut out),
+        }
+        self.entries = out;
+        let max = self.entries.len().saturating_sub(1);
+        if self.file_scroll > max {
+            self.file_scroll = max;
+        }
+    }
+
+    /// The change under review: conflicts first under their heading, then
+    /// the tree or the flat list.
+    fn emit_changes(&self, out: &mut Vec<FileEntry>) {
         debug_assert_eq!(
             self.tree.built_from,
             self.files.len(),
             "the cached tree is stale — call rebuild_files() after changing self.files"
         );
-        // Conflicted files come first under their own heading, in the flat
-        // view and the tree alike. `local_changes` already sorts them to
-        // the front of `files`, so they are contiguous here.
-        let mut out: Vec<FileEntry> = Vec::with_capacity(self.files.len() + 1);
+        out.reserve(self.files.len() + 1);
+        // `local_changes` already sorts conflicted files to the front of
+        // `files`, so they are contiguous here.
         let conflicts: Vec<usize> = self
             .files
             .iter()
@@ -4574,7 +4751,7 @@ impl App {
         }
         if self.tree_view {
             // The tree skips conflicted files; they are already above it.
-            self.tree.emit(&self.collapsed_dirs, &mut out);
+            self.tree.emit(&self.collapsed_dirs, out);
         } else {
             out.extend(
                 self.files
@@ -4587,10 +4764,18 @@ impl App {
                     }),
             );
         }
-        self.entries = out;
-        let max = self.entries.len().saturating_sub(1);
-        if self.file_scroll > max {
-            self.file_scroll = max;
+    }
+
+    /// The whole repository. No conflict heading — a merge conflict is a
+    /// fact about the change, and this list is not about the change.
+    fn emit_files(&self, out: &mut Vec<FileEntry>) {
+        if self.tree_view {
+            self.file_tree.emit(&self.collapsed_files, out);
+        } else {
+            out.extend((0..self.repo_paths.len()).map(|i| FileEntry::File {
+                src: RowSrc::Path(i),
+                depth: 0,
+            }));
         }
     }
 
@@ -5324,6 +5509,7 @@ impl App {
                     KeyCode::Char('v') => self.toggle_view(),
                     KeyCode::Char('z') => self.toggle_fold(),
                     KeyCode::Char('B') => self.toggle_blame(),
+                    KeyCode::Char('F') => self.toggle_panel(),
                     KeyCode::Char('x') => self.toggle_file_mark(self.file_cursor),
                     // Put changes back: the section at the cursor, or (with
                     // shift) the whole file. Both ask first.
@@ -6030,8 +6216,18 @@ impl App {
         };
         match entry {
             FileEntry::Dir { path, .. } => {
-                if !self.collapsed_dirs.remove(&path) {
-                    self.collapsed_dirs.insert(path);
+                let set = self.collapsed();
+                let opened = set.remove(&path);
+                if !opened {
+                    set.insert(path.clone());
+                }
+                // A directory git would not walk into has nothing under it
+                // yet, so opening it shows an empty folder. Say why rather
+                // than leave the click looking broken.
+                if opened && self.repo_stubs.iter().any(|d| d == &path) {
+                    self.ok(format!(
+                        "{path} is ignored — loupe has not read what is inside it."
+                    ));
                 }
                 self.rebuild_entries();
             }
@@ -6654,6 +6850,8 @@ impl App {
         }
         match id {
             ButtonId::ViewToggle => self.toggle_view(),
+            ButtonId::PanelChanges => self.set_panel(PanelMode::Changes),
+            ButtonId::PanelFiles => self.set_panel(PanelMode::Files),
             ButtonId::ViewTree => self.set_tree_view(true),
             ButtonId::ViewFlat => self.set_tree_view(false),
             ButtonId::TreeToggle => self.set_tree_view(!self.tree_view),
@@ -11706,6 +11904,108 @@ b2
         highlight::set_theme(before_theme);
         crate::theme::set_appearance(before_appearance);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Everything collapsed is what Files mode opens onto, and the
+    /// collapse set has to be built from the same walk that draws the
+    /// rows. Single-child directory chains are compressed into one row
+    /// with a joined label, so a set built from raw path prefixes would
+    /// miss every one of them and the tree would open fully expanded.
+    #[test]
+    fn files_mode_opens_with_every_directory_collapsed() {
+        let listing = search::RepoListing {
+            paths: vec![
+                "deeply/nested/only/child.rs".into(),
+                "src/app.rs".into(),
+                "src/ui.rs".into(),
+                "README.md".into(),
+            ],
+            ignored_from: 4,
+            stubs: vec!["node_modules".into()],
+        };
+        let tree = TreeNodes::from_listing(&listing);
+        let collapsed = tree.all_dirs();
+
+        let mut rows = Vec::new();
+        tree.emit(&collapsed, &mut rows);
+
+        let dirs: Vec<&str> = rows
+            .iter()
+            .filter_map(|e| match e {
+                FileEntry::Dir { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            dirs.contains(&"deeply/nested/only"),
+            "the single-child chain is one compressed row: {dirs:?}"
+        );
+        assert!(dirs.contains(&"src"), "and the ordinary ones are there too");
+        assert!(
+            dirs.contains(&"node_modules"),
+            "a directory git would not walk into still gets a row: {dirs:?}"
+        );
+
+        // Nothing below any of them, and the top-level file.
+        let files: Vec<RowSrc> = rows
+            .iter()
+            .filter_map(|e| match e {
+                FileEntry::File { src, .. } => Some(*src),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "only the root's own file shows while everything is collapsed"
+        );
+    }
+
+    /// Flipping to Files and back must not disturb the change under
+    /// review, and the two lists must not share collapse state — a folder
+    /// closed in one is a folder the reader never touched in the other.
+    #[test]
+    fn the_two_panels_keep_their_own_collapse_state() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.files = vec![cf("src/app.rs"), cf("src/ui.rs")];
+        app.rebuild_files();
+        let change_rows = app.entries.len();
+
+        app.apply_repo_listing(search::RepoListing {
+            paths: vec!["src/app.rs".into(), "docs/plan.md".into()],
+            ignored_from: 2,
+            stubs: Vec::new(),
+        });
+        app.set_panel(PanelMode::Files);
+        assert!(
+            app.entries.iter().any(|e| matches!(
+                e,
+                FileEntry::File {
+                    src: RowSrc::Path(_),
+                    ..
+                }
+            ) || matches!(e, FileEntry::Dir { .. })),
+            "Files mode draws the repository"
+        );
+
+        // Open `src` here. The change panel must not notice.
+        app.collapsed_files.remove("src");
+        app.rebuild_entries();
+        let files_rows = app.entries.len();
+
+        app.set_panel(PanelMode::Changes);
+        assert_eq!(
+            app.entries.len(),
+            change_rows,
+            "the change under review came back exactly as it was"
+        );
+        assert!(
+            !app.collapsed_dirs.contains("src"),
+            "and the other panel's collapse never leaked into it"
+        );
+
+        app.set_panel(PanelMode::Files);
+        assert_eq!(app.entries.len(), files_rows, "as did the repository list");
     }
 
     /// The whole point of caching the tree: a collapse toggle must not pay

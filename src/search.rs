@@ -201,40 +201,121 @@ pub struct RepoFiles {
 /// the file finder drops them, and the file tree draws them as folders it
 /// has not opened yet.
 pub fn list_files(root: &Path, rev: Option<&str>) -> Result<RepoFiles> {
-    let root = root.to_string_lossy().to_string();
-    let mut args: Vec<&str> = vec!["-C", &root];
     match rev {
-        Some(rev) => args.extend(["ls-tree", "-r", "--name-only", "-z", rev]),
-        None => args.extend([
+        Some(rev) => run_ls(root, &["ls-tree", "-r", "--name-only", "-z", rev]),
+        None => run_ls(
+            root,
+            &[
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+        ),
+    }
+}
+
+/// The files git is ignoring, and the directories it is ignoring whole.
+///
+/// `--directory` is what makes this affordable. Without it git walks into
+/// every ignored directory and reports its contents: on one real Astro
+/// repository that is 17,504 entries and 147 ms, nearly all of it
+/// `node_modules`. With it, git stops at a directory whose whole contents
+/// are ignored and reports the directory — 10 entries and 14 ms:
+///
+/// ```text
+/// .env
+/// debug.log
+/// dist/
+/// node_modules/
+/// ```
+///
+/// Which is exactly the split the file tree wants. An ignored *file* is
+/// something a developer needs to open — `.env` above — so it is listed.
+/// An ignored *directory* is `node_modules`, so it costs one row until
+/// somebody asks for more.
+pub fn list_ignored(root: &Path) -> Result<RepoFiles> {
+    run_ls(
+        root,
+        &[
             "ls-files",
             "-z",
-            "--cached",
             "--others",
+            "--ignored",
             "--exclude-standard",
-        ]),
-    }
+            "--directory",
+            "--no-empty-directory",
+        ],
+    )
+}
+
+/// Run one `git ls-files`/`ls-tree` and split its output into files and
+/// the directories git declined to walk into. See [`RepoFiles`].
+fn run_ls(root: &Path, args: &[&str]) -> Result<RepoFiles> {
+    let root = root.to_string_lossy().to_string();
+    let mut full: Vec<&str> = vec!["-C", &root];
+    full.extend_from_slice(args);
     let out = Command::new("git")
-        .args(&args)
+        .args(&full)
         .output()
         .context("failed to spawn git — is git installed?")?;
     if !out.status.success() {
         anyhow::bail!(
             "git {} failed: {}",
-            if rev.is_some() { "ls-tree" } else { "ls-files" },
+            args.first().unwrap_or(&"ls-files"),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let mut out_files = RepoFiles::default();
+    let mut found = RepoFiles::default();
     for entry in String::from_utf8_lossy(&out.stdout)
         .split('\0')
         .filter(|s| !s.is_empty())
     {
         match entry.strip_suffix('/') {
-            Some(dir) => out_files.stubs.push(dir.to_string()),
-            None => out_files.files.push(entry.to_string()),
+            Some(dir) => found.stubs.push(dir.to_string()),
+            None => found.files.push(entry.to_string()),
         }
     }
-    Ok(out_files)
+    Ok(found)
+}
+
+/// Everything the file tree draws for one repository.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RepoListing {
+    /// Every path: the tracked and untracked ones first, then the ignored
+    /// ones. One list rather than two so a row is one index.
+    pub paths: Vec<String>,
+    /// Where the ignored paths begin in `paths`. Rows at or past this
+    /// index are drawn dim: git is ignoring them, and a reader should see
+    /// that before opening one.
+    pub ignored_from: usize,
+    /// Directories git would not walk into — a nested repository, a linked
+    /// worktree inside the clone, or a directory whose contents are all
+    /// ignored. Each costs one row until it is expanded.
+    pub stubs: Vec<String>,
+}
+
+/// Both halves of the listing, for the file tree.
+///
+/// Two `git ls-files` calls: about 93 ms for 16,761 tracked files, and
+/// about 14 ms for the ignored half. Far past a frame, so this belongs on
+/// a worker thread.
+pub fn list_repo(root: &Path) -> Result<RepoListing> {
+    let tracked = list_files(root, None)?;
+    let ignored = list_ignored(root)?;
+    let mut paths = tracked.files;
+    let ignored_from = paths.len();
+    paths.extend(ignored.files);
+    let mut stubs = tracked.stubs;
+    stubs.extend(ignored.stubs);
+    stubs.sort();
+    stubs.dedup();
+    Ok(RepoListing {
+        paths,
+        ignored_from,
+        stubs,
+    })
 }
 
 // ------------------------------------------------------------------ matching
@@ -964,6 +1045,71 @@ mod tests {
     fn smart_case_follows_the_query() {
         assert!(smart_case("handle"));
         assert!(!smart_case("Handle"));
+    }
+
+    /// `.env` is ignored and a developer needs it. `node_modules` is
+    /// ignored and is 17,000 rows of noise. `--directory` is what tells
+    /// them apart: git stops at a directory whose whole contents are
+    /// ignored and names the directory, but an ignored file it names
+    /// outright.
+    #[test]
+    fn an_ignored_file_is_listed_and_an_ignored_directory_is_not_walked() {
+        let root = std::env::temp_dir().join(format!("loupe-ign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let r = root.to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["-C", &r, "init", "-q", "."]);
+        std::fs::write(root.join(".gitignore"), "node_modules/\n.env\n").unwrap();
+        std::fs::write(root.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/a.js"), "1\n").unwrap();
+        git(&["-C", &r, "add", "-A"]);
+        git(&[
+            "-C",
+            &r,
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "x",
+        ]);
+
+        let listing = list_repo(&root).unwrap();
+
+        assert!(
+            listing.paths.contains(&".env".to_string()),
+            "an ignored file a developer needs is listed: {:?}",
+            listing.paths
+        );
+        assert!(
+            listing
+                .paths
+                .iter()
+                .all(|p| !p.starts_with("node_modules/")),
+            "git never walked into the ignored directory: {:?}",
+            listing.paths
+        );
+        assert!(
+            listing.stubs.contains(&"node_modules".to_string()),
+            "it came back as one directory instead: {:?}",
+            listing.stubs
+        );
+
+        // The split point is what draws the dim rows, so it has to land
+        // between the two kinds rather than at either end.
+        let (tracked, ignored) = listing.paths.split_at(listing.ignored_from);
+        assert!(tracked.contains(&"src/main.rs".to_string()));
+        assert!(!tracked.contains(&".env".to_string()));
+        assert!(ignored.contains(&".env".to_string()));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A nested repository — the shape a linked worktree takes when

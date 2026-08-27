@@ -852,6 +852,12 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
             " Files — ⚠ {conflicts} conflict{} ",
             if conflicts == 1 { "" } else { "s" }
         )
+    } else if app.panel == crate::app::PanelMode::Files {
+        if app.repo_paths.is_empty() {
+            " Files — reading… ".to_string()
+        } else {
+            format!(" Files — {} in the repo ", app.repo_paths.len())
+        }
     } else if app.local {
         format!(" Files {viewed_n}/{n} staged ")
     } else {
@@ -895,6 +901,33 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
             &[
                 ("Tree", ButtonId::ViewTree, app.tree_view),
                 ("Flat", ButtonId::ViewFlat, !app.tree_view),
+            ],
+        );
+        // The Changes/Files toggle sits on the bottom border, where there
+        // is always a full row to spend — the top one is shared with the
+        // title and runs out on a narrowed panel.
+        let mode_area = Rect {
+            x: area.x + 1,
+            y: area.y + area.height.saturating_sub(1),
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        buttons_right(
+            f,
+            app,
+            mode_area,
+            0,
+            &[
+                (
+                    "Change",
+                    ButtonId::PanelChanges,
+                    app.panel == crate::app::PanelMode::Changes,
+                ),
+                (
+                    "Files",
+                    ButtonId::PanelFiles,
+                    app.panel == crate::app::PanelMode::Files,
+                ),
             ],
         );
     }
@@ -950,9 +983,13 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                         let name_w = (inner.width as usize).saturating_sub(indent + 4);
                         let text =
                             format!("{}    {}", " ".repeat(indent), tail_truncate(name, name_w));
+                        // Dim means git is ignoring this file. `.env` is
+                        // worth opening and worth knowing is not committed,
+                        // so the row says both at once.
+                        let fg = if app.row_ignored(*src) { p.dim } else { p.text };
                         lines.push(Line::from(Span::styled(
                             truncate_pad(&text, inner.width as usize),
-                            Style::default().fg(p.dim),
+                            Style::default().fg(fg),
                         )));
                         continue;
                     }
