@@ -16,7 +16,7 @@ use crate::editor::Editor;
 use crate::github::{
     self, ChangedFile, CommentSide, PrDetail, PrRef, PrSummary, ReviewComment, Verdict,
 };
-use crate::gitops::{self, MergeOp, StageState, Tracking};
+use crate::gitops::{self, MergeOp, StageState, Stash, StashScope, Tracking};
 use crate::highlight::{self, HlLine};
 use crate::linter;
 use crate::lsp::{self, Lsp};
@@ -182,6 +182,10 @@ pub enum PathBoxKind {
     Rename { from: String },
     /// A new name for the symbol under the editor's cursor.
     RenameSymbol { word: String },
+    /// What to call the stash about to be made. Empty is allowed here and
+    /// nowhere else: git writes its own `WIP on <branch>` name when you
+    /// give it none, so Enter on an empty box is a real answer.
+    StashName { scope: StashScope },
 }
 
 /// The fixes and refactors on offer, and which is selected.
@@ -1159,6 +1163,15 @@ pub enum ButtonId {
     StageFile,
     StageAll,
     UnstageAll,
+    /// 📦 in the ☰ menu: the stash menu.
+    StashMenu,
+    /// Make a stash of this scope. The name box opens first.
+    StashPush(StashScope),
+    /// One stash in the list: a click opens what can be done with it.
+    StashPick(usize),
+    StashApply(usize),
+    StashPop(usize),
+    StashDrop(usize),
     Quit,
 }
 
@@ -1963,6 +1976,12 @@ pub enum Outcome {
     ExternalOpened(Box<ExternalFile>),
     /// A file outside the changeset was written; nothing else changed.
     ExternalSaved(String),
+    /// A stash was made, applied, or dropped. The working tree is a
+    /// different shape afterwards, so a fresh local scan comes with it.
+    Stashed {
+        note: String,
+        local: Box<LocalOpenedData>,
+    },
     /// Answers from a language server.
     Locations(Box<LocationsData>),
     Hover(Box<HoverData>),
@@ -2280,6 +2299,10 @@ pub struct App {
     /// preference rather than review state, so it stays on the app across
     /// a swap to the pull request and back.
     pub collapsed_sections: HashSet<StageSection>,
+    /// What `git stash list` said when the stash menu was last opened.
+    /// Read there rather than kept fresh: a stash nobody is looking at
+    /// costs nothing to not know about.
+    pub stashes: Vec<Stash>,
     pub entries: Vec<FileEntry>,
     /// The directory tree behind `entries`, cached so a collapse toggle
     /// emits rows without rebuilding it. See [`TreeNodes`].
@@ -2617,6 +2640,7 @@ impl App {
             tree_view: true,
             collapsed_dirs: HashSet::new(),
             collapsed_sections: HashSet::new(),
+            stashes: Vec::new(),
             entries: Vec::new(),
             tree: TreeNodes::default(),
             repo_paths: Vec::new(),
@@ -3374,6 +3398,13 @@ impl App {
                 // list is the place to pick one either way.
                 self.screen = Screen::PrList;
                 self.spawn_load_prs();
+            }
+            Outcome::Stashed { note, local } => {
+                // The working tree is a different shape now, so this is
+                // an ordinary local open — with the stash's own word on
+                // the status line instead of the file count.
+                self.apply(Outcome::LocalOpened(local));
+                self.ok(note);
             }
             Outcome::LocalOpened(data) => {
                 let d = *data;
@@ -6858,6 +6889,10 @@ impl App {
                     // of it, or — when it is all staged already — take all
                     // of it back out.
                     KeyCode::Char('X') => self.toggle_stage_all(),
+                    // Put work aside, or take it back. Shift, because `s`
+                    // is not free and this is not a thing to press by
+                    // accident.
+                    KeyCode::Char('S') => self.open_stash_menu_from_key(),
                     // Put changes back: the section at the cursor, or (with
                     // shift) the whole file. Both ask first.
                     KeyCode::Char('u') => self.ask_revert_section(self.diff_cursor),
@@ -8411,6 +8446,7 @@ impl App {
                 ButtonId::UnstageAll,
                 staged > 0,
             ));
+            rows.push(item("📦 Stash…".into(), "S", ButtonId::StashMenu));
         }
 
         rows.push(maybe(
@@ -8653,6 +8689,188 @@ impl App {
         self.overlay = Overlay::Menu(Box::new(menu));
     }
 
+    // ------------------------------------------------------------- stash
+
+    /// The stash menu: three ways to make one, then every stash there is.
+    ///
+    /// The list is read here rather than kept fresh in the background.
+    /// `git stash list` is a reflog read of a local ref — cheap enough to
+    /// pay for on the click that asks for it, and a stash nobody is
+    /// looking at costs nothing to not know about.
+    pub fn open_stash_menu(&mut self, x: u16, y: u16) {
+        if !self.local {
+            self.err("Stashing is for local changes — press ` to swap to them.");
+            return;
+        }
+        self.stashes = gitops::stash_list(&self.repo_root).unwrap_or_default();
+        let staged = self.section_count(StageSection::Staged);
+        let dirty = !self.files.is_empty();
+        let item = |label: String, hint: &'static str, id: ButtonId, enabled: bool| {
+            MenuRow::Item(MenuItem {
+                label,
+                hint,
+                id,
+                enabled,
+                checked: None,
+            })
+        };
+
+        let mut rows = vec![MenuRow::Heading("PUT WORK ASIDE")];
+        rows.push(item(
+            "📦 Stash the tracked changes".into(),
+            "",
+            ButtonId::StashPush(StashScope::Tracked),
+            dirty,
+        ));
+        rows.push(item(
+            "📦 Stash everything, untracked files too".into(),
+            "",
+            ButtonId::StashPush(StashScope::WithUntracked),
+            dirty,
+        ));
+        rows.push(item(
+            format!("📦 Stash the staged files only ({staged})"),
+            "",
+            ButtonId::StashPush(StashScope::StagedOnly),
+            staged > 0,
+        ));
+
+        if self.stashes.is_empty() {
+            rows.push(MenuRow::Heading("NO STASHES YET"));
+        } else {
+            rows.push(MenuRow::Heading("STASHES"));
+            for st in &self.stashes {
+                rows.push(item(
+                    format!("{}  ·  {}", st.subject, st.when),
+                    "",
+                    ButtonId::StashPick(st.index),
+                    true,
+                ));
+            }
+        }
+        self.open_menu_at(rows, " 📦 Stash ".into(), x, y);
+    }
+
+    /// What can be done with one stash. A second menu rather than three
+    /// more lines per stash in the first: the list is as long as the
+    /// reader's history, and every row would carry the same three.
+    pub fn open_stash_item_menu(&mut self, index: usize, x: u16, y: u16) {
+        let Some(st) = self.stashes.iter().find(|s| s.index == index) else {
+            self.err("That stash is gone — reopen the menu for the current list.");
+            return;
+        };
+        let title = format!(" 📦 {} ", st.subject);
+        let item = |label: &str, id: ButtonId| {
+            MenuRow::Item(MenuItem {
+                label: label.to_string(),
+                hint: "",
+                id,
+                enabled: true,
+                checked: None,
+            })
+        };
+        let rows = vec![
+            MenuRow::Heading("PUT IT BACK"),
+            item(
+                "⤓  Apply it and keep the stash",
+                ButtonId::StashApply(index),
+            ),
+            item("⤓  Apply it and drop the stash", ButtonId::StashPop(index)),
+            MenuRow::Heading("OR"),
+            item(
+                "✕  Drop it — this cannot be undone",
+                ButtonId::StashDrop(index),
+            ),
+        ];
+        self.open_menu_at(rows, title, x, y);
+    }
+
+    /// A menu opened at the pointer, with rows somebody else built.
+    fn open_menu_at(&mut self, rows: Vec<MenuRow>, title: String, x: u16, y: u16) {
+        let mut menu = Menu {
+            rows,
+            sel: 0,
+            scroll: 0,
+            anchor: (x, y),
+            title,
+            flip: true,
+        };
+        menu.sel = menu.first_selectable();
+        self.overlay = Overlay::Menu(Box::new(menu));
+    }
+
+    /// Ask what to call the stash, then make it.
+    ///
+    /// Every scope goes through the box, so "stash with a name" is not a
+    /// fourth way to stash — it is the same three, named. Enter on an
+    /// empty box is a real answer: git writes `WIP on <branch>` itself.
+    fn ask_stash_name(&mut self, scope: StashScope) {
+        self.open_path_box(PathBoxKind::StashName { scope });
+    }
+
+    /// `git stash push`, then a fresh scan of what is left.
+    fn spawn_stash_push(&mut self, scope: StashScope, name: Option<String>) {
+        let root = self.repo_root.clone();
+        let called = name.clone().unwrap_or_default();
+        self.spawn("Stashing your changes", false, false, move || {
+            gitops::stash_push(&root, name.as_deref(), scope)?;
+            let note = if called.is_empty() {
+                format!(
+                    "📦 Stashed {} — `git stash pop` puts them back.",
+                    scope.label()
+                )
+            } else {
+                format!("📦 Stashed {} as “{called}”.", scope.label())
+            };
+            Ok(Outcome::Stashed {
+                note,
+                local: Box::new(scan_local(&root)?),
+            })
+        });
+    }
+
+    /// `git stash apply` or `git stash pop`, then a fresh scan.
+    fn spawn_stash_apply(&mut self, index: usize, pop: bool) {
+        let root = self.repo_root.clone();
+        let subject = self
+            .stashes
+            .iter()
+            .find(|s| s.index == index)
+            .map(|s| s.subject.clone())
+            .unwrap_or_else(|| format!("stash@{{{index}}}"));
+        let label = if pop { "Popping" } else { "Applying" };
+        self.spawn(format!("{label} the stash"), false, false, move || {
+            gitops::stash_apply(&root, index, pop)?;
+            let tail = if pop {
+                "and dropped the stash"
+            } else {
+                "and kept the stash"
+            };
+            Ok(Outcome::Stashed {
+                note: format!("⤓ Applied “{subject}” {tail}."),
+                local: Box::new(scan_local(&root)?),
+            })
+        });
+    }
+
+    /// `git stash drop`. Nothing is put back, so the menu line says so.
+    fn spawn_stash_drop(&mut self, index: usize) {
+        let root = self.repo_root.clone();
+        let subject = self
+            .stashes
+            .iter()
+            .find(|s| s.index == index)
+            .map(|s| s.subject.clone())
+            .unwrap_or_else(|| format!("stash@{{{index}}}"));
+        self.spawn("Dropping the stash", false, false, move || {
+            gitops::stash_drop(&root, index)?;
+            Ok(Outcome::Stashed {
+                note: format!("✕ Dropped “{subject}”."),
+                local: Box::new(scan_local(&root)?),
+            })
+        });
+    }
+
     pub fn open_menu(&mut self, x: u16, y: u16) {
         let rows = self.build_menu();
         let mut menu = Menu {
@@ -8667,17 +8885,36 @@ impl App {
         self.overlay = Overlay::Menu(Box::new(menu));
     }
 
-    /// `m`: open the ☰ menu where the ☰ button is, so it lands in the same
-    /// place whether the mouse or the keyboard asked for it.
-    pub fn open_menu_from_key(&mut self) {
-        let anchor = self
-            .layout
+    /// The stash menu, anchored on the ☰ button. Reached from `S`, and
+    /// from the ☰ line, which closes the menu it was clicked in — so it
+    /// has no pointer of its own to open under.
+    pub fn open_stash_menu_from_key(&mut self) {
+        let (x, y) = self.menu_anchor();
+        self.open_stash_menu(x, y);
+    }
+
+    /// The same, for one stash picked out of that menu.
+    pub fn open_stash_item_menu_from_key(&mut self, index: usize) {
+        let (x, y) = self.menu_anchor();
+        self.open_stash_item_menu(index, x, y);
+    }
+
+    /// The cell the ☰ button occupies, which is where a menu with no
+    /// pointer behind it hangs from.
+    fn menu_anchor(&self) -> (u16, u16) {
+        self.layout
             .buttons
             .iter()
             .find(|(_, id)| *id == ButtonId::Menu)
             .map(|(r, _)| (r.x, r.y))
-            .unwrap_or((0, 0));
-        self.open_menu(anchor.0, anchor.1);
+            .unwrap_or((0, 0))
+    }
+
+    /// `m`: open the ☰ menu where the ☰ button is, so it lands in the same
+    /// place whether the mouse or the keyboard asked for it.
+    pub fn open_menu_from_key(&mut self) {
+        let (x, y) = self.menu_anchor();
+        self.open_menu(x, y);
     }
 
     /// Run the ☰ menu line at `i` and close the menu.
@@ -8776,6 +9013,12 @@ impl App {
             ButtonId::StageFile => self.toggle_file_mark(self.file_cursor),
             ButtonId::StageAll => self.stage_all(),
             ButtonId::UnstageAll => self.unstage_all(),
+            ButtonId::StashMenu => self.open_stash_menu_from_key(),
+            ButtonId::StashPush(scope) => self.ask_stash_name(scope),
+            ButtonId::StashPick(i) => self.open_stash_item_menu_from_key(i),
+            ButtonId::StashApply(i) => self.spawn_stash_apply(i, false),
+            ButtonId::StashPop(i) => self.spawn_stash_apply(i, true),
+            ButtonId::StashDrop(i) => self.spawn_stash_drop(i),
             ButtonId::ReviewBody => self.focus_review(),
             ButtonId::ReviewSubmit => self.ask_submit_review(),
             ButtonId::ReviewVerdict => {
@@ -11724,6 +11967,10 @@ impl App {
             PathBoxKind::RenameSymbol { word } => {
                 format!("Rename {word} to — every file it touches opens unsaved for you to read.")
             }
+            PathBoxKind::StashName { scope } => format!(
+                "Name this stash of {} — Enter with nothing typed lets git name it.",
+                scope.label()
+            ),
         });
         self.overlay = Overlay::OpenPath(Box::new(OpenPathBox {
             kind,
@@ -11845,6 +12092,15 @@ impl App {
         };
         let typed = box_.input.trim().to_string();
         let kind = box_.kind.clone();
+        // Every other box needs something typed. A stash name does not:
+        // git writes `WIP on <branch>` when you give it none, so an empty
+        // box means "you name it" rather than "never mind".
+        if let PathBoxKind::StashName { scope } = kind {
+            self.overlay = Overlay::None;
+            let name = Some(typed).filter(|t| !t.is_empty());
+            self.spawn_stash_push(scope, name);
+            return;
+        }
         if typed.is_empty() {
             self.overlay = Overlay::None;
             self.ok("Nothing typed — nothing done.");
@@ -11852,6 +12108,8 @@ impl App {
         }
         match kind {
             PathBoxKind::Open => {}
+            // Handled above: it is the one box an empty answer belongs in.
+            PathBoxKind::StashName { .. } => return,
             PathBoxKind::NewFile { dir } => {
                 self.overlay = Overlay::None;
                 let path = if dir.is_empty() {
@@ -12856,6 +13114,24 @@ fn read_external(
 /// Load everything the diff view needs for one file: both sides' content,
 /// the computed diff, and syntax highlighting. Runs on a worker thread for
 /// both the modal load and the silent refresh.
+/// One read of everything local review is built from.
+///
+/// The three places that change the working tree wholesale — the stash
+/// commands — all end with this, so a stash and an ordinary rescan land
+/// the app in exactly the same state.
+fn scan_local(root: &Path) -> Result<LocalOpenedData> {
+    Ok(LocalOpenedData {
+        branch: gitops::current_branch(),
+        head: gitops::head_oid(),
+        files: gitops::local_changes(root)?,
+        // Cosmetic: a status read that fails shows everything as
+        // unstaged rather than sinking the whole scan.
+        stage: gitops::stage_states(root).unwrap_or_default(),
+        merge_op: gitops::merge_op(root),
+        tracking: gitops::tracking(root),
+    })
+}
+
 fn load_file_data(
     idx: usize,
     file: ChangedFile,
@@ -17134,6 +17410,143 @@ b2
             app.status
         );
         assert_eq!(app.section_count(StageSection::Staged), 0);
+    }
+
+    // ------------------------------------------------------------- stash
+
+    /// The labels of every line the open menu offers.
+    fn menu_labels(app: &App) -> Vec<String> {
+        let Overlay::Menu(menu) = &app.overlay else {
+            panic!("no menu is open");
+        };
+        menu.rows
+            .iter()
+            .map(|r| match r {
+                MenuRow::Heading(h) => format!("# {h}"),
+                MenuRow::Item(it) => it.label.clone(),
+            })
+            .collect()
+    }
+
+    /// The stash menu offers the three scopes, and greys the ones there is
+    /// nothing to do — stashing the staged files with nothing staged.
+    #[test]
+    fn the_stash_menu_offers_three_scopes() {
+        let dir = TempDir::new("stash-menu");
+        let mut app = staging_app(&dir.0);
+        app.open_stash_menu(0, 0);
+
+        let labels = menu_labels(&app);
+        assert!(labels
+            .iter()
+            .any(|l| l.contains("Stash the tracked changes")));
+        assert!(labels.iter().any(|l| l.contains("untracked files too")));
+        assert!(labels
+            .iter()
+            .any(|l| l.contains("Stash the staged files only (0)")));
+        assert!(
+            labels.iter().any(|l| l == "# NO STASHES YET"),
+            "a fresh repository has none: {labels:?}"
+        );
+
+        let Overlay::Menu(menu) = &app.overlay else {
+            panic!("the menu is open");
+        };
+        let staged_only = menu
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                MenuRow::Item(it) if it.id == ButtonId::StashPush(StashScope::StagedOnly) => {
+                    Some(it)
+                }
+                _ => None,
+            })
+            .expect("the staged-only line is there");
+        assert!(
+            !staged_only.enabled,
+            "with nothing staged there is nothing for it to take"
+        );
+    }
+
+    /// Every scope goes through the name box, and an empty box is a real
+    /// answer — git names the stash itself.
+    #[test]
+    fn stashing_asks_for_a_name_and_takes_none() {
+        let dir = TempDir::new("stash-name");
+        let mut app = staging_app(&dir.0);
+        app.open_stash_menu(0, 0);
+        app.activate(ButtonId::StashPush(StashScope::WithUntracked));
+
+        let Overlay::OpenPath(box_) = &app.overlay else {
+            panic!("the name box opens first, status: {}", app.status);
+        };
+        assert_eq!(
+            box_.kind,
+            PathBoxKind::StashName {
+                scope: StashScope::WithUntracked
+            }
+        );
+        assert!(
+            app.status
+                .contains("Enter with nothing typed lets git name it"),
+            "{}",
+            app.status
+        );
+
+        // Enter with an empty box runs the stash rather than cancelling.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.job.is_some(), "the stash is running");
+    }
+
+    /// Stashing belongs to local review. A pull request has no working
+    /// tree of yours to put aside.
+    #[test]
+    fn the_stash_menu_is_local_only() {
+        let dir = TempDir::new("stash-pr");
+        let mut app = staging_app(&dir.0);
+        app.local = false;
+        app.open_stash_menu(0, 0);
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status_err);
+        assert!(app.status.contains("local changes"), "{}", app.status);
+    }
+
+    /// A stash in the list opens a second menu, so every stash carries
+    /// apply, pop and drop without the first menu carrying three lines
+    /// for each of them.
+    #[test]
+    fn picking_a_stash_offers_apply_pop_and_drop() {
+        let dir = TempDir::new("stash-pick");
+        let mut app = staging_app(&dir.0);
+        app.stashes = vec![Stash {
+            index: 0,
+            name: "stash@{0}".into(),
+            subject: "On main: fix the parser".into(),
+            when: "2 hours ago".into(),
+        }];
+
+        app.open_stash_item_menu(0, 0, 0);
+        let labels = menu_labels(&app);
+        assert!(
+            labels.iter().any(|l| l.contains("keep the stash")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("drop the stash")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("cannot be undone")),
+            "dropping says what it costs: {labels:?}"
+        );
+
+        // A stash that went away between the two menus says so rather
+        // than acting on whatever now sits at that position.
+        app.stashes.clear();
+        app.open_stash_item_menu(0, 0, 0);
+        assert!(app.status_err);
+        assert!(app.status.contains("gone"), "{}", app.status);
     }
 
     /// The wheel scrolls sideways when a modifier is held (whichever one the

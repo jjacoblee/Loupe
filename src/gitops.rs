@@ -1428,4 +1428,179 @@ mod tests {
         assert_eq!(repo_from_url(""), None);
         assert_eq!(repo_from_url("https://github.com/"), None);
     }
+
+    /// A stash message is free text. The separators are a unit and a
+    /// record separator so a name with a newline or a tab in it still
+    /// lands in one field.
+    #[test]
+    fn stash_records_survive_an_awkward_name() {
+        let out = "stash@{0}\u{1f}On main: fix\nthe\tparser\u{1f}2 hours ago\u{1e}\n\
+                   stash@{1}\u{1f}WIP on main: 4683983 something\u{1f}yesterday\u{1e}\n";
+        let list = parse_stash_list(out);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].index, 0);
+        assert_eq!(list[0].name, "stash@{0}");
+        assert_eq!(list[0].subject, "On main: fix\nthe\tparser");
+        assert_eq!(list[0].when, "2 hours ago");
+        assert_eq!(list[1].index, 1, "the index is the position in the list");
+        assert!(parse_stash_list("").is_empty());
+    }
+
+    /// A commit subject is free text too, and gets the same treatment.
+    #[test]
+    fn commit_records_survive_an_awkward_subject() {
+        let out = "aaa111\u{1f}aaa\u{1f}Fix\tthe\nparser\u{1f}Jacob Lee\u{1f}2 hours ago\u{1e}\n\
+                   bbb222\u{1f}bbb\u{1f}Second\u{1f}Someone Else\u{1f}yesterday\u{1e}\n";
+        let log = parse_commit_log(out);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].oid, "aaa111");
+        assert_eq!(log[0].short, "aaa");
+        assert_eq!(log[0].subject, "Fix\tthe\nparser");
+        assert_eq!(log[0].author, "Jacob Lee");
+        assert_eq!(log[1].oid, "bbb222");
+        assert!(parse_commit_log("").is_empty());
+    }
+
+    /// A scratch repository, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("loupe-gitops-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch directory");
+            let d = dir.to_string_lossy().into_owned();
+            for args in [
+                vec!["-C", d.as_str(), "init", "-q", "-b", "main", "."],
+                vec!["-C", d.as_str(), "config", "user.email", "loupe@test"],
+                vec!["-C", d.as_str(), "config", "user.name", "loupe"],
+            ] {
+                run_git(&args).expect("git init");
+            }
+            Scratch(dir)
+        }
+
+        fn write(&self, name: &str, body: &str) {
+            std::fs::write(self.0.join(name), body).expect("fixture written");
+        }
+
+        fn commit(&self, message: &str) {
+            let d = self.0.to_string_lossy().into_owned();
+            run_git(&["-C", &d, "add", "-A"]).unwrap();
+            run_git(&["-C", &d, "commit", "-q", "-m", message]).unwrap();
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The three scopes take three different sets of work, and the name
+    /// given to a stash comes back in the list.
+    #[test]
+    fn the_three_stash_scopes_take_different_work() {
+        let s = Scratch::new("stash-scopes");
+        s.write("a.txt", "one\n");
+        s.commit("first");
+        s.write("a.txt", "two\n");
+        s.write("untracked.txt", "new\n");
+        stage_all(&s.0).unwrap();
+        // Only a.txt in the index for this one; untracked.txt was added
+        // by `stage_all`, so take it back out first.
+        run_git(&[
+            "-C",
+            &s.0.to_string_lossy(),
+            "reset",
+            "-q",
+            "--",
+            "untracked.txt",
+        ])
+        .unwrap();
+
+        stash_push(&s.0, Some("just the index"), StashScope::StagedOnly).unwrap();
+        let states = stage_states(&s.0).unwrap();
+        assert_eq!(states.get("a.txt"), None, "the staged edit went away");
+        assert_eq!(
+            states.get("untracked.txt"),
+            Some(&StageState::Unstaged),
+            "the untracked file stayed"
+        );
+
+        let list = stash_list(&s.0).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(
+            list[0].subject.contains("just the index"),
+            "the name given is the name kept: {:?}",
+            list[0].subject
+        );
+
+        // Untracked files need asking for by name.
+        stash_push(&s.0, None, StashScope::Tracked).unwrap_err();
+        stash_push(&s.0, Some("everything"), StashScope::WithUntracked).unwrap();
+        assert!(!s.0.join("untracked.txt").exists());
+
+        // And back out again, newest first.
+        stash_apply(&s.0, 0, true).unwrap();
+        assert!(s.0.join("untracked.txt").exists());
+        assert_eq!(stash_list(&s.0).unwrap().len(), 1, "pop dropped it");
+
+        stash_drop(&s.0, 0).unwrap();
+        assert!(stash_list(&s.0).unwrap().is_empty());
+    }
+
+    /// git calls an empty stash a success and says so on stdout. The
+    /// caller gets an error instead, so a menu click that did nothing
+    /// does not look like one that worked.
+    #[test]
+    fn stashing_nothing_is_an_error() {
+        let s = Scratch::new("stash-empty");
+        s.write("a.txt", "one\n");
+        s.commit("first");
+        let err = stash_push(&s.0, None, StashScope::Tracked).unwrap_err();
+        assert!(err.to_string().contains("nothing to stash"), "{err}");
+    }
+
+    /// The commit list is what the upstream does not have, and each
+    /// commit can name its own files.
+    #[test]
+    fn unpushed_commits_list_what_the_upstream_lacks() {
+        let s = Scratch::new("commits");
+        s.write("a.txt", "one\n");
+        s.commit("first");
+        let base = head_at(&s.0);
+        s.write("a.txt", "two\n");
+        s.write("b.txt", "new\n");
+        s.commit("second");
+        s.write("c.txt", "third\n");
+        s.commit("third");
+
+        let commits = unpushed_commits(&s.0, &base).unwrap();
+        assert_eq!(commits.len(), 2, "two commits since the base");
+        assert_eq!(commits[0].subject, "third", "newest first");
+        assert_eq!(commits[1].subject, "second");
+        assert_eq!(commits[0].author, "loupe");
+        assert!(!commits[0].short.is_empty());
+
+        let files = commit_files(&s.0, &commits[1].oid).unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(names, ["a.txt", "b.txt"]);
+        assert_eq!(files[0].status, "modified");
+        assert_eq!(files[1].status, "added");
+        assert_eq!(files[1].additions, 1);
+
+        // A root commit has no parent to diff against, and lists its whole
+        // tree as added rather than failing.
+        let all = unpushed_commits(&s.0, "HEAD~2").unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(first_parent(&s.0, &commits[0].oid).is_some());
+    }
+
+    fn head_at(root: &Path) -> String {
+        run_git(&["-C", &root.to_string_lossy(), "rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
 }
