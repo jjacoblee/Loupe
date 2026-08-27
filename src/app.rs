@@ -2480,18 +2480,25 @@ pub struct App {
     /// change. Opening another file parks this one here; coming back
     /// swaps them.
     pub parked: Vec<Editor>,
-    /// Where the buffer on screen sits in the tab row.
+    /// The tab row, by path, in the reader's own order.
     ///
-    /// `parked` holds every *other* open buffer, in the order the reader
-    /// opened them, and nothing ever reorders it. Putting the buffer on
-    /// screen back at this index is the whole of what keeps the row
-    /// standing still: without it, coming back to a file meant appending
-    /// it, so every click along the row threw the row into a new order
-    /// and the reader had to find each tab again.
+    /// One list for every kind of tab. A file is in the row while it is
+    /// open as a diff, as a buffer, or as both, and it keeps its place
+    /// through every move between them: pressing `e` on a diff and `Esc`
+    /// back again must not shuffle the tab under the pointer.
     ///
-    /// A drag is the only thing that reorders the row, and it does it by
-    /// permuting `parked` — see [`App::move_buffer`].
-    buffer_slot: usize,
+    /// Storage lives elsewhere — [`Self::parked`] for buffers,
+    /// [`Self::parked_diffs`] for diffs — and neither is ever in row
+    /// order. This is the only thing that is, and a drag is the only
+    /// thing that permutes it.
+    tab_order: Vec<String>,
+    /// The place a closed peek tab left, for the file that replaces it.
+    ///
+    /// Walking a tree means opening a great many files to look at one,
+    /// and each one lands in the same tab. Without this the replacement
+    /// would append instead, and the row would grow a tab to the right on
+    /// every click.
+    tab_hole: Option<usize>,
     /// The tab a drag picked up, by path. A path rather than an index
     /// because the drag is what changes the indices.
     tab_drag: Option<String>,
@@ -2775,7 +2782,8 @@ impl App {
             editor: None,
             quit_armed: false,
             parked: Vec::new(),
-            buffer_slot: 0,
+            tab_order: Vec::new(),
+            tab_hole: None,
             tab_drag: None,
             peek: None,
             preview: None,
@@ -12896,11 +12904,7 @@ impl App {
             return;
         }
         self.parked.remove(at);
-        // Everything after it moved up one, the buffer on screen
-        // included.
-        if at < self.buffer_slot {
-            self.buffer_slot -= 1;
-        }
+        self.forget_tab(&path);
         // Fire and forget, on a worker: the registry blocks, and the
         // reader is already looking at something else.
         let lsp = self.lsp.clone();
@@ -12929,32 +12933,52 @@ impl App {
         self.open_buffer_at(next);
     }
 
-    /// Every open buffer, in the order the tab row draws them.
+    /// Put a path in the tab row, if it is not there already.
     ///
-    /// The buffer on screen sits where it was opened rather than at the
-    /// end. It used to be last, because it lived in its own field and the
-    /// field came last — which meant clicking a tab moved that tab to the
-    /// right, and a reader clicking along the row watched it reshuffle
-    /// under the pointer.
-    pub fn buffers(&self) -> impl Iterator<Item = &Editor> {
-        let at = self.buffer_slot.min(self.parked.len());
-        self.parked[..at]
-            .iter()
-            .chain(self.editor.iter())
-            .chain(self.parked[at..].iter())
+    /// It lands where a closed peek tab left a hole, and at the end
+    /// otherwise — which is where a reader looks for the file they just
+    /// opened.
+    fn note_tab(&mut self, path: &str) {
+        if self.tab_order.iter().any(|p| p == path) {
+            return;
+        }
+        match self.tab_hole.take() {
+            Some(at) if at <= self.tab_order.len() => self.tab_order.insert(at, path.to_string()),
+            _ => self.tab_order.push(path.to_string()),
+        }
     }
 
-    /// Put the buffer on screen back among the others, where it belongs
-    /// in the row. `parked` is then the whole row, in order.
+    /// Take a path out of the tab row.
+    fn forget_tab(&mut self, path: &str) {
+        self.tab_order.retain(|p| p != path);
+        self.tab_hole = None;
+    }
+
+    /// The buffer holding `path`, whether it is on screen or parked.
+    fn editor_for(&self, path: &str) -> Option<&Editor> {
+        self.editor
+            .iter()
+            .chain(self.parked.iter())
+            .find(|e| e.path == path)
+    }
+
+    /// Every open buffer, in the order the tab row draws them.
+    ///
+    /// The row is [`Self::tab_order`] and nothing else, so the buffer on
+    /// screen sits where it was opened rather than at the end. It used to
+    /// be last, because it lived in its own field and the field came last
+    /// — which meant clicking a tab moved that tab to the right, and a
+    /// reader clicking along the row watched it reshuffle under the
+    /// pointer.
+    pub fn buffers(&self) -> impl Iterator<Item = &Editor> {
+        self.tab_order.iter().filter_map(|p| self.editor_for(p))
+    }
+
+    /// Put the buffer on screen back among the others. Its place in the
+    /// row is [`Self::tab_order`]'s business, so this is only storage.
     fn park_active(&mut self) {
         if let Some(cur) = self.editor.take() {
-            let at = self.buffer_slot.min(self.parked.len());
-            self.parked.insert(at, cur);
-            // That slot is taken now. A file arriving later with nothing
-            // on screen goes after it rather than on top of it — only
-            // `drop_peek`, which really does free a slot, leaves one for
-            // the next file to land in.
-            self.buffer_slot = at + 1;
+            self.parked.push(cur);
         }
     }
 
@@ -12970,35 +12994,24 @@ impl App {
             return;
         }
         // Both ends by path, not by index. The row is a subsequence of
-        // the open buffers — a pinned file has a tab elsewhere and none
+        // the open files — a pinned file has a tab elsewhere and none
         // here — so a position in the row is not a position in the list.
         let moved = row[from].path.clone();
         let onto = row[to].path.clone();
-        let active = self.editor.as_ref().map(|e| e.path.clone());
-        self.park_active();
-        let Some(i) = self.parked.iter().position(|e| e.path == moved) else {
+        let Some(i) = self.tab_order.iter().position(|p| *p == moved) else {
             return;
         };
-        let held = self.parked.remove(i);
+        let held = self.tab_order.remove(i);
         // Dropped on a tab to the right means after it, and to the left
         // means before it. Anything else moves the tab past the one the
         // reader aimed at.
         let at = self
-            .parked
+            .tab_order
             .iter()
-            .position(|e| e.path == onto)
+            .position(|p| *p == onto)
             .map(|at| at + usize::from(from < to))
-            .unwrap_or(self.parked.len());
-        self.parked.insert(at.min(self.parked.len()), held);
-        // Back in front of the reader, at whatever index the move left
-        // it: a drag reorders the row, it does not change which file is
-        // on screen.
-        if let Some(path) = active {
-            if let Some(at) = self.parked.iter().position(|e| e.path == path) {
-                self.editor = Some(self.parked.remove(at));
-                self.buffer_slot = at;
-            }
-        }
+            .unwrap_or(self.tab_order.len());
+        self.tab_order.insert(at.min(self.tab_order.len()), held);
     }
 
     /// True when `path` is the file in front of the reader — the buffer
@@ -13086,20 +13099,35 @@ impl App {
         let root = self.repo_root.clone();
         let closing = path.clone();
         thread::spawn(move || lsp.close(&root, &closing));
+        // The place this tab had belongs to the file that replaces it,
+        // so walking a tree does not grow the row a tab per click.
+        let hole = self.tab_order.iter().position(|p| *p == path);
         if let Some(i) = self.parked.iter().position(|e| e.path == path) {
             self.parked.remove(i);
-            // Everything after it moved up one, the buffer on screen
-            // included.
-            if i < self.buffer_slot {
-                self.buffer_slot -= 1;
-            }
-            return;
-        }
-        // Left as it is: `buffer_slot` now names the place this tab had,
-        // and the file that replaces it goes there.
-        if self.editor.as_ref().is_some_and(|e| e.path == path) {
+        } else if self.editor.as_ref().is_some_and(|e| e.path == path) {
             self.editor = None;
         }
+        self.forget_tab(&path);
+        // The replacement usually has the screen already — see
+        // `apply_external`, which opens it first so the pane is never
+        // empty — in which case it is at the end of the row and has to be
+        // moved back into the tab it took over. When it has not arrived
+        // yet, the place is held for it instead.
+        match hole {
+            Some(at) => self.move_tab_to(keep, at),
+            None => self.tab_hole = None,
+        }
+    }
+
+    /// Put an open tab at `at` in the row, or hold that place for it when
+    /// it is not in the row yet.
+    fn move_tab_to(&mut self, path: &str, at: usize) {
+        let Some(i) = self.tab_order.iter().position(|p| p == path) else {
+            self.tab_hole = Some(at);
+            return;
+        };
+        let held = self.tab_order.remove(i);
+        self.tab_order.insert(at.min(self.tab_order.len()), held);
     }
 
     /// How many open buffers hold unsaved work. Every "are you sure"
@@ -13120,18 +13148,10 @@ impl App {
         if self.switch_buffer(&next.path) {
             return;
         }
-        if self.editor.is_some() {
-            // A file nobody has open yet joins the end of the row, which
-            // is where a reader looks for the file they just opened.
-            self.park_active();
-            self.buffer_slot = self.parked.len();
-        } else {
-            // Nothing on screen: the new buffer takes the slot the last
-            // one left. That is what puts a file that replaces a
-            // peek tab in the tab it replaced, rather than at the
-            // end of the row.
-            self.buffer_slot = self.buffer_slot.min(self.parked.len());
-        }
+        self.park_active();
+        // `note_tab` puts it where a closed peek tab left a hole, and at
+        // the end otherwise.
+        self.note_tab(&next.path);
         self.editor = Some(next);
         // A file that has just opened has never been linted. Arm the
         // clock so the first pause runs it, rather than waiting for an
@@ -13157,7 +13177,6 @@ impl App {
             return false;
         };
         self.editor = Some(self.parked.remove(i));
-        self.buffer_slot = i;
         true
     }
 
@@ -13176,7 +13195,8 @@ impl App {
 
     fn close_editor(&mut self) {
         let standalone = self.editor.as_ref().is_some_and(|e| e.standalone);
-        if let Some(path) = self.editor.as_ref().map(|e| e.path.clone()) {
+        let closing = self.editor.as_ref().map(|e| e.path.clone());
+        if let Some(path) = closing.clone() {
             // Fire and forget, on a worker: the registry blocks, and the
             // reader is already looking at something else.
             let lsp = self.lsp.clone();
@@ -13184,6 +13204,14 @@ impl App {
             thread::spawn(move || lsp.close(&root, &path));
         }
         self.editor = None;
+        // Where the closed tab was, so the tab that takes its place is
+        // the one that was beside it.
+        let was = closing
+            .as_deref()
+            .and_then(|p| self.tab_order.iter().position(|q| q == p));
+        if let Some(path) = &closing {
+            self.forget_tab(path);
+        }
         // Another buffer waiting is what the reader goes back to, not the
         // diff. Closing one file of several should not close them all.
         //
@@ -13191,9 +13219,12 @@ impl App {
         // what the reader is looking at, so the tab that takes the closed
         // one's place should be the tab that was beside it.
         if !self.parked.is_empty() {
-            let at = self.buffer_slot.min(self.parked.len() - 1);
-            let prev = self.parked.remove(at);
-            self.buffer_slot = at;
+            let at = was.unwrap_or(0).min(self.tab_order.len().saturating_sub(1));
+            let next = self.tab_order.get(at).cloned();
+            let take = next
+                .and_then(|p| self.parked.iter().position(|e| e.path == p))
+                .unwrap_or(0);
+            let prev = self.parked.remove(take);
             let path = prev.path.clone();
             let read_only = prev.read_only;
             self.editor = Some(prev);
