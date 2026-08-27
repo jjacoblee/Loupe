@@ -22,6 +22,11 @@ use unicode_width::UnicodeWidthChar;
 /// Width of the Tree/Flat toggle drawn on the file panel's top border.
 const TOGGLE_W: usize = 13;
 
+/// Columns a commit's subject needs before the panel will also spend any
+/// on the date beside it. Below this the row would say when at the cost
+/// of saying what.
+const COMMIT_SUBJECT_MIN: usize = 20;
+
 /// Rows the ☰ menu keeps below the button before it gives up and fills
 /// the screen from the top instead.
 const MENU_MIN_H: u16 = 8;
@@ -1110,12 +1115,17 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                 };
                 let arrow = if *open { "▾" } else { "▸" };
                 let head = format!("{arrow} {} ", c.short);
-                // The date is worth its columns — a stack of commits is
-                // read by when as much as by what — so the subject gives
-                // way to it rather than the other way round.
+                let avail = (inner.width as usize).saturating_sub(disp_width(&head));
+                // The subject is what the row is for. The date keeps its
+                // columns while there is enough left to read a name by,
+                // and gives them up when there is not.
                 let when = format!(" {}", c.when);
-                let sub_w =
-                    (inner.width as usize).saturating_sub(disp_width(&head) + disp_width(&when));
+                let (sub_w, when) = if avail.saturating_sub(disp_width(&when)) >= COMMIT_SUBJECT_MIN
+                {
+                    (avail - disp_width(&when), when)
+                } else {
+                    (avail, String::new())
+                };
                 let sub = truncate_pad(&c.subject, sub_w);
                 lines.push(Line::from(vec![
                     Span::styled(head, Style::default().fg(p.accent)),
@@ -4241,6 +4251,10 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
             } else if !app.pending.is_empty() {
                 let n = app.pending.len();
                 format!("{n} held · R the review box · c comment · y copy · m menu")
+            } else if app.open_commit.is_some() {
+                // Nothing in a commit can be staged or put back, so the
+                // row offers what is left and the way out.
+                "click a commit or its files · F the change · m menu".into()
             } else if app.conflict.is_some() {
                 // Mid-conflict there is one thing worth doing, so the hint
                 // row says how rather than listing everything else.
@@ -5525,9 +5539,9 @@ mod tests {
         use crate::gitops::Commit;
 
         let mut app = wide_app();
-        // Wide enough for the full title; a narrow panel shortens it to
-        // the commit count alone.
-        app.file_panel_w = 40;
+        // Wide enough for the full title and the date beside the
+        // subject; a narrow panel gives up both.
+        app.file_panel_w = 56;
         app.set_panel(PanelMode::Commits);
         app.apply_commits(CommitsData {
             base: Some("origin/main".into()),
@@ -5573,6 +5587,16 @@ mod tests {
             !panel.contains("[+]") && !panel.contains("[ ]"),
             "and no staging box — a commit already happened: {panel:?}"
         );
+
+        // Narrowed, the subject keeps the row and the date gives it up:
+        // a row that says when at the cost of saying what says nothing.
+        app.file_panel_w = 34;
+        let buf = render(&mut app);
+        let panel: String = (2..5).map(|y| row_text(&buf, y)).collect();
+        assert!(panel.contains("4683983 Make the editor"), "{panel:?}");
+        assert!(!panel.contains("hours ago"), "{panel:?}");
+        app.file_panel_w = 56;
+        let buf = render(&mut app);
 
         // The panel's own bottom border offers all three panels.
         let fl = app.layout.file_list;

@@ -3688,7 +3688,10 @@ impl App {
                 }
                 // Start this language's server in the background, so the
                 // first gd / gr / K doesn't pay for the handshake.
-                if self.lsp_enabled {
+                // Not for a commit's file: it cannot be edited, and the
+                // text is not what is on disk for the server to agree
+                // with.
+                if self.lsp_enabled && self.open_commit.is_none() {
                     if let (Some(file), Some(text)) = (
                         self.files.get(self.file_cursor),
                         self.new_content.as_deref(),
@@ -3706,14 +3709,24 @@ impl App {
                             if n == 1 { "" } else { "s" }
                         )
                     }
-                    None => {
-                        let mode = if self.checked_out {
-                            "editable"
-                        } else {
-                            "read-only (branch not checked out)"
-                        };
-                        format!("{} — {}", d.path, mode)
-                    }
+                    // A file out of the Commits panel names the commit
+                    // it came from. It is read-only for a different
+                    // reason than an unchecked-out branch is, and the
+                    // reason is the useful half of the sentence.
+                    None => match &self.open_commit {
+                        Some(c) => format!(
+                            "{} at {} {} — read-only; a commit already happened.",
+                            d.path, c.short, c.subject
+                        ),
+                        None => {
+                            let mode = if self.checked_out {
+                                "editable"
+                            } else {
+                                "read-only (branch not checked out)"
+                            };
+                            format!("{} — {}", d.path, mode)
+                        }
+                    },
                 };
                 match self.auto_open_note.take() {
                     Some(note) => self.ok(format!("{note} · {msg}")),
