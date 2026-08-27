@@ -964,6 +964,17 @@ pub enum ButtonId {
     /// The Changes/Files toggle above the file panel.
     PanelChanges,
     PanelFiles,
+    /// Editor commands that have no button of their own, reached from ☰.
+    EditorDefinition,
+    EditorHover,
+    EditorFind,
+    EditorComment,
+    EditorReferences,
+    EditorRename,
+    EditorActions,
+    EditorSignature,
+    BufferNext,
+    BufferPrev,
     FoldToggle,
     Edit,
     Comment,
@@ -7179,14 +7190,84 @@ impl App {
         }
 
         if self.editor.is_some() {
+            let read_only = self.editor.as_ref().is_some_and(|e| e.read_only);
+            let path = self
+                .editor
+                .as_ref()
+                .map(|e| e.path.clone())
+                .unwrap_or_default();
+            let has_server = lsp::Lsp::supports(&path).is_some();
+
             rows.push(MenuRow::Heading("EDITOR"));
             rows.push(item("💾 Save".into(), "Ctrl+S", ButtonId::EditorSave));
             rows.push(item("⇥  Format".into(), "Ctrl+T", ButtonId::EditorFormat));
+            rows.push(item(
+                "🔍 Find and replace".into(),
+                "Alt+F",
+                ButtonId::EditorFind,
+            ));
+            if !read_only {
+                rows.push(item(
+                    "💬 Comment or uncomment".into(),
+                    "Alt+C",
+                    ButtonId::EditorComment,
+                ));
+            }
             if markdown::is_markdown(self.editor.as_ref().map(|e| e.path.as_str()).unwrap_or("")) {
                 rows.push(item(
                     "📖 Preview the markdown".into(),
                     "Alt+P",
                     ButtonId::PreviewToggle,
+                ));
+            }
+            // The language-server lines are shown for a language loupe can
+            // drive, and greyed rather than hidden when the server itself
+            // is missing — "install gopls" is a more useful answer than a
+            // menu that quietly has fewer lines on Go files.
+            if has_server {
+                rows.push(MenuRow::Heading("CODE"));
+                rows.push(item(
+                    "⇢  Go to the definition".into(),
+                    "Ctrl+]",
+                    ButtonId::EditorDefinition,
+                ));
+                rows.push(item(
+                    "≡  Find every use".into(),
+                    "Alt+R",
+                    ButtonId::EditorReferences,
+                ));
+                rows.push(item(
+                    "ℹ  What is this?".into(),
+                    "Ctrl+G",
+                    ButtonId::EditorHover,
+                ));
+                rows.push(item(
+                    "ƒ  Signature of this call".into(),
+                    "Alt+S",
+                    ButtonId::EditorSignature,
+                ));
+                if !read_only {
+                    rows.push(item(
+                        "✎  Rename it everywhere".into(),
+                        "Alt+M",
+                        ButtonId::EditorRename,
+                    ));
+                    rows.push(item(
+                        "🔧 Fixes and refactors".into(),
+                        "Alt+.",
+                        ButtonId::EditorActions,
+                    ));
+                }
+            }
+
+            // Only worth a line when there is somewhere else to go.
+            if self.buffers().count() > 1 {
+                rows.push(MenuRow::Heading("OPEN FILES"));
+                rows.push(item("→  Next file".into(), "Alt+]", ButtonId::BufferNext));
+                rows.push(item(
+                    "←  Previous file".into(),
+                    "Alt+[",
+                    ButtonId::BufferPrev,
                 ));
             }
             rows.push(item(
@@ -7225,6 +7306,12 @@ impl App {
             "",
             ButtonId::TreeToggle,
             self.tree_view,
+        ));
+        rows.push(switch(
+            "📁 Every file in the repository".into(),
+            "F",
+            ButtonId::PanelFiles,
+            self.panel == PanelMode::Files,
         ));
         rows.push(switch(
             "👤 Blame column".into(),
@@ -7430,6 +7517,40 @@ impl App {
         }
         match id {
             ButtonId::ViewToggle => self.toggle_view(),
+            ButtonId::EditorFind => {
+                if let Some(ed) = &mut self.editor {
+                    ed.open_find();
+                    self.ok("Find in this file — Tab adds a replacement, Esc cancels.");
+                }
+            }
+            ButtonId::EditorComment => {
+                let known = self.editor.as_mut().is_some_and(|e| e.toggle_comment());
+                if !known {
+                    self.err("Loupe does not know how this language writes a comment.");
+                }
+            }
+            ButtonId::EditorDefinition => self.spawn_editor_request(EditorRequest::Definition),
+            ButtonId::EditorHover => self.spawn_editor_request(EditorRequest::Hover),
+            ButtonId::EditorReferences => self.spawn_editor_request(EditorRequest::References),
+            ButtonId::EditorRename => {
+                let word = self
+                    .editor
+                    .as_ref()
+                    .map(|e| e.word_at_cursor())
+                    .unwrap_or_default();
+                if word.is_empty() {
+                    self.err("Put the cursor on a name first.");
+                } else {
+                    self.open_path_box(PathBoxKind::RenameSymbol { word });
+                }
+            }
+            ButtonId::EditorActions => {
+                self.ok("Asking what is on offer here…");
+                self.spawn_editor_request(EditorRequest::CodeActions);
+            }
+            ButtonId::EditorSignature => self.spawn_editor_request(EditorRequest::SignatureHelp),
+            ButtonId::BufferNext => self.step_buffer(1),
+            ButtonId::BufferPrev => self.step_buffer(-1),
             ButtonId::PanelChanges => self.set_panel(PanelMode::Changes),
             ButtonId::PanelFiles => self.set_panel(PanelMode::Files),
             ButtonId::ViewTree => self.set_tree_view(true),
@@ -13082,7 +13203,66 @@ b2
         assert_eq!(menu.items[0].key, 'y', "and it takes a deliberate key");
     }
 
-    /// Two buffers both called `mod.rs` name nothing    /// Two buffers both called `mod.rs` name nothing, so a shared name
+    /// Every key the editor answers to has a line in ☰. The menu is how a
+    /// mouse-first reader finds a command at all, and seven of these are
+    /// Alt keys some terminals never deliver — a line that is only a
+    /// keyboard shortcut is a line those readers cannot reach.
+    #[test]
+    fn the_menu_offers_every_editor_command() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.open_buffer(buf("src/a.rs"));
+        app.open_buffer(buf("src/b.rs"));
+
+        let hints: Vec<&str> = app
+            .build_menu()
+            .iter()
+            .filter_map(|r| match r {
+                MenuRow::Item(i) => Some(i.hint),
+                _ => None,
+            })
+            .collect();
+
+        for want in [
+            "Ctrl+S", "Ctrl+T", "Alt+F", "Alt+C", "Ctrl+]", "Alt+R", "Ctrl+G", "Alt+S", "Alt+M",
+            "Alt+.", "Alt+]", "Alt+[",
+        ] {
+            assert!(hints.contains(&want), "☰ has no line for {want}: {hints:?}");
+        }
+    }
+
+    /// A read-only buffer came from a commit, not the working tree, so the
+    /// lines that would write to it are not offered. Reading is still on
+    /// the menu — that is the whole reason the buffer is open.
+    #[test]
+    fn a_read_only_buffer_is_not_offered_the_lines_that_write() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        let mut ed = buf("src/a.rs");
+        ed.read_only = true;
+        app.open_buffer(ed);
+
+        let hints: Vec<&str> = app
+            .build_menu()
+            .iter()
+            .filter_map(|r| match r {
+                MenuRow::Item(i) => Some(i.hint),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            !hints.contains(&"Alt+C"),
+            "no commenting a file it cannot write"
+        );
+        assert!(!hints.contains(&"Alt+M"), "and no renaming through it");
+        assert!(
+            hints.contains(&"Alt+R"),
+            "but finding every use still works"
+        );
+    }
+
+    /// Two buffers both called `mod.rs` name nothing    /// Two buffers both called `mod.rs` name nothing    /// Two buffers both called `mod.rs` name nothing, so a shared name
     /// costs both of them their parent directory — the rule the pins
     /// already use.
     #[test]
