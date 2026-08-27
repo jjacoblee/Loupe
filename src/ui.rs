@@ -2,7 +2,8 @@
 //! `app.layout` so the mouse handlers can hit-test against it.
 
 use crate::app::{
-    App, ButtonId, Dragging, FileEntry, FinderMode, MenuRow, Overlay, Screen, ViewMode, FINDER_ROWS,
+    App, ButtonId, Dragging, FileEntry, FinderMode, MenuRow, Overlay, Screen, StageSection,
+    ViewMode, FINDER_ROWS,
 };
 use crate::blame::{self, Heat};
 use crate::diff::{DisplayEntry, Row, RowKind, Selection, Side, TAB_WIDTH};
@@ -1080,6 +1081,37 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                     truncate_pad(&text, inner.width as usize),
                     Style::default().fg(p.conflict).add_modifier(Modifier::BOLD),
                 )));
+            }
+            FileEntry::StageHeading {
+                section,
+                count,
+                collapsed,
+            } => {
+                // The heading reads as a heading, not as a file: no
+                // checkbox column, no status letter, and its own color.
+                let arrow = if *collapsed { "▸" } else { "▾" };
+                let head = format!("{arrow} {} {count}", section.title());
+                let action = if *count > 0 {
+                    section.action_label()
+                } else {
+                    ""
+                };
+                let w = inner.width as usize;
+                let pad = w
+                    .saturating_sub(disp_width(&head))
+                    .saturating_sub(disp_width(action));
+                let fg = match section {
+                    StageSection::Staged => p.st_added,
+                    StageSection::Unstaged => p.dim,
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        truncate_pad(&head, disp_width(&head).min(w)),
+                        Style::default().fg(fg).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(action.to_string(), Style::default().fg(p.accent)),
+                ]));
             }
             FileEntry::Dir { label, path, depth } => {
                 let arrow = if app.collapsed_set().contains(path) {
@@ -5410,13 +5442,13 @@ mod tests {
                 conflicted: false,
             })
             .collect();
-        app.rebuild_files();
         app.stage.insert("a.rs".into(), StageState::Unstaged);
         app.stage.insert("b.rs".into(), StageState::Partial);
         app.stage.insert("c.rs".into(), StageState::Staged);
+        app.rebuild_files();
 
         let buf = render(&mut app);
-        let panel: String = (1..5).map(|y| row_text(&buf, y)).collect();
+        let panel: String = (1..8).map(|y| row_text(&buf, y)).collect();
         assert!(
             panel.contains("[+] M a.rs"),
             "unstaged file offers [+]: {panel:?}"
@@ -5430,14 +5462,25 @@ mod tests {
             "fully staged file shows [✓]: {panel:?}"
         );
         assert!(
-            row_text(&buf, 1).contains("1/3 staged"),
-            "title counts staged files"
+            row_text(&buf, 1).contains("2/3 staged"),
+            "title counts what is in the index, partly staged files included"
+        );
+        // The two sections, and the file in each of them.
+        assert!(
+            panel.contains("STAGED 2") && panel.contains("UNSTAGED 1"),
+            "the headings count each section: {panel:?}"
         );
 
-        // A pull-request review keeps the viewed checkbox.
+        // A pull-request review has no index to divide: no headings, and
+        // the viewed checkbox is back.
         app.local = false;
+        app.rebuild_files();
         let buf = render(&mut app);
         let panel: String = (1..5).map(|y| row_text(&buf, y)).collect();
+        assert!(
+            !panel.contains("STAGED"),
+            "no staging sections on a PR: {panel:?}"
+        );
         assert!(
             panel.contains("[ ] M a.rs"),
             "PR review shows the viewed checkbox: {panel:?}"

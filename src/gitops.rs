@@ -516,6 +516,262 @@ pub fn unstage_file(root: &Path, path: &str, previous: Option<&str>) -> Result<(
     run_git(&args).map(|_| ())
 }
 
+/// `git add -A` from the repository root: every change in the working tree
+/// goes into the index, untracked files included.
+///
+/// The file panel already lists untracked files as additions, so "stage
+/// everything in the list" and `git add -A` name the same set. The `.`
+/// pathspec is relative to `-C <root>`, so this stages the whole
+/// repository even when loupe was started in a subdirectory.
+pub fn stage_all(root: &Path) -> Result<()> {
+    let r = root.to_string_lossy().into_owned();
+    run_git(&["-C", &r, "add", "-A", "--", "."]).map(|_| ())
+}
+
+/// Empty the index back to HEAD, leaving every file on disk alone.
+///
+/// The `.` pathspec is what makes this work in a repository with no
+/// commits: `git reset` with a pathspec and no commit resolves against the
+/// empty tree when there is no HEAD, while a bare `git reset` fails.
+pub fn unstage_all(root: &Path) -> Result<()> {
+    let r = root.to_string_lossy().into_owned();
+    run_git(&["-C", &r, "reset", "-q", "--", "."]).map(|_| ())
+}
+
+// ------------------------------------------------------------------- stash
+
+/// What a stash takes with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StashScope {
+    /// Tracked changes only — what `git stash push` does on its own. An
+    /// untracked file stays where it is.
+    Tracked,
+    /// Tracked changes and untracked files (`--include-untracked`).
+    /// Ignored files are still left alone.
+    WithUntracked,
+    /// Only what is in the index (`--staged`), which leaves the unstaged
+    /// edits in the working tree. Needs git 2.35 or later.
+    StagedOnly,
+}
+
+impl StashScope {
+    /// What the status line calls this scope.
+    pub fn label(self) -> &'static str {
+        match self {
+            StashScope::Tracked => "tracked changes",
+            StashScope::WithUntracked => "tracked changes and untracked files",
+            StashScope::StagedOnly => "the staged changes",
+        }
+    }
+}
+
+/// `git stash push`, with an optional name and a scope.
+///
+/// git refuses an empty stash, and its own message for that reads as a
+/// success ("No local changes to save"), so the caller is told with an
+/// error instead — a silent no-op after a menu click looks like a bug.
+pub fn stash_push(root: &Path, message: Option<&str>, scope: StashScope) -> Result<()> {
+    let r = root.to_string_lossy().into_owned();
+    let mut args = vec!["-C", r.as_str(), "stash", "push"];
+    match scope {
+        StashScope::Tracked => {}
+        StashScope::WithUntracked => args.push("--include-untracked"),
+        StashScope::StagedOnly => args.push("--staged"),
+    }
+    let msg = message.map(str::trim).filter(|m| !m.is_empty());
+    if let Some(m) = msg {
+        args.push("-m");
+        args.push(m);
+    }
+    let out = run_git(&args)?;
+    if out.contains("No local changes to save") || out.trim().is_empty() {
+        bail!("nothing to stash — {} left nothing to save", scope.label());
+    }
+    Ok(())
+}
+
+/// One entry of `git stash list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stash {
+    /// Position in the list. `stash@{0}` is the newest.
+    pub index: usize,
+    /// What git calls it: `stash@{0}`.
+    pub name: String,
+    /// The reflog subject — the name you gave it, or the `WIP on <branch>`
+    /// git writes when you gave it none.
+    pub subject: String,
+    /// How long ago it was made, as `2 hours ago`.
+    pub when: String,
+}
+
+/// Every stash in the repository, newest first.
+///
+/// The fields are split on a unit separator and the records on a record
+/// separator, so a stash message with a newline or a tab in it still parses.
+pub fn stash_list(root: &Path) -> Result<Vec<Stash>> {
+    let r = root.to_string_lossy().into_owned();
+    let out = run_git(&["-C", &r, "stash", "list", "--format=%gd%x1f%gs%x1f%cr%x1e"])?;
+    Ok(parse_stash_list(&out))
+}
+
+fn parse_stash_list(out: &str) -> Vec<Stash> {
+    out.split('\u{1e}')
+        .map(str::trim_start)
+        .filter(|rec| !rec.is_empty())
+        .enumerate()
+        .map(|(index, rec)| {
+            let mut f = rec.split('\u{1f}');
+            let name = f.next().unwrap_or_default().to_string();
+            let subject = f.next().unwrap_or_default().to_string();
+            let when = f.next().unwrap_or_default().to_string();
+            Stash {
+                index,
+                name,
+                subject,
+                when,
+            }
+        })
+        .collect()
+}
+
+/// Put a stash back into the working tree. `pop` also drops it.
+///
+/// The stash is named by position rather than by the `stash@{N}` string,
+/// so a list that moved under the reader cannot address the wrong one by
+/// a stale name.
+pub fn stash_apply(root: &Path, index: usize, pop: bool) -> Result<()> {
+    let r = root.to_string_lossy().into_owned();
+    let name = format!("stash@{{{index}}}");
+    let verb = if pop { "pop" } else { "apply" };
+    run_git(&["-C", &r, "stash", verb, "--index", &name])
+        // `--index` also restores what was staged, and git refuses it when
+        // the index cannot be replayed. Fall back to the plain form, which
+        // restores the work as unstaged edits rather than failing.
+        .or_else(|_| run_git(&["-C", &r, "stash", verb, &name]))
+        .map(|_| ())
+}
+
+/// Throw one stash away for good.
+pub fn stash_drop(root: &Path, index: usize) -> Result<()> {
+    let r = root.to_string_lossy().into_owned();
+    let name = format!("stash@{{{index}}}");
+    run_git(&["-C", &r, "stash", "drop", &name]).map(|_| ())
+}
+
+// ----------------------------------------------------------------- commits
+
+/// One commit in the list of what has not been pushed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    /// The full object id, which is what every later git call uses.
+    pub oid: String,
+    /// The abbreviated id, which is what the panel shows.
+    pub short: String,
+    pub subject: String,
+    pub author: String,
+    /// How long ago it was made, as `2 hours ago`.
+    pub when: String,
+}
+
+/// Commits on HEAD that `upstream` does not have, newest first.
+pub fn unpushed_commits(root: &Path, upstream: &str) -> Result<Vec<Commit>> {
+    let r = root.to_string_lossy().into_owned();
+    let range = format!("{upstream}..HEAD");
+    let out = run_git(&[
+        "-C",
+        &r,
+        "log",
+        "--format=%H%x1f%h%x1f%s%x1f%an%x1f%cr%x1e",
+        &range,
+    ])?;
+    Ok(parse_commit_log(&out))
+}
+
+fn parse_commit_log(out: &str) -> Vec<Commit> {
+    out.split('\u{1e}')
+        .map(str::trim_start)
+        .filter(|rec| !rec.is_empty())
+        .map(|rec| {
+            let mut f = rec.split('\u{1f}');
+            let oid = f.next().unwrap_or_default().to_string();
+            let short = f.next().unwrap_or_default().to_string();
+            let subject = f.next().unwrap_or_default().to_string();
+            let author = f.next().unwrap_or_default().to_string();
+            let when = f.next().unwrap_or_default().to_string();
+            Commit {
+                oid,
+                short,
+                subject,
+                author,
+                when,
+            }
+        })
+        .collect()
+}
+
+/// The files one commit changed, against its first parent.
+///
+/// `--diff-merges=first-parent` is what makes a merge commit answer this
+/// question at all: without it `git show` prints nothing for a merge, and
+/// an empty file list would read as "this commit changed nothing". A root
+/// commit has no parent, and `git show` lists its whole tree as added.
+pub fn commit_files(root: &Path, oid: &str) -> Result<Vec<ChangedFile>> {
+    let r = root.to_string_lossy().into_owned();
+    let ns = run_git(&[
+        "-C",
+        &r,
+        "show",
+        "--diff-merges=first-parent",
+        "--format=",
+        "--name-status",
+        "-M",
+        "-z",
+        oid,
+    ])?;
+    // Counts are cosmetic — a failed read costs the +/− columns, not the
+    // file list.
+    let counts = run_git(&[
+        "-C",
+        &r,
+        "show",
+        "--diff-merges=first-parent",
+        "--format=",
+        "--numstat",
+        "-M",
+        "-z",
+        oid,
+    ])
+    .map(|o| parse_numstat_z(&o))
+    .unwrap_or_default();
+    let mut files: Vec<ChangedFile> = parse_name_status_z(&ns)
+        .into_iter()
+        .map(|(status, previous, path)| {
+            let (additions, deletions) = counts.get(&path).copied().unwrap_or((0, 0));
+            ChangedFile {
+                path,
+                status,
+                additions,
+                deletions,
+                previous,
+                conflicted: false,
+            }
+        })
+        .collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// The first parent of a commit, which is the side its diff is read
+/// against. `None` for a root commit, whose diff is against nothing.
+pub fn first_parent(root: &Path, oid: &str) -> Option<String> {
+    let r = root.to_string_lossy().into_owned();
+    let spec = format!("{oid}^1");
+    run_git(&["-C", &r, "rev-parse", "--verify", "--quiet", &spec])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 // ------------------------------------------------------------------ revert
 
 /// True when `path` exists in the tree at `rev`.

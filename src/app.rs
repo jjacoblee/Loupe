@@ -1154,6 +1154,11 @@ pub enum ButtonId {
     ResolveFile,
     /// The idle re-scan switch (see `App::auto_refresh`).
     AutoRefreshToggle,
+    /// ✚ all / ↩ all — move a whole staging section across, and the
+    /// menu's line for the one file at the cursor.
+    StageFile,
+    StageAll,
+    UnstageAll,
     Quit,
 }
 
@@ -1217,6 +1222,10 @@ pub const BLAME_MIN: u16 = 12;
 /// when reverting is possible at all (see [`App::revert_gutter`]), so a
 /// read-only review still gets the full width for code.
 pub const REVERT_W: u16 = 2;
+
+/// Width of the action at the right-hand end of a staging heading — `✚ all`
+/// and `↩ all`, and the click target that runs them.
+pub const SECTION_ACTION_W: u16 = 6;
 
 /// How old the repository listing may get before coming back to the file
 /// panel re-reads it. Long, because the read costs about 93 ms on a
@@ -1381,6 +1390,45 @@ pub enum FileEntry {
     ConflictHeading {
         count: usize,
     },
+    /// The heading above the staged or the unstaged half of a local
+    /// review. It carries the count, the fold arrow, and the action that
+    /// moves the whole section across.
+    StageHeading {
+        section: StageSection,
+        count: usize,
+        collapsed: bool,
+    },
+}
+
+/// Which half of the local file panel a heading names.
+///
+/// A pull request has no index, so it has no sections: the split is local
+/// review only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StageSection {
+    /// Files with something in the index — what `git commit` would take.
+    Staged,
+    /// Files whose change is only in the working tree.
+    Unstaged,
+}
+
+impl StageSection {
+    /// What the heading says.
+    pub fn title(self) -> &'static str {
+        match self {
+            StageSection::Staged => "STAGED",
+            StageSection::Unstaged => "UNSTAGED",
+        }
+    }
+
+    /// The right-hand action on the heading: stage the whole section, or
+    /// take the whole section back out.
+    pub fn action_label(self) -> &'static str {
+        match self {
+            StageSection::Staged => " ↩ all",
+            StageSection::Unstaged => " ✚ all",
+        }
+    }
 }
 
 /// One directory's contents, read on a worker thread.
@@ -1575,7 +1623,15 @@ impl TreeNodes {
     /// of them.
     fn all_dirs(&self) -> HashSet<String> {
         let mut rows = Vec::new();
-        walk(&self.root, "", 0, &HashSet::new(), &mut rows);
+        walk(
+            &self.root,
+            "",
+            0,
+            &HashSet::new(),
+            &|_| true,
+            false,
+            &mut rows,
+        );
         rows.into_iter()
             .filter_map(|e| match e {
                 FileEntry::Dir { path, .. } => Some(path),
@@ -1585,8 +1641,31 @@ impl TreeNodes {
     }
 
     fn emit(&self, collapsed: &HashSet<String>, out: &mut Vec<FileEntry>) {
-        walk(&self.root, "", 0, collapsed, out);
+        walk(&self.root, "", 0, collapsed, &|_| true, false, out);
     }
+
+    /// The same rows, with only the files `keep` accepts.
+    ///
+    /// This is how one tree serves both halves of a local review: the
+    /// staged and the unstaged sections are the same tree emitted twice
+    /// under different filters, so nothing has to be rebuilt when a file
+    /// moves across. A directory left with nothing in it is dropped
+    /// rather than drawn empty.
+    fn emit_where(
+        &self,
+        collapsed: &HashSet<String>,
+        keep: &dyn Fn(RowSrc) -> bool,
+        out: &mut Vec<FileEntry>,
+    ) {
+        walk(&self.root, "", 0, collapsed, keep, true, out);
+    }
+}
+
+/// Whether anything under this node passes the filter — the question a
+/// collapsed directory has to answer, because its rows are never emitted.
+fn node_keeps(node: &Node, keep: &dyn Fn(RowSrc) -> bool) -> bool {
+    node.files.iter().any(|(_, src)| keep(*src))
+        || node.dirs.values().any(|child| node_keeps(child, keep))
 }
 
 fn walk(
@@ -1594,6 +1673,11 @@ fn walk(
     prefix: &str,
     depth: u16,
     collapsed: &HashSet<String>,
+    keep: &dyn Fn(RowSrc) -> bool,
+    // Drop a directory the filter left with nothing in it. Off for the
+    // panel that lists the repository, where a directory git would not
+    // walk into is legitimately empty until somebody opens it.
+    prune: bool,
     out: &mut Vec<FileEntry>,
 ) {
     for (name, child) in &node.dirs {
@@ -1611,17 +1695,30 @@ fn walk(
         } else {
             format!("{prefix}/{label}")
         };
+        // A collapsed directory emits no rows to count, so it is asked
+        // directly; an open one is walked and rolled back when the walk
+        // turns out to have added nothing.
+        if collapsed.contains(&path) {
+            if !prune || node_keeps(cur, keep) {
+                out.push(FileEntry::Dir { label, path, depth });
+            }
+            continue;
+        }
+        let mark = out.len();
         out.push(FileEntry::Dir {
             label,
             path: path.clone(),
             depth,
         });
-        if !collapsed.contains(&path) {
-            walk(cur, &path, depth + 1, collapsed, out);
+        walk(cur, &path, depth + 1, collapsed, keep, prune, out);
+        if prune && out.len() == mark + 1 {
+            out.truncate(mark);
         }
     }
     for (_, src) in &node.files {
-        out.push(FileEntry::File { src: *src, depth });
+        if keep(*src) {
+            out.push(FileEntry::File { src: *src, depth });
+        }
     }
 }
 
@@ -1651,6 +1748,12 @@ enum BgKind {
     Viewed { path: String, viewed: bool },
     /// `git add` / unstage; `before` is the state to restore on failure.
     Stage { path: String, before: StageState },
+    /// The whole index at once. `before` is the map to restore on
+    /// failure, because every file moved rather than one.
+    StageAll {
+        before: HashMap<String, StageState>,
+        add: bool,
+    },
     /// A plain re-read of the index after something changed the working
     /// tree under it. Nothing to roll back if it fails.
     Rescan,
@@ -2172,6 +2275,11 @@ pub struct App {
     pub file_scroll: usize,
     pub tree_view: bool,
     pub collapsed_dirs: HashSet<String>,
+    /// The staging sections the reader folded away. Local review only —
+    /// a pull request has no index, so it has no sections. This is a view
+    /// preference rather than review state, so it stays on the app across
+    /// a swap to the pull request and back.
+    pub collapsed_sections: HashSet<StageSection>,
     pub entries: Vec<FileEntry>,
     /// The directory tree behind `entries`, cached so a collapse toggle
     /// emits rows without rebuilding it. See [`TreeNodes`].
@@ -2508,6 +2616,7 @@ impl App {
             file_scroll: 0,
             tree_view: true,
             collapsed_dirs: HashSet::new(),
+            collapsed_sections: HashSet::new(),
             entries: Vec::new(),
             tree: TreeNodes::default(),
             repo_paths: Vec::new(),
@@ -2999,6 +3108,11 @@ impl App {
                         // guess can't).
                         (Ok(Some(states)), _) => {
                             self.stage = states;
+                            // The sections are drawn from this map, so a
+                            // file that turned out to be partly staged
+                            // has to move to the half it really belongs
+                            // in before the next frame.
+                            self.rebuild_entries();
                             changed = true;
                         }
                         (Ok(None), _) => {}
@@ -3014,6 +3128,13 @@ impl App {
                         (Err(e), BgKind::Stage { path, before }) => {
                             self.stage.insert(path.clone(), before);
                             self.err(format!("Staging {path} failed: {e:#}"));
+                            changed = true;
+                        }
+                        (Err(e), BgKind::StageAll { before, add }) => {
+                            self.stage = before;
+                            self.rebuild_entries();
+                            let what = if add { "Staging" } else { "Unstaging" };
+                            self.err(format!("{what} everything failed: {e:#}"));
                             changed = true;
                         }
                         // A failed re-read leaves the icons as they were:
@@ -5114,12 +5235,13 @@ impl App {
         self.stage.get(path).copied().unwrap_or_default()
     }
 
-    /// How many files are fully staged (for the panel title).
+    /// How many files have something in the index (for the panel title).
+    ///
+    /// A partly staged file counts, because the STAGED heading is where
+    /// it is listed. Two numbers on one screen that disagree about the
+    /// same file would be worse than either number alone.
     pub fn staged_count(&self) -> usize {
-        self.files
-            .iter()
-            .filter(|f| self.stage_state(&f.path) == StageState::Staged)
-            .count()
+        self.section_count(StageSection::Staged)
     }
 
     /// Re-read the index in the background and adopt it wholesale — the
@@ -5167,6 +5289,9 @@ impl App {
                 StageState::Unstaged
             },
         );
+        // The row moves between the sections on this frame; the re-read
+        // only corrects it if git disagrees.
+        self.rebuild_entries();
         if add {
             self.ok(format!("✚ Staged {path} — click again to unstage."));
         } else {
@@ -5193,6 +5318,110 @@ impl App {
         self.bg_jobs.push(BgJob {
             rx,
             kind: BgKind::Stage { path, before },
+        });
+    }
+
+    /// `X`: stage the whole change, or take the whole change back out
+    /// when there is nothing left to stage. One key for the question the
+    /// two heading buttons ask separately.
+    pub fn toggle_stage_all(&mut self) {
+        if !self.local {
+            self.err("Staging is for local changes — a pull request has no index here.");
+            return;
+        }
+        if self.section_count(StageSection::Unstaged) > 0 {
+            self.stage_all();
+        } else {
+            self.unstage_all();
+        }
+    }
+
+    /// `git add -A`: everything the panel lists goes into the index, and
+    /// the whole UNSTAGED section moves up into STAGED.
+    ///
+    /// A conflicted file is left out of the count but not out of the add.
+    /// git treats a path as conflicted until it is added, so staging
+    /// everything while a conflict is open would mark it resolved without
+    /// anybody resolving it — the command is refused instead.
+    pub fn stage_all(&mut self) {
+        if !self.local {
+            return;
+        }
+        if self.conflict_count() > 0 {
+            self.err(
+                "Resolve the merge conflicts first — staging them all would mark them resolved.",
+            );
+            return;
+        }
+        let n = self.section_count(StageSection::Unstaged);
+        if n == 0 {
+            self.ok("Everything is staged already.");
+            return;
+        }
+        self.optimistic_stage_all(true);
+        self.ok(format!(
+            "✚ Staged {n} file{} — the working tree is untouched.",
+            if n == 1 { "" } else { "s" }
+        ));
+        self.spawn_stage_all(true);
+    }
+
+    /// `git reset`: the index goes back to HEAD and the whole STAGED
+    /// section drops back down. Nothing on disk moves.
+    pub fn unstage_all(&mut self) {
+        if !self.local {
+            return;
+        }
+        let n = self.section_count(StageSection::Staged);
+        if n == 0 {
+            self.ok("Nothing is staged.");
+            return;
+        }
+        self.optimistic_stage_all(false);
+        self.ok(format!(
+            "↩ Unstaged {n} file{} — the working tree is untouched.",
+            if n == 1 { "" } else { "s" }
+        ));
+        self.spawn_stage_all(false);
+    }
+
+    /// Move every non-conflicted file across at once, so the panel redraws
+    /// before git has answered. The real index arrives with the re-read.
+    fn optimistic_stage_all(&mut self, add: bool) {
+        let want = if add {
+            StageState::Staged
+        } else {
+            StageState::Unstaged
+        };
+        let paths: Vec<String> = self
+            .files
+            .iter()
+            .filter(|f| !f.conflicted)
+            .map(|f| f.path.clone())
+            .collect();
+        for path in paths {
+            self.stage.insert(path, want);
+        }
+        self.rebuild_entries();
+    }
+
+    /// Run the whole-index command on a worker thread and adopt the index
+    /// it reads back, the same way one file's toggle does.
+    fn spawn_stage_all(&mut self, add: bool) {
+        let root = self.repo_root.clone();
+        let before = self.stage.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let res = if add {
+                gitops::stage_all(&root)
+            } else {
+                gitops::unstage_all(&root)
+            };
+            let _ = tx.send(res.and_then(|()| gitops::stage_states(&root).map(Some)));
+        });
+        self.bg_jobs.push(BgJob {
+            rx,
+            kind: BgKind::StageAll { before, add },
         });
     }
 
@@ -5674,21 +5903,93 @@ impl App {
                 depth: 0,
             }));
         }
+        // A pull request has no index to divide, so it keeps the one
+        // list loupe has always shown.
+        if !self.local {
+            self.emit_section(None, out);
+            return;
+        }
+        // Local review splits what is left in two: what `git commit`
+        // would take, then what it would leave behind. Both headings are
+        // drawn even when a section is empty — the heading is where the
+        // "move the whole section" action lives, and a section that
+        // vanished would take its own button with it.
+        // A clean tree has no sections to head. Two empty headings over
+        // nothing would say less than the empty panel does.
+        if !self.files.iter().any(|f| !f.conflicted) {
+            return;
+        }
+        for section in [StageSection::Staged, StageSection::Unstaged] {
+            let count = self
+                .files
+                .iter()
+                .filter(|f| !f.conflicted && self.section_of(&f.path) == section)
+                .count();
+            let collapsed = self.collapsed_sections.contains(&section);
+            out.push(FileEntry::StageHeading {
+                section,
+                count,
+                collapsed,
+            });
+            if !collapsed {
+                self.emit_section(Some(section), out);
+            }
+        }
+    }
+
+    /// The rows of one staging section, or of the whole change when
+    /// `section` is None (a pull request, which has no index).
+    fn emit_section(&self, section: Option<StageSection>, out: &mut Vec<FileEntry>) {
+        let keep = |src: RowSrc| {
+            let RowSrc::Changed(i) = src else {
+                return false;
+            };
+            let Some(file) = self.files.get(i) else {
+                return false;
+            };
+            if file.conflicted {
+                return false;
+            }
+            match section {
+                None => true,
+                Some(want) => self.section_of(&file.path) == want,
+            }
+        };
         if self.tree_view {
             // The tree skips conflicted files; they are already above it.
-            self.tree.emit(&self.collapsed_dirs, out);
+            self.tree.emit_where(&self.collapsed_dirs, &keep, out);
         } else {
             out.extend(
-                self.files
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, f)| !f.conflicted)
-                    .map(|(idx, _)| FileEntry::File {
+                (0..self.files.len())
+                    .filter(|i| keep(RowSrc::Changed(*i)))
+                    .map(|idx| FileEntry::File {
                         src: RowSrc::Changed(idx),
                         depth: 0,
                     }),
             );
         }
+    }
+
+    /// Which half of the panel a file belongs in.
+    ///
+    /// A partly staged file is in the index and in the working tree at
+    /// once. It is listed once, under STAGED, with the `[±]` icon that
+    /// says the rest of it is not — listing it twice would make the two
+    /// counts add up to more than the change has files.
+    pub fn section_of(&self, path: &str) -> StageSection {
+        match self.stage_state(path) {
+            StageState::Staged | StageState::Partial => StageSection::Staged,
+            StageState::Unstaged | StageState::Conflicted => StageSection::Unstaged,
+        }
+    }
+
+    /// How many files sit in one section, for the heading and for the
+    /// commands that act on a whole section.
+    pub fn section_count(&self, section: StageSection) -> usize {
+        self.files
+            .iter()
+            .filter(|f| !f.conflicted && self.section_of(&f.path) == section)
+            .count()
     }
 
     /// The whole repository. No conflict heading — a merge conflict is a
@@ -6553,6 +6854,10 @@ impl App {
                     KeyCode::Char('B') => self.toggle_blame(),
                     KeyCode::Char('F') => self.toggle_panel(),
                     KeyCode::Char('x') => self.toggle_file_mark(self.file_cursor),
+                    // The same question about the whole change: stage all
+                    // of it, or — when it is all staged already — take all
+                    // of it back out.
+                    KeyCode::Char('X') => self.toggle_stage_all(),
                     // Put changes back: the section at the cursor, or (with
                     // shift) the whole file. Both ask first.
                     KeyCode::Char('u') => self.ask_revert_section(self.diff_cursor),
@@ -7387,7 +7692,29 @@ impl App {
             }
             // The heading is a label, not a target.
             FileEntry::ConflictHeading { .. } => {}
+            FileEntry::StageHeading { section, count, .. } => {
+                // The right-hand end moves the whole section across; the
+                // rest of the row folds it away.
+                let fl = self.layout.file_list;
+                let action_from = fl.x + fl.width.saturating_sub(SECTION_ACTION_W);
+                if count > 0 && x >= action_from {
+                    match section {
+                        StageSection::Staged => self.unstage_all(),
+                        StageSection::Unstaged => self.stage_all(),
+                    }
+                } else {
+                    self.toggle_section(section);
+                }
+            }
         }
+    }
+
+    /// Fold one staging section away, or bring it back.
+    pub fn toggle_section(&mut self, section: StageSection) {
+        if !self.collapsed_sections.remove(&section) {
+            self.collapsed_sections.insert(section);
+        }
+        self.rebuild_entries();
     }
 
     /// A click on a file row that has no diff behind it: open the file.
@@ -7470,8 +7797,8 @@ impl App {
                 Some(path) => (path.to_string(), false),
                 None => return,
             },
-            // The heading names no path, so there is nothing to copy.
-            FileEntry::ConflictHeading { .. } => return,
+            // A heading names no path, so there is nothing to copy.
+            FileEntry::ConflictHeading { .. } | FileEntry::StageHeading { .. } => return,
         };
         let mut items = vec![PathMenuItem {
             key: 'r',
@@ -8060,6 +8387,32 @@ impl App {
             ));
         }
 
+        // Staging is the local reviewer's whole job, so it gets its own
+        // group rather than a line lost among the diff commands.
+        if self.local {
+            let unstaged = self.section_count(StageSection::Unstaged);
+            let staged = self.section_count(StageSection::Staged);
+            rows.push(MenuRow::Heading("STAGE"));
+            rows.push(maybe(
+                "✚  Stage this file".into(),
+                "x",
+                ButtonId::StageFile,
+                !self.files.is_empty(),
+            ));
+            rows.push(maybe(
+                format!("✚  Stage everything ({unstaged})"),
+                "X",
+                ButtonId::StageAll,
+                unstaged > 0,
+            ));
+            rows.push(maybe(
+                format!("↩  Unstage everything ({staged})"),
+                "",
+                ButtonId::UnstageAll,
+                staged > 0,
+            ));
+        }
+
         rows.push(maybe(
             "↺  Revert this section".into(),
             "u",
@@ -8420,6 +8773,9 @@ impl App {
             ButtonId::CopyContext => self.yank_context(),
             ButtonId::RevertSection => self.ask_revert_section(self.diff_cursor),
             ButtonId::RevertFile => self.ask_revert_file(self.file_cursor),
+            ButtonId::StageFile => self.toggle_file_mark(self.file_cursor),
+            ButtonId::StageAll => self.stage_all(),
+            ButtonId::UnstageAll => self.unstage_all(),
             ButtonId::ReviewBody => self.focus_review(),
             ButtonId::ReviewSubmit => self.ask_submit_review(),
             ButtonId::ReviewVerdict => {
@@ -9057,12 +9413,36 @@ impl App {
         }
     }
 
+    /// Move the file cursor one row, following what is on screen.
+    ///
+    /// The panel groups files by directory and by staging section, so the
+    /// order of `self.files` and the order of the rows are not the same
+    /// thing. Stepping through the list would send the cursor jumping
+    /// between the two sections, so the rows are what `j` and `k` walk.
     fn step_file(&mut self, delta: i32) {
         if self.files.is_empty() {
             return;
         }
-        let cur = self.file_cursor as i32 + delta;
-        let idx = cur.clamp(0, self.files.len() as i32 - 1) as usize;
+        let rows: Vec<usize> = self
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                FileEntry::File {
+                    src: RowSrc::Changed(i),
+                    ..
+                } => Some(*i),
+                _ => None,
+            })
+            .collect();
+        let idx = match rows.iter().position(|i| *i == self.file_cursor) {
+            Some(at) => rows[(at as i32 + delta).clamp(0, rows.len() as i32 - 1) as usize],
+            // The open file has no row — a folded section holds it, or
+            // the panel is showing the repository instead of the change.
+            // Fall back to the list, which is always there.
+            None => {
+                (self.file_cursor as i32 + delta).clamp(0, self.files.len() as i32 - 1) as usize
+            }
+        };
         if idx != self.file_cursor {
             self.spawn_load_file(idx);
         }
@@ -16526,6 +16906,236 @@ b2
         assert!(app.viewed.contains("test.rs"));
     }
 
+    /// A local review with three files and a repository behind it, so the
+    /// whole-index commands have an index to write to.
+    fn staging_app(dir: &std::path::Path) -> App {
+        init_repo(dir);
+        let mut app = App::new(LaunchMode::Local, None);
+        app.local = true;
+        app.checked_out = true;
+        app.screen = Screen::Review;
+        app.repo_root = dir.to_path_buf();
+        app.tree_view = false;
+        app.files = ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .map(|p| ChangedFile {
+                path: (*p).into(),
+                status: "modified".into(),
+                additions: 1,
+                deletions: 0,
+                previous: None,
+                conflicted: false,
+            })
+            .collect();
+        app.rebuild_files();
+        app
+    }
+
+    /// The paths the panel lists, in the order it lists them, with each
+    /// heading named. This is what the reader sees, so it is what the
+    /// section tests assert on.
+    fn panel_rows(app: &App) -> Vec<String> {
+        app.entries
+            .iter()
+            .map(|e| match e {
+                FileEntry::StageHeading { section, count, .. } => {
+                    format!("# {} {count}", section.title())
+                }
+                FileEntry::ConflictHeading { count } => format!("# CONFLICT {count}"),
+                FileEntry::Dir { path, .. } => format!("/ {path}"),
+                FileEntry::File { src, .. } => app.row_path(*src).unwrap_or("?").to_string(),
+            })
+            .collect()
+    }
+
+    /// The whole point of the split: staging a file moves its row out of
+    /// the bottom section and into the top one.
+    #[test]
+    fn staging_a_file_moves_it_up_into_the_staged_section() {
+        let dir = TempDir::new("stage-sections");
+        let mut app = staging_app(&dir.0);
+
+        assert_eq!(
+            panel_rows(&app),
+            ["# STAGED 0", "# UNSTAGED 3", "a.rs", "b.rs", "c.rs"],
+            "everything starts unstaged, under the bottom heading"
+        );
+
+        app.stage.insert("b.rs".into(), StageState::Staged);
+        app.rebuild_entries();
+        assert_eq!(
+            panel_rows(&app),
+            ["# STAGED 1", "b.rs", "# UNSTAGED 2", "a.rs", "c.rs"],
+            "the staged file is now above the unstaged ones"
+        );
+
+        // Partly staged counts as staged: it is in the index, and the [±]
+        // icon is what says the rest of it is not.
+        app.stage.insert("a.rs".into(), StageState::Partial);
+        app.rebuild_entries();
+        assert_eq!(
+            panel_rows(&app),
+            ["# STAGED 2", "a.rs", "b.rs", "# UNSTAGED 1", "c.rs"],
+        );
+        assert_eq!(app.staged_count(), 2, "the title agrees with the heading");
+    }
+
+    /// A folded section keeps its heading and takes its files away.
+    #[test]
+    fn folding_a_section_hides_only_its_own_files() {
+        let dir = TempDir::new("stage-fold");
+        let mut app = staging_app(&dir.0);
+        app.stage.insert("b.rs".into(), StageState::Staged);
+        app.rebuild_entries();
+
+        app.toggle_section(StageSection::Unstaged);
+        assert_eq!(
+            panel_rows(&app),
+            ["# STAGED 1", "b.rs", "# UNSTAGED 2"],
+            "the unstaged files are away, the staged one stays"
+        );
+
+        app.toggle_section(StageSection::Unstaged);
+        assert_eq!(panel_rows(&app).len(), 5, "and they come back");
+    }
+
+    /// A directory the filter emptied is dropped rather than drawn with
+    /// nothing under it.
+    #[test]
+    fn the_tree_drops_a_directory_a_section_emptied() {
+        let dir = TempDir::new("stage-tree");
+        let mut app = staging_app(&dir.0);
+        app.tree_view = true;
+        app.files = ["src/one.rs", "docs/two.md"]
+            .iter()
+            .map(|p| ChangedFile {
+                path: (*p).into(),
+                status: "modified".into(),
+                additions: 1,
+                deletions: 0,
+                previous: None,
+                conflicted: false,
+            })
+            .collect();
+        app.stage.insert("src/one.rs".into(), StageState::Staged);
+        app.rebuild_files();
+
+        assert_eq!(
+            panel_rows(&app),
+            [
+                "# STAGED 1",
+                "/ src",
+                "src/one.rs",
+                "# UNSTAGED 1",
+                "/ docs",
+                "docs/two.md",
+            ],
+            "each section draws only the directories it has files in"
+        );
+    }
+
+    /// `j` and `k` follow the rows on screen. With the sections in the way,
+    /// stepping through `files` in index order would jump between them.
+    #[test]
+    fn the_file_cursor_follows_the_rows_not_the_list() {
+        let dir = TempDir::new("stage-step");
+        let mut app = staging_app(&dir.0);
+        // a.rs and c.rs staged, b.rs not: index order is a, b, c but row
+        // order is a, c, b.
+        app.stage.insert("a.rs".into(), StageState::Staged);
+        app.stage.insert("c.rs".into(), StageState::Staged);
+        app.rebuild_entries();
+        assert_eq!(
+            panel_rows(&app),
+            ["# STAGED 2", "a.rs", "c.rs", "# UNSTAGED 1", "b.rs"]
+        );
+
+        app.file_cursor = 0;
+        app.step_file(1);
+        assert_eq!(
+            app.job.as_ref().map(|j| j.label.clone()),
+            Some("Loading c.rs".to_string()),
+            "the next row down is c.rs, not b.rs"
+        );
+    }
+
+    /// ✚ all moves every row up at once; ↩ all sends them all back down.
+    ///
+    /// The panel moves before git answers, so this is the optimistic half:
+    /// `the_whole_index_moves_at_once` is the half that checks git.
+    #[test]
+    fn the_heading_actions_move_the_whole_section() {
+        let dir = TempDir::new("stage-all");
+        let mut app = staging_app(&dir.0);
+
+        app.stage_all();
+        assert_eq!(app.section_count(StageSection::Staged), 3);
+        assert_eq!(app.section_count(StageSection::Unstaged), 0);
+        assert!(app.status.contains("Staged 3 files"), "{}", app.status);
+        assert_eq!(
+            panel_rows(&app),
+            ["# STAGED 3", "a.rs", "b.rs", "c.rs", "# UNSTAGED 0"],
+        );
+
+        app.unstage_all();
+        assert_eq!(app.section_count(StageSection::Staged), 0);
+        assert!(app.status.contains("Unstaged 3 files"), "{}", app.status);
+    }
+
+    /// The git half: `git add -A` then `git reset`, against a real index.
+    #[test]
+    fn the_whole_index_moves_at_once() {
+        let dir = TempDir::new("stage-git");
+        init_repo(&dir.0);
+        for name in ["a.rs", "b.rs"] {
+            std::fs::write(dir.0.join(name), "one\n").unwrap();
+        }
+
+        gitops::stage_all(&dir.0).unwrap();
+        let states = gitops::stage_states(&dir.0).unwrap();
+        assert_eq!(states.get("a.rs"), Some(&StageState::Staged));
+        assert_eq!(states.get("b.rs"), Some(&StageState::Staged));
+
+        // Works in a repository with no commits, which is where a bare
+        // `git reset` would fail for want of a HEAD to resolve.
+        gitops::unstage_all(&dir.0).unwrap();
+        let states = gitops::stage_states(&dir.0).unwrap();
+        assert_eq!(states.get("a.rs"), Some(&StageState::Unstaged));
+        // And the files are still on disk: unstaging never touches them.
+        assert!(dir.0.join("a.rs").exists());
+    }
+
+    /// `X` asks the whole-change question with one key: stage what is left,
+    /// or take it all back out when there is nothing left to stage.
+    #[test]
+    fn the_x_key_toggles_the_whole_change() {
+        let dir = TempDir::new("stage-x");
+        let mut app = staging_app(&dir.0);
+        app.toggle_stage_all();
+        assert_eq!(app.section_count(StageSection::Staged), 3);
+        app.toggle_stage_all();
+        assert_eq!(app.section_count(StageSection::Staged), 0);
+    }
+
+    /// Staging everything mid-merge would mark every conflict resolved
+    /// without anybody resolving one, so it is refused.
+    #[test]
+    fn stage_all_refuses_while_a_conflict_is_open() {
+        let dir = TempDir::new("stage-conflict");
+        let mut app = staging_app(&dir.0);
+        app.files.push(cf_conflicted("merge.txt"));
+        app.rebuild_files();
+
+        app.stage_all();
+        assert!(app.status_err);
+        assert!(
+            app.status.contains("Resolve the merge conflicts first"),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.section_count(StageSection::Staged), 0);
+    }
+
     /// The wheel scrolls sideways when a modifier is held (whichever one the
     /// terminal passes through) and when the terminal reports a horizontal
     /// wheel directly; a bare wheel still scrolls vertically.
@@ -17351,6 +17961,16 @@ b2
 
     /// Two changed sections in one small file, with folding off so every
     /// row is on screen: rows 0 a, 1 b→B, 2-4 context, 5 f→F1, 6 +F2, 7 g.
+    /// Row offset of the first file in the panel. Local review heads each
+    /// staging section, so a test that clicks "the first file" has to ask
+    /// rather than assume row zero.
+    fn first_file_row(app: &App) -> u16 {
+        app.entries
+            .iter()
+            .position(|e| matches!(e, FileEntry::File { .. }))
+            .expect("the panel lists at least one file") as u16
+    }
+
     fn revert_app() -> App {
         let mut app = App::new(LaunchMode::Local, None);
         app.screen = Screen::Review;
@@ -17476,10 +18096,13 @@ b2
     fn the_file_list_offers_a_whole_file_revert() {
         let mut app = revert_app();
         let fl = app.layout.file_list;
+        // Local review heads each staging section, so the first file is
+        // not the first row.
+        let row = first_file_row(&app);
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             fl.x + fl.width - 1,
-            fl.y,
+            fl.y + row,
         ));
         let Overlay::Revert(prompt) = &app.overlay else {
             panic!("expected a confirm prompt, status: {}", app.status);
