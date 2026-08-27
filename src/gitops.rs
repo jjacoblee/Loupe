@@ -67,10 +67,17 @@ pub fn merge_base(base: &str, head: &str) -> String {
         .unwrap_or_else(|_| base.to_string())
 }
 
-/// Content of `path` at `refspec`, or None if the file does not exist there.
-pub fn show_file(refspec: &str, path: &str) -> Option<String> {
+/// Content of `path` at `refspec`, or None if the file does not exist
+/// there.
+///
+/// `-C root` matters: every other path in the app is resolved against the
+/// repository root, and a `git show` that resolved against the process's
+/// own directory instead would read a different repository the moment the
+/// two ever differ.
+pub fn show_file(root: &Path, refspec: &str, path: &str) -> Option<String> {
+    let r = root.to_string_lossy().into_owned();
     let spec = format!("{refspec}:{path}");
-    run_git(&["show", &spec]).ok()
+    run_git(&["-C", &r, "show", &spec]).ok()
 }
 
 /// Full commit id of HEAD, or None (e.g. a repository with no commits yet).
@@ -673,14 +680,38 @@ pub struct Commit {
     pub when: String,
 }
 
+/// The ref the unpushed list is measured against.
+///
+/// The branch's own upstream first — that is what "not pushed yet"
+/// means. A branch that tracks nothing has never been pushed at all, so
+/// the question becomes "what is on this branch that the default branch
+/// does not have", and `origin/HEAD` names that branch.
+pub fn unpushed_base(root: &Path) -> Option<String> {
+    if let Some(t) = tracking(root) {
+        return Some(t.upstream);
+    }
+    let r = root.to_string_lossy().into_owned();
+    run_git(&["-C", &r, "rev-parse", "--abbrev-ref", "origin/HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "origin/HEAD")
+}
+
+/// Most commits the panel will list. A branch that tracks nothing and
+/// forked long ago can be thousands of commits from the default branch,
+/// and a panel that long is a panel nobody reads.
+pub const MAX_UNPUSHED: usize = 200;
+
 /// Commits on HEAD that `upstream` does not have, newest first.
 pub fn unpushed_commits(root: &Path, upstream: &str) -> Result<Vec<Commit>> {
     let r = root.to_string_lossy().into_owned();
     let range = format!("{upstream}..HEAD");
+    let cap = format!("-n{}", MAX_UNPUSHED);
     let out = run_git(&[
         "-C",
         &r,
         "log",
+        &cap,
         "--format=%H%x1f%h%x1f%s%x1f%an%x1f%cr%x1e",
         &range,
     ])?;

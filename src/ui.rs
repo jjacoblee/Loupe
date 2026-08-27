@@ -989,6 +989,12 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             format!(" Files — {} in the repo ", app.repo_paths.len())
         }
+    } else if app.panel == crate::app::PanelMode::Commits {
+        match (app.commits.len(), app.commits_base.as_deref()) {
+            (0, _) => " Commits ".to_string(),
+            (n, Some(base)) => format!(" Commits — {n} not on {base} "),
+            (n, None) => format!(" Commits — {n} "),
+        }
     } else if app.local {
         format!(" Files {viewed_n}/{n} staged ")
     } else {
@@ -1059,6 +1065,11 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                     ButtonId::PanelFiles,
                     app.panel == crate::app::PanelMode::Files,
                 ),
+                (
+                    "Commits",
+                    ButtonId::PanelCommits,
+                    app.panel == crate::app::PanelMode::Commits,
+                ),
             ],
         );
     }
@@ -1081,6 +1092,65 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                     truncate_pad(&text, inner.width as usize),
                     Style::default().fg(p.conflict).add_modifier(Modifier::BOLD),
                 )));
+            }
+            FileEntry::CommitNote(note) => {
+                lines.push(Line::from(Span::styled(
+                    truncate_pad(note, inner.width as usize),
+                    Style::default().fg(p.dim),
+                )));
+            }
+            FileEntry::CommitRow { idx, open } => {
+                let Some(c) = app.commits.get(*idx) else {
+                    continue;
+                };
+                let arrow = if *open { "▾" } else { "▸" };
+                let head = format!("{arrow} {} ", c.short);
+                // The date is worth its columns — a stack of commits is
+                // read by when as much as by what — so the subject gives
+                // way to it rather than the other way round.
+                let when = format!(" {}", c.when);
+                let sub_w =
+                    (inner.width as usize).saturating_sub(disp_width(&head) + disp_width(&when));
+                let sub = truncate_pad(&c.subject, sub_w);
+                lines.push(Line::from(vec![
+                    Span::styled(head, Style::default().fg(p.accent)),
+                    Span::styled(sub, Style::default().fg(p.text)),
+                    Span::styled(when, Style::default().fg(p.dim)),
+                ]));
+            }
+            FileEntry::CommitFileRow { commit, file } => {
+                let Some(f) = app.files_of_commit(*commit).and_then(|fs| fs.get(*file)) else {
+                    continue;
+                };
+                // The row the diff pane is showing, so a walk through a
+                // commit's files has a place mark.
+                let here = app.open_commit.as_ref().is_some_and(|c| {
+                    c.file == *file && Some(&c.oid) == app.commits.get(*commit).map(|x| &x.oid)
+                });
+                let sc = f.status_char();
+                let sc_color = match sc {
+                    'A' => p.st_added,
+                    'D' => p.st_removed,
+                    'R' | 'C' => p.st_renamed,
+                    _ => p.st_other,
+                };
+                let counts = format!(" +{} −{}", f.additions, f.deletions);
+                // Four columns of indent: two for the commit's fold arrow,
+                // two so the names line up under its subject.
+                let name_w = (inner.width as usize).saturating_sub(6 + counts.chars().count());
+                let name_t = tail_truncate(&f.path, name_w);
+                let pad = name_w.saturating_sub(disp_width(&name_t));
+                let base = if here {
+                    Style::default().bg(p.row).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("    ", base),
+                    Span::styled(format!("{sc} "), base.fg(sc_color)),
+                    Span::styled(format!("{name_t}{}", " ".repeat(pad)), base.fg(p.text)),
+                    Span::styled(counts, base.fg(p.dim)),
+                ]));
             }
             FileEntry::StageHeading {
                 section,
@@ -2111,7 +2181,7 @@ fn draw_blame(
 
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let p = palette();
-    let file = app.files.get(app.file_cursor);
+    let file = app.open_file();
     // Sideways offset is easy to lose track of — say so in the title.
     let hoff = if app.diff_hscroll > 0 {
         format!(" · ⇥ col {}", app.diff_hscroll + 1)
@@ -2130,13 +2200,26 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                 if n == 1 { "" } else { "s" }
             )
         }
-        (Some(fl), Some(d), None) => format!(
-            " {} — +{} −{}{}{hoff} ",
-            fl.path,
-            d.additions,
-            d.deletions,
-            if app.checked_out { "" } else { " · read-only" }
-        ),
+        // A file out of the Commits panel names the commit it came from:
+        // the same path can be in several of them, and the reader has to
+        // be able to tell which one is on screen.
+        (Some(fl), Some(d), None) => match &app.open_commit {
+            Some(c) => format!(
+                " {} — +{} −{} · ◷ {} {}{hoff} ",
+                fl.path,
+                d.additions,
+                d.deletions,
+                c.short,
+                tail_truncate(&c.subject, 40)
+            ),
+            None => format!(
+                " {} — +{} −{}{}{hoff} ",
+                fl.path,
+                d.additions,
+                d.deletions,
+                if app.checked_out { "" } else { " · read-only" }
+            ),
+        },
         _ => " Diff ".to_string(),
     };
     let block = Block::default()

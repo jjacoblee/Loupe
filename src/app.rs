@@ -16,7 +16,7 @@ use crate::editor::Editor;
 use crate::github::{
     self, ChangedFile, CommentSide, PrDetail, PrRef, PrSummary, ReviewComment, Verdict,
 };
-use crate::gitops::{self, MergeOp, StageState, Stash, StashScope, Tracking};
+use crate::gitops::{self, Commit, MergeOp, StageState, Stash, StashScope, Tracking};
 use crate::highlight::{self, HlLine};
 use crate::linter;
 use crate::lsp::{self, Lsp};
@@ -63,6 +63,9 @@ pub enum PanelMode {
     Changes,
     /// Every file in the repository.
     Files,
+    /// The commits on this branch the upstream does not have. Open one to
+    /// see its files; open a file to read that commit's diff.
+    Commits,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1021,9 +1024,10 @@ pub enum ButtonId {
     /// Copy the block that tells an agent what is on screen.
     CopyContext,
     ViewFlat,
-    /// The Changes/Files toggle above the file panel.
+    /// The Change/Files/Commits toggle on the file panel's bottom border.
     PanelChanges,
     PanelFiles,
+    PanelCommits,
     /// Editor commands that have no button of their own, reached from ☰.
     EditorDefinition,
     EditorHover,
@@ -1246,6 +1250,12 @@ pub const SECTION_ACTION_W: u16 = 6;
 /// out of date — a file added a minute ago simply is not listed yet.
 const REPO_LISTING_MAX_AGE: Duration = Duration::from_secs(60);
 
+/// How old the commit list may get before coming back to the Commits
+/// panel re-reads it. A commit lands when somebody runs `git commit`,
+/// which loupe never does, so the list is only ever stale by somebody
+/// else's doing.
+const COMMIT_LIST_MAX_AGE: Duration = Duration::from_secs(30);
+
 /// How many paths the file tree will hold whole before it starts reading
 /// one directory at a time instead.
 ///
@@ -1411,6 +1421,19 @@ pub enum FileEntry {
         count: usize,
         collapsed: bool,
     },
+    /// One commit in the Commits panel. `idx` indexes [`App::commits`].
+    CommitRow {
+        idx: usize,
+        open: bool,
+    },
+    /// One file inside an open commit.
+    CommitFileRow {
+        commit: usize,
+        file: usize,
+    },
+    /// What the Commits panel says when it has no commits to list: still
+    /// reading, nothing to push, or no upstream to measure against.
+    CommitNote(String),
 }
 
 /// Which half of the local file panel a heading names.
@@ -1442,6 +1465,30 @@ impl StageSection {
             StageSection::Unstaged => " ✚ all",
         }
     }
+}
+
+/// The commit whose diff the pane is showing, and which of its files.
+///
+/// It carries the commit's own labels rather than an index into
+/// [`App::commits`]: the list is re-read while a commit is open, and a
+/// title that renumbered itself under the reader would be worse than one
+/// that stayed put.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCommit {
+    pub oid: String,
+    pub short: String,
+    pub subject: String,
+    /// The commit's first parent — the old side of its diff. Empty for a
+    /// root commit, which has none, so every file in it reads as added.
+    pub parent: String,
+    /// Index into that commit's own file list.
+    pub file: usize,
+}
+
+/// What one read of the commit list came back with.
+pub(crate) struct CommitsData {
+    pub(crate) base: Option<String>,
+    pub(crate) commits: Vec<Commit>,
 }
 
 /// One directory's contents, read on a worker thread.
@@ -2079,7 +2126,7 @@ fn read_source(root: &std::path::Path, rev: Option<&str>, path: &str) -> Option<
     let from_disk =
         || gitops::safe_repo_path(root, path).and_then(|p| std::fs::read_to_string(p).ok());
     match rev {
-        Some(rev) => gitops::show_file(rev, path).or_else(from_disk),
+        Some(rev) => gitops::show_file(root, rev, path).or_else(from_disk),
         None => from_disk(),
     }
 }
@@ -2303,6 +2350,27 @@ pub struct App {
     /// Read there rather than kept fresh: a stash nobody is looking at
     /// costs nothing to not know about.
     pub stashes: Vec<Stash>,
+
+    // --- the Commits panel
+    /// The commits the upstream does not have, newest first.
+    pub commits: Vec<Commit>,
+    /// The ref the list is measured against — the branch's upstream, or
+    /// the default branch when it tracks nothing.
+    pub commits_base: Option<String>,
+    /// Files of each commit, read the first time it is opened and kept.
+    /// A commit's files never change, so nothing here goes stale.
+    pub commit_files: HashMap<String, Vec<ChangedFile>>,
+    /// Which commits are open in the panel.
+    pub open_commits: HashSet<String>,
+    /// What the panel says when it has no commits to list.
+    pub commits_note: Option<String>,
+    /// When the list was last read, so coming back to the panel does not
+    /// re-read it on every visit.
+    commits_read: Option<Instant>,
+    commits_job: Option<Receiver<Result<CommitsData>>>,
+    /// The commit file the diff pane is showing. `None` means the diff is
+    /// the change under review — the working tree, or the pull request.
+    pub open_commit: Option<OpenCommit>,
     pub entries: Vec<FileEntry>,
     /// The directory tree behind `entries`, cached so a collapse toggle
     /// emits rows without rebuilding it. See [`TreeNodes`].
@@ -2641,6 +2709,14 @@ impl App {
             collapsed_dirs: HashSet::new(),
             collapsed_sections: HashSet::new(),
             stashes: Vec::new(),
+            commits: Vec::new(),
+            commits_base: None,
+            commit_files: HashMap::new(),
+            open_commits: HashSet::new(),
+            commits_note: None,
+            commits_read: None,
+            commits_job: None,
+            open_commit: None,
             entries: Vec::new(),
             tree: TreeNodes::default(),
             repo_paths: Vec::new(),
@@ -3241,6 +3317,26 @@ impl App {
                 }
             }
         }
+        if let Some(rx) = &self.commits_job {
+            match rx.try_recv() {
+                Ok(Ok(data)) => {
+                    self.commits_job = None;
+                    self.apply_commits(data);
+                    changed = true;
+                }
+                Ok(Err(e)) => {
+                    self.commits_job = None;
+                    self.commits_note = Some(format!("Couldn't read the commit list: {e:#}"));
+                    self.rebuild_entries();
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.commits_job = None;
+                    changed = true;
+                }
+            }
+        }
         if let Some(rx) = &self.repo_job {
             match rx.try_recv() {
                 Ok(Ok(listing)) => {
@@ -3533,9 +3629,13 @@ impl App {
             Outcome::FileLoaded(data) => {
                 let d = *data;
                 // A silent refresh can reorder `files` while a load is in
-                // flight — trust the path, not the captured index.
-                self.file_cursor =
-                    if self.files.get(d.idx).map(|f| f.path.as_str()) == Some(d.path.as_str()) {
+                // flight — trust the path, not the captured index. A file
+                // out of a commit is not in `files` at all, and its own
+                // row keeps the cursor.
+                if self.open_commit.is_none() {
+                    self.file_cursor = if self.files.get(d.idx).map(|f| f.path.as_str())
+                        == Some(d.path.as_str())
+                    {
                         d.idx
                     } else {
                         self.files
@@ -3543,6 +3643,7 @@ impl App {
                             .position(|f| f.path == d.path)
                             .unwrap_or(d.idx.min(self.files.len().saturating_sub(1)))
                     };
+                }
                 self.old_content = d.old;
                 self.new_content = d.new;
                 self.old_hl = d.old_hl;
@@ -3912,23 +4013,39 @@ impl App {
 
     /// What a file load needs from the app, captured before the worker
     /// thread starts (both the modal and the quiet load use this).
-    fn file_load_ctx(&self) -> (String, String, bool, bool, PathBuf) {
-        (
-            self.merge_base.clone(),
-            self.pr
-                .as_ref()
-                .map(|p| p.head_ref_oid.clone())
-                .unwrap_or_default(),
-            self.checked_out,
-            self.local,
-            self.repo_root.clone(),
-        )
+    fn file_load_ctx(&self) -> LoadCtx {
+        match &self.open_commit {
+            // A commit is read against its own first parent, both sides
+            // from git. The copy on disk belongs to HEAD, which for every
+            // commit but the newest is a later version of the same file.
+            Some(c) => LoadCtx {
+                old_ref: c.parent.clone(),
+                new_ref: c.oid.clone(),
+                from_disk: false,
+                anchor: false,
+                root: self.repo_root.clone(),
+            },
+            None => LoadCtx {
+                old_ref: self.merge_base.clone(),
+                new_ref: self
+                    .pr
+                    .as_ref()
+                    .map(|p| p.head_ref_oid.clone())
+                    .unwrap_or_default(),
+                from_disk: self.checked_out,
+                anchor: !self.local,
+                root: self.repo_root.clone(),
+            },
+        }
     }
 
     fn spawn_load_file(&mut self, idx: usize) {
         let Some(file) = self.files.get(idx).cloned() else {
             return;
         };
+        // This file belongs to the change, not to a commit, so the diff
+        // pane stops being a commit's before opening it.
+        self.leave_open_commit();
         let ctx = self.file_load_ctx();
         self.spawn(format!("Loading {}", file.path), true, false, move || {
             load_file_data(idx, file, ctx).map(|d| Outcome::FileLoaded(Box::new(d)))
@@ -4304,6 +4421,7 @@ impl App {
             .unwrap_or_default();
         let old = self.old_content.clone();
         let local = self.local;
+        let root = self.repo_root.clone();
         self.spawn(format!("Saving {path}"), false, false, move || {
             // Re-check at write time: the file could have been swapped for a
             // symlink since the editor was opened.
@@ -4323,7 +4441,7 @@ impl App {
             let differs = if local {
                 false
             } else {
-                let head = gitops::show_file(&head_oid, &path);
+                let head = gitops::show_file(&root, &head_oid, &path);
                 head.as_deref() != Some(content.as_str())
             };
             let diff = FileDiff::compute(old.as_deref(), Some(&content));
@@ -4345,7 +4463,12 @@ impl App {
     /// commit, and there is nothing of ours on disk to undo. An open editor
     /// owns the file until it is closed, so it hides the offer too.
     pub fn can_revert(&self) -> bool {
-        self.checked_out && self.screen == Screen::Review && self.editor.is_none()
+        self.checked_out
+            // A commit already happened. Nothing in its diff is a change
+            // anybody can put back from here.
+            && self.open_commit.is_none()
+            && self.screen == Screen::Review
+            && self.editor.is_none()
     }
 
     /// Columns the change bar takes off the left of the diff pane — zero
@@ -5292,6 +5415,13 @@ impl App {
 
     /// What the icon column does: stage/unstage locally, mark viewed on a PR.
     pub fn toggle_file_mark(&mut self, idx: usize) {
+        if let Some(c) = &self.open_commit {
+            self.err(format!(
+                "{} is a commit — press F for the change to stage anything.",
+                c.short
+            ));
+            return;
+        }
         if self.local {
             self.toggle_stage(idx);
         } else {
@@ -5622,7 +5752,10 @@ impl App {
     /// The collapse set for whichever list the panel is showing.
     pub(crate) fn collapsed(&mut self) -> &mut HashSet<String> {
         match self.panel {
-            PanelMode::Changes => &mut self.collapsed_dirs,
+            // The Commits panel draws no directories, so nothing asks it
+            // this. It answers with the change's set rather than a third
+            // one nobody would ever read.
+            PanelMode::Changes | PanelMode::Commits => &mut self.collapsed_dirs,
             PanelMode::Files => &mut self.collapsed_files,
         }
     }
@@ -5630,8 +5763,21 @@ impl App {
     /// The same set, for the renderer, which only reads it.
     pub fn collapsed_set(&self) -> &HashSet<String> {
         match self.panel {
-            PanelMode::Changes => &self.collapsed_dirs,
+            PanelMode::Changes | PanelMode::Commits => &self.collapsed_dirs,
             PanelMode::Files => &self.collapsed_files,
+        }
+    }
+
+    /// The file the diff pane is showing.
+    ///
+    /// Usually the file at the cursor in the change; a file out of the
+    /// Commits panel while one of those is open. Every part of the
+    /// window that describes the diff asks this rather than `files`,
+    /// which a commit's file is not in.
+    pub fn open_file(&self) -> Option<&ChangedFile> {
+        match &self.open_commit {
+            Some(c) => self.commit_files.get(&c.oid)?.get(c.file),
+            None => self.files.get(self.file_cursor),
         }
     }
 
@@ -5654,21 +5800,170 @@ impl App {
         }
         self.panel = panel;
         self.file_scroll = 0;
-        if panel == PanelMode::Files {
-            self.refresh_repo_listing_if_stale();
-            self.ok("Files — every file in the repository. F goes back to the change.");
-        } else {
-            self.ok("Back to the files this change touches.");
-            self.ensure_file_visible();
+        match panel {
+            PanelMode::Files => {
+                self.refresh_repo_listing_if_stale();
+                self.ok("Files — every file in the repository. F goes back to the change.");
+            }
+            PanelMode::Commits => {
+                self.refresh_commits_if_stale();
+                self.ok("Commits — what this branch has that the upstream does not.");
+            }
+            PanelMode::Changes => {
+                self.ok("Back to the files this change touches.");
+                self.ensure_file_visible();
+            }
         }
         self.rebuild_entries();
     }
 
+    /// `F` walks the three panels in the order the toggle row draws them.
     pub fn toggle_panel(&mut self) {
         self.set_panel(match self.panel {
             PanelMode::Changes => PanelMode::Files,
-            PanelMode::Files => PanelMode::Changes,
+            PanelMode::Files => PanelMode::Commits,
+            PanelMode::Commits => PanelMode::Changes,
         });
+    }
+
+    // ----------------------------------------------------- the commits
+
+    /// Read the commit list again if it has gone stale.
+    ///
+    /// A commit lands when somebody runs `git commit`, which loupe never
+    /// does, so the list is re-read when the reader comes back to the
+    /// panel rather than on a timer.
+    fn refresh_commits_if_stale(&mut self) {
+        if self.commits_job.is_some() {
+            return;
+        }
+        let stale = match self.commits_read {
+            None => true,
+            Some(at) => at.elapsed() >= COMMIT_LIST_MAX_AGE,
+        };
+        if stale {
+            self.spawn_commits();
+        }
+    }
+
+    /// Read the unpushed commits on a worker thread.
+    pub fn spawn_commits(&mut self) {
+        let root = self.repo_root.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send((|| {
+                let base = gitops::unpushed_base(&root);
+                let commits = match &base {
+                    Some(b) => gitops::unpushed_commits(&root, b)?,
+                    None => Vec::new(),
+                };
+                Ok(CommitsData { base, commits })
+            })());
+        });
+        self.commits_job = Some(rx);
+    }
+
+    /// The list arrived. Commits already opened stay open, so a refresh
+    /// does not fold the panel up under the reader.
+    pub(crate) fn apply_commits(&mut self, data: CommitsData) {
+        self.commits_base = data.base;
+        self.commits = data.commits;
+        self.commits_read = Some(Instant::now());
+        self.commits_note = if self.commits_base.is_none() {
+            Some("No upstream to compare against — push the branch once, or set one with `git branch -u`.".into())
+        } else if self.commits.is_empty() {
+            Some(format!(
+                "Nothing to push — level with {}.",
+                self.commits_base.as_deref().unwrap_or("the upstream")
+            ))
+        } else {
+            None
+        };
+        // A commit that is no longer in the list cannot stay open.
+        let live: HashSet<String> = self.commits.iter().map(|c| c.oid.clone()).collect();
+        self.open_commits.retain(|oid| live.contains(oid));
+        if self.panel == PanelMode::Commits {
+            self.rebuild_entries();
+        }
+    }
+
+    /// Open or close one commit in the panel.
+    ///
+    /// Its file list is read here, once, and kept: a commit's files never
+    /// change, so nothing cached about one goes stale. `git show
+    /// --name-status` on a single commit is one process and a few
+    /// milliseconds, which is cheap enough to pay for on the click that
+    /// asks for it.
+    pub fn toggle_commit(&mut self, idx: usize) {
+        let Some(commit) = self.commits.get(idx).cloned() else {
+            return;
+        };
+        if self.open_commits.remove(&commit.oid) {
+            self.rebuild_entries();
+            return;
+        }
+        if !self.commit_files.contains_key(&commit.oid) {
+            match gitops::commit_files(&self.repo_root, &commit.oid) {
+                Ok(files) => {
+                    self.commit_files.insert(commit.oid.clone(), files);
+                }
+                Err(e) => {
+                    self.err(format!("Couldn't read {}: {e:#}", commit.short));
+                    return;
+                }
+            }
+        }
+        let n = self.commit_files.get(&commit.oid).map_or(0, Vec::len);
+        self.open_commits.insert(commit.oid.clone());
+        self.ok(format!(
+            "{} {} — {n} file{}.",
+            commit.short,
+            commit.subject,
+            if n == 1 { "" } else { "s" }
+        ));
+        self.rebuild_entries();
+    }
+
+    /// Read one file of one commit into the diff pane.
+    ///
+    /// The diff is the commit against its own first parent, both sides
+    /// read from git. The copy on disk belongs to HEAD, which for every
+    /// commit but the newest is a later version of the same file.
+    pub fn open_commit_file(&mut self, idx: usize, file: usize) {
+        let Some(commit) = self.commits.get(idx).cloned() else {
+            return;
+        };
+        let Some(cf) = self
+            .commit_files
+            .get(&commit.oid)
+            .and_then(|fs| fs.get(file))
+            .cloned()
+        else {
+            return;
+        };
+        self.open_commit = Some(OpenCommit {
+            oid: commit.oid.clone(),
+            short: commit.short.clone(),
+            subject: commit.subject.clone(),
+            parent: gitops::first_parent(&self.repo_root, &commit.oid).unwrap_or_default(),
+            file,
+        });
+        // The blame pane numbers lines in the working-tree file, which for
+        // every commit but the newest is a later version of this one.
+        self.clear_blame();
+        let ctx = self.file_load_ctx();
+        let label = format!("Loading {} at {}", cf.path, commit.short);
+        self.spawn(label, true, false, move || {
+            load_file_data(file, cf, ctx).map(|d| Outcome::FileLoaded(Box::new(d)))
+        });
+    }
+
+    /// Leave the commit the diff pane is showing.
+    ///
+    /// The commit carries its own two refs, so nothing about the review
+    /// had to move aside for it and nothing has to be put back.
+    fn leave_open_commit(&mut self) {
+        self.open_commit = None;
     }
 
     /// Re-read the repository if the listing has gone stale.
@@ -5899,6 +6194,7 @@ impl App {
         match self.panel {
             PanelMode::Changes => self.emit_changes(&mut out),
             PanelMode::Files => self.emit_files(&mut out),
+            PanelMode::Commits => self.emit_commits(&mut out),
         }
         self.entries = out;
         let max = self.entries.len().saturating_sub(1);
@@ -6021,6 +6317,35 @@ impl App {
             .iter()
             .filter(|f| !f.conflicted && self.section_of(&f.path) == section)
             .count()
+    }
+
+    /// The commits the upstream does not have, each openable to its files.
+    fn emit_commits(&self, out: &mut Vec<FileEntry>) {
+        if self.commits.is_empty() {
+            let note = self
+                .commits_note
+                .clone()
+                .unwrap_or_else(|| "Reading the commit list…".to_string());
+            out.push(FileEntry::CommitNote(note));
+            return;
+        }
+        for (idx, c) in self.commits.iter().enumerate() {
+            let open = self.open_commits.contains(&c.oid);
+            out.push(FileEntry::CommitRow { idx, open });
+            if !open {
+                continue;
+            }
+            let Some(files) = self.commit_files.get(&c.oid) else {
+                continue;
+            };
+            out.extend((0..files.len()).map(|file| FileEntry::CommitFileRow { commit: idx, file }));
+        }
+    }
+
+    /// The files one commit changed, once it has been opened.
+    pub fn files_of_commit(&self, idx: usize) -> Option<&[ChangedFile]> {
+        let oid = &self.commits.get(idx)?.oid;
+        self.commit_files.get(oid).map(Vec::as_slice)
     }
 
     /// The whole repository. No conflict heading — a merge conflict is a
@@ -7727,6 +8052,10 @@ impl App {
             }
             // The heading is a label, not a target.
             FileEntry::ConflictHeading { .. } => {}
+            FileEntry::CommitRow { idx, .. } => self.toggle_commit(idx),
+            FileEntry::CommitFileRow { commit, file } => self.open_commit_file(commit, file),
+            // A note is a sentence, not a target.
+            FileEntry::CommitNote(_) => {}
             FileEntry::StageHeading { section, count, .. } => {
                 // The right-hand end moves the whole section across; the
                 // rest of the row folds it away.
@@ -7833,7 +8162,16 @@ impl App {
                 None => return,
             },
             // A heading names no path, so there is nothing to copy.
-            FileEntry::ConflictHeading { .. } | FileEntry::StageHeading { .. } => return,
+            FileEntry::ConflictHeading { .. }
+            | FileEntry::StageHeading { .. }
+            | FileEntry::CommitRow { .. }
+            | FileEntry::CommitNote(_) => return,
+            FileEntry::CommitFileRow { commit, file } => {
+                match self.files_of_commit(*commit).and_then(|fs| fs.get(*file)) {
+                    Some(f) => (f.path.clone(), false),
+                    None => return,
+                }
+            }
         };
         let mut items = vec![PathMenuItem {
             key: 'r',
@@ -8352,6 +8690,12 @@ impl App {
             "F",
             ButtonId::PanelFiles,
             self.panel == PanelMode::Files,
+        ));
+        rows.push(switch(
+            "◷  Commits not pushed yet".into(),
+            "F",
+            ButtonId::PanelCommits,
+            self.panel == PanelMode::Commits,
         ));
         rows.push(switch(
             "👤 Blame column".into(),
@@ -8982,6 +9326,7 @@ impl App {
             ButtonId::BufferPrev => self.step_buffer(-1),
             ButtonId::PanelChanges => self.set_panel(PanelMode::Changes),
             ButtonId::PanelFiles => self.set_panel(PanelMode::Files),
+            ButtonId::PanelCommits => self.set_panel(PanelMode::Commits),
             ButtonId::ViewTree => self.set_tree_view(true),
             ButtonId::ViewFlat => self.set_tree_view(false),
             ButtonId::TreeToggle => self.set_tree_view(!self.tree_view),
@@ -11373,8 +11718,7 @@ impl App {
         match &self.editor {
             Some(ed) => markdown::is_markdown(&ed.path),
             None => self
-                .files
-                .get(self.file_cursor)
+                .open_file()
                 .is_some_and(|f| markdown::is_markdown(&f.path) && f.status != "removed"),
         }
     }
@@ -12169,6 +12513,13 @@ impl App {
     }
 
     pub fn open_editor(&mut self, jump_line: Option<usize>) {
+        if let Some(c) = &self.open_commit {
+            self.err(format!(
+                "{} is a commit — the file on disk is a later version of it.",
+                c.short
+            ));
+            return;
+        }
         if !self.checked_out {
             self.err("Editing needs the PR branch checked out — reopen the PR and pick “Checkout & review”.");
             return;
@@ -12888,6 +13239,12 @@ impl App {
     /// Reload one file in place — same work as [`Self::spawn_load_file`],
     /// but non-modal, and applied without touching the scroll position.
     fn spawn_quiet_file(&mut self, idx: usize, auto: bool) {
+        // The pane is showing a commit, not the change. A commit's diff
+        // cannot go stale, and replacing it with a working-tree one would
+        // take the reader somewhere they did not ask to go.
+        if self.open_commit.is_some() {
+            return;
+        }
         let Some(file) = self.files.get(idx).cloned() else {
             return;
         };
@@ -13091,8 +13448,8 @@ fn read_external(
         Some(text) => (text, false),
         None => {
             let from_commit = match rev {
-                Some(rev) => gitops::show_file(rev, path),
-                None => gitops::head_oid().and_then(|oid| gitops::show_file(&oid, path)),
+                Some(rev) => gitops::show_file(root, rev, path),
+                None => gitops::head_oid().and_then(|oid| gitops::show_file(root, &oid, path)),
             };
             match from_commit {
                 Some(text) => (text, true),
@@ -13132,11 +13489,35 @@ fn scan_local(root: &Path) -> Result<LocalOpenedData> {
     })
 }
 
-fn load_file_data(
-    idx: usize,
-    file: ChangedFile,
-    (merge_base, head_oid, checked_out, local, root): (String, String, bool, bool, PathBuf),
-) -> Result<FileLoadedData> {
+/// The two refs a file's diff is read between, and where the new side
+/// comes from.
+///
+/// Three reviews use it: a pull request (base…head, the working tree when
+/// it is checked out), local changes (HEAD…the working tree), and one
+/// commit out of the Commits panel (its parent…itself).
+#[derive(Clone)]
+pub struct LoadCtx {
+    /// Old side of the diff. Empty means there is none, and every file
+    /// reads as added.
+    old_ref: String,
+    /// New side, when it is a commit rather than the working tree.
+    new_ref: String,
+    /// Read the new side from disk instead of from `new_ref`.
+    from_disk: bool,
+    /// Also read the copy at `new_ref`, which is what an inline comment
+    /// anchors its line numbers to. Only a pull request has comments.
+    anchor: bool,
+    root: PathBuf,
+}
+
+fn load_file_data(idx: usize, file: ChangedFile, ctx: LoadCtx) -> Result<FileLoadedData> {
+    let LoadCtx {
+        old_ref: merge_base,
+        new_ref,
+        from_disk,
+        anchor,
+        root,
+    } = ctx;
     // A conflicted file is a different question, so it gets a different
     // answer: our version against their version, with the marker lines
     // taken out. Diffing the working tree against HEAD would instead show
@@ -13150,27 +13531,34 @@ fn load_file_data(
     let old = if file.status == "added" || merge_base.is_empty() {
         None
     } else {
-        gitops::show_file(&merge_base, file.old_path())
+        gitops::show_file(&root, &merge_base, file.old_path())
     };
-    // The PR-head copy only matters for comment anchoring — local
-    // review has no PR to comment on, so skip the lookup.
-    let head_content = if local || file.status == "removed" {
+    // The copy at `new_ref` only matters for comment anchoring — local
+    // review has no PR to comment on, and a commit's diff is already the
+    // copy at that ref, so both skip the lookup.
+    let head_content = if !anchor || file.status == "removed" {
         None
     } else {
-        gitops::show_file(&head_oid, &file.path)
+        gitops::show_file(&root, &new_ref, &file.path)
     };
     let new = if file.status == "removed" {
         None
-    } else if checked_out {
+    } else if from_disk {
         // safe_repo_path rejects API paths that could resolve outside
         // the repository (absolute, `..`, …).
         gitops::safe_repo_path(&root, &file.path)
             .and_then(|p| std::fs::read_to_string(p).ok())
             .or_else(|| head_content.clone())
+    } else if new_ref.is_empty() {
+        None
     } else {
-        head_content.clone()
+        // Not on disk and not anchored: a commit, whose new side is the
+        // file as that commit left it.
+        head_content
+            .clone()
+            .or_else(|| gitops::show_file(&root, &new_ref, &file.path))
     };
-    let differs = if local {
+    let differs = if !anchor {
         false
     } else {
         match (&new, &head_content) {
@@ -17220,6 +17608,17 @@ b2
                 FileEntry::ConflictHeading { count } => format!("# CONFLICT {count}"),
                 FileEntry::Dir { path, .. } => format!("/ {path}"),
                 FileEntry::File { src, .. } => app.row_path(*src).unwrap_or("?").to_string(),
+                FileEntry::CommitRow { idx, open } => {
+                    let arrow = if *open { "▾" } else { "▸" };
+                    let c = &app.commits[*idx];
+                    format!("{arrow} {} {}", c.short, c.subject)
+                }
+                FileEntry::CommitFileRow { commit, file } => app
+                    .files_of_commit(*commit)
+                    .and_then(|fs| fs.get(*file))
+                    .map(|f| format!("    {}", f.path))
+                    .unwrap_or_else(|| "    ?".into()),
+                FileEntry::CommitNote(note) => format!("… {note}"),
             })
             .collect()
     }
@@ -17410,6 +17809,172 @@ b2
             app.status
         );
         assert_eq!(app.section_count(StageSection::Staged), 0);
+    }
+
+    // ----------------------------------------------------- the commits
+
+    /// A repository with three commits, the first of them standing in for
+    /// the upstream, and an app looking at it in local review.
+    fn commits_app(dir: &std::path::Path) -> (App, String) {
+        init_repo(dir);
+        let d = dir.to_string_lossy().into_owned();
+        let commit = |name: &str, body: &str, message: &str| {
+            std::fs::write(dir.join(name), body).unwrap();
+            gitops::run_git(&["-C", &d, "add", "-A"]).unwrap();
+            gitops::run_git(&["-C", &d, "commit", "-q", "-m", message]).unwrap();
+        };
+        commit("a.txt", "one\n", "first");
+        let base = gitops::run_git(&["-C", &d, "rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        commit("a.txt", "two\n", "second");
+        commit("b.txt", "new\n", "third");
+
+        let mut app = App::new(LaunchMode::Local, None);
+        app.local = true;
+        app.checked_out = true;
+        app.screen = Screen::Review;
+        app.repo_root = dir.to_path_buf();
+        (app, base)
+    }
+
+    /// Read the commit list the way the panel does, and wait for it.
+    fn load_commits(app: &mut App, base: &str) {
+        let commits = gitops::unpushed_commits(&app.repo_root, base).unwrap();
+        app.apply_commits(CommitsData {
+            base: Some(base.to_string()),
+            commits,
+        });
+    }
+
+    /// The panel lists what the upstream does not have, newest first, and
+    /// each commit opens to its own files.
+    #[test]
+    fn the_commits_panel_opens_a_commit_to_its_files() {
+        let dir = TempDir::new("commits-open");
+        let (mut app, base) = commits_app(&dir.0);
+        app.set_panel(PanelMode::Commits);
+        load_commits(&mut app, &base);
+
+        let rows = panel_rows(&app);
+        assert_eq!(rows.len(), 2, "two commits since the base: {rows:?}");
+        assert!(rows[0].starts_with('▸') && rows[0].ends_with("third"));
+        assert!(rows[1].ends_with("second"));
+
+        // Opening one reads its files and lists them under it.
+        app.toggle_commit(0);
+        let rows = panel_rows(&app);
+        assert_eq!(
+            rows.len(),
+            3,
+            "the newest commit's one file is under it: {rows:?}"
+        );
+        assert!(rows[0].starts_with('▾'));
+        assert_eq!(rows[1], "    b.txt");
+        assert!(rows[2].ends_with("second"), "the next commit follows it");
+
+        // And closing it takes it away again.
+        app.toggle_commit(0);
+        assert_eq!(panel_rows(&app).len(), 2);
+    }
+
+    /// A file out of the panel is read against the commit's own first
+    /// parent, not against the working tree — the copy on disk is a later
+    /// version of the same file.
+    #[test]
+    fn a_commit_file_diffs_against_its_parent() {
+        let dir = TempDir::new("commits-diff");
+        let (mut app, base) = commits_app(&dir.0);
+        app.set_panel(PanelMode::Commits);
+        load_commits(&mut app, &base);
+        app.toggle_commit(1);
+        app.open_commit_file(1, 0);
+
+        // The load runs on its own thread; wait for it the way the app
+        // does.
+        for _ in 0..200 {
+            app.poll_jobs();
+            if app.job.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.job.is_none(), "the load finished: {}", app.status);
+
+        let oc = app.open_commit.as_ref().expect("a commit is open");
+        assert_eq!(oc.file, 0);
+        assert!(!oc.parent.is_empty(), "it knows its own old side");
+        assert_eq!(app.open_file().map(|f| f.path.as_str()), Some("a.txt"));
+        assert_eq!(app.old_content.as_deref(), Some("one\n"));
+        assert_eq!(
+            app.new_content.as_deref(),
+            Some("two\n"),
+            "the new side is the file as that commit left it"
+        );
+
+        // Nothing here is a change anyone can put back or edit.
+        assert!(!app.can_revert());
+        app.open_editor(None);
+        assert!(app.status_err);
+        assert!(app.status.contains("is a commit"), "{}", app.status);
+
+        // Back to the change: the pane stops being a commit's.
+        app.set_panel(PanelMode::Changes);
+        app.files = vec![ChangedFile {
+            path: "a.txt".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            previous: None,
+            conflicted: false,
+        }];
+        app.rebuild_files();
+        app.spawn_load_file(0);
+        assert!(app.open_commit.is_none());
+    }
+
+    /// A branch with no upstream has nothing to measure against, and the
+    /// panel says so rather than showing an empty list.
+    #[test]
+    fn the_commits_panel_says_why_it_is_empty() {
+        let dir = TempDir::new("commits-empty");
+        let (mut app, base) = commits_app(&dir.0);
+        app.set_panel(PanelMode::Commits);
+
+        app.apply_commits(CommitsData {
+            base: None,
+            commits: Vec::new(),
+        });
+        let rows = panel_rows(&app);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("No upstream"), "{rows:?}");
+
+        // Level with the upstream is a different sentence.
+        app.apply_commits(CommitsData {
+            base: Some("origin/main".into()),
+            commits: Vec::new(),
+        });
+        assert!(panel_rows(&app)[0].contains("Nothing to push"));
+
+        // And a real list clears it.
+        load_commits(&mut app, &base);
+        assert!(app.commits_note.is_none());
+        assert_eq!(panel_rows(&app).len(), 2);
+    }
+
+    /// F walks the three panels and comes back round.
+    #[test]
+    fn the_panel_key_walks_all_three() {
+        let dir = TempDir::new("commits-toggle");
+        let (mut app, _) = commits_app(&dir.0);
+        assert_eq!(app.panel, PanelMode::Changes);
+        app.toggle_panel();
+        assert_eq!(app.panel, PanelMode::Files);
+        app.toggle_panel();
+        assert_eq!(app.panel, PanelMode::Commits);
+        app.toggle_panel();
+        assert_eq!(app.panel, PanelMode::Changes);
     }
 
     // ------------------------------------------------------------- stash
