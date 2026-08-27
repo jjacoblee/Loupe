@@ -3743,7 +3743,7 @@ mod tests {
             changed("src/merge.rs", true),
             changed("src/other.rs", false),
         ];
-        app.rebuild_entries();
+        app.rebuild_files();
 
         let text = "keep\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nkeep2\n";
         let parsed = crate::conflict::Conflicted::parse(text).unwrap();
@@ -3789,7 +3789,7 @@ mod tests {
         app.local = true;
         app.checked_out = true;
         app.files = vec![changed("merge.rs", true)];
-        app.rebuild_entries();
+        app.rebuild_files();
         let text = "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\n";
         let parsed = crate::conflict::Conflicted::parse(text).unwrap();
         let sides = parsed.sides();
@@ -3865,7 +3865,7 @@ mod tests {
             url: String::new(),
         });
         app.files = vec![changed("src/a.rs", false), changed("src/b.rs", false)];
-        app.rebuild_entries();
+        app.rebuild_files();
         let (old, new) = ("one\ntwo\nthree\n", "one\nTWO\nthree\n");
         app.old_content = Some(old.into());
         app.new_content = Some(new.into());
@@ -4062,7 +4062,7 @@ mod tests {
         app.local = true;
         app.repo_root = "/repo".into();
         app.files = vec![changed("src/app.rs", false)];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.pins
             .add(crate::pins::Pin::new(
                 std::path::Path::new("/repo"),
@@ -4186,7 +4186,7 @@ mod tests {
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.preview = Some(crate::preview::Preview::new(
             "PLAN.md",
             "/repo/PLAN.md".into(),
@@ -4227,7 +4227,7 @@ mod tests {
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         let old = "fn main() {\n    let x = 1;\n}\n";
         let new = "fn main() {\n    let x = 42; // changed\n    let s = \"txt\";\n}\n";
         app.old_hl = highlight::highlight("test.rs", old);
@@ -4524,7 +4524,7 @@ mod tests {
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         // A line far wider than the pane: "0123456789" repeated.
         let long = "0123456789".repeat(30);
         app.diff = Some(FileDiff::compute(Some("old\n"), Some(&format!("{long}\n"))));
@@ -4672,7 +4672,7 @@ mod tests {
                 conflicted: false,
             })
             .collect();
-        app.rebuild_entries();
+        app.rebuild_files();
         app.stage.insert("a.rs".into(), StageState::Unstaged);
         app.stage.insert("b.rs".into(), StageState::Partial);
         app.stage.insert("c.rs".into(), StageState::Staged);
@@ -4760,7 +4760,7 @@ mod tests {
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
         app.rebuild_display();
 
@@ -4820,7 +4820,7 @@ mod tests {
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
         app.rebuild_display();
 
@@ -4867,7 +4867,7 @@ mod tests {
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
         app.rebuild_display();
 
@@ -4914,7 +4914,7 @@ mod tests {
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
         app.rebuild_display();
 
@@ -5000,7 +5000,7 @@ mod tests {
                 conflicted: false,
             },
         ];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
         app.rebuild_display();
         app.open_finder(crate::app::FinderMode::Files);
@@ -5038,7 +5038,7 @@ mod tests {
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         let old = "let alpha = 1;\n";
         let new = "let alpha = 2;\n";
         app.diff = Some(FileDiff::compute(Some(old), Some(new)));
@@ -5085,7 +5085,7 @@ mod tests {
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         let menu = || {
             Box::new(crate::app::PathMenu {
                 path: "src/app.rs".into(),
@@ -5158,7 +5158,7 @@ mod tests {
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
         app.rebuild_display();
 
@@ -5198,7 +5198,7 @@ mod tests {
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.diff = Some(FileDiff::compute(Some("a\n"), Some("b\n")));
         app.rebuild_display();
 
@@ -5231,7 +5231,7 @@ mod tests {
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         let old = "const alpha = 1;\nconst beta = 2;\n";
         let new = "const alpha = 1;\nconst BETA = 2;\n";
         app.old_content = Some(old.into());

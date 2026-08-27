@@ -1211,67 +1211,103 @@ pub enum FileEntry {
     ConflictHeading { count: usize },
 }
 
-fn build_tree_entries(files: &[ChangedFile], collapsed: &HashSet<String>) -> Vec<FileEntry> {
-    #[derive(Default)]
-    struct Node {
-        dirs: BTreeMap<String, Node>,
-        files: Vec<(String, usize)>,
-    }
-    let mut root = Node::default();
-    for (i, f) in files.iter().enumerate() {
-        // Conflicted files are listed above the tree, not inside it (see
-        // `App::rebuild_entries`), so the tree never shows them twice.
-        if f.conflicted {
-            continue;
-        }
-        let mut parts: Vec<&str> = f.path.split('/').collect();
-        let base = parts.pop().unwrap_or("").to_string();
-        let mut node = &mut root;
-        for p in parts {
-            node = node.dirs.entry(p.to_string()).or_default();
-        }
-        node.files.push((base, i));
-    }
-    fn emit(
-        node: &Node,
-        prefix: &str,
-        depth: u16,
-        collapsed: &HashSet<String>,
-        out: &mut Vec<FileEntry>,
-    ) {
-        for (name, child) in &node.dirs {
-            // Compress chains of single-subdir folders with no files.
-            let mut label = name.clone();
-            let mut cur = child;
-            while cur.files.is_empty() && cur.dirs.len() == 1 {
-                let (n2, c2) = cur.dirs.iter().next().expect("len checked");
-                label.push('/');
-                label.push_str(n2);
-                cur = c2;
+/// The changeset's directory tree, built once per file list.
+///
+/// Building this is the expensive half of the file panel and emitting the
+/// rows is the cheap half — on a 400,000-path tree the build costs 48 ms
+/// and the emit costs about a microsecond. A collapse toggle only changes
+/// which rows are visible, so it must never pay for the build. Hence the
+/// split: [`TreeNodes::build`] runs when `App::files` changes, and
+/// [`TreeNodes::emit`] runs on every toggle.
+#[derive(Default)]
+pub struct TreeNodes {
+    root: Node,
+    /// How many files this was built from. `rebuild_entries` asserts
+    /// against it in debug builds, so a new path that changes the file
+    /// list without rebuilding the tree fails a test rather than
+    /// quietly drawing the previous change's rows.
+    built_from: usize,
+}
+
+#[derive(Default)]
+struct Node {
+    dirs: BTreeMap<String, Node>,
+    /// (base name, index into `App::files`), sorted at build time. Sorting
+    /// here rather than in `emit` is what lets `emit` borrow the vector
+    /// instead of cloning it once per directory.
+    files: Vec<(String, usize)>,
+}
+
+impl TreeNodes {
+    fn build(files: &[ChangedFile]) -> TreeNodes {
+        let mut root = Node::default();
+        for (i, f) in files.iter().enumerate() {
+            // Conflicted files are listed above the tree, not inside it
+            // (see `App::rebuild_entries`), so the tree never shows them
+            // twice.
+            if f.conflicted {
+                continue;
             }
-            let path = if prefix.is_empty() {
-                label.clone()
-            } else {
-                format!("{prefix}/{label}")
-            };
-            out.push(FileEntry::Dir {
-                label,
-                path: path.clone(),
-                depth,
-            });
-            if !collapsed.contains(&path) {
-                emit(cur, &path, depth + 1, collapsed, out);
+            let mut parts: Vec<&str> = f.path.split('/').collect();
+            let base = parts.pop().unwrap_or("").to_string();
+            let mut node = &mut root;
+            for p in parts {
+                node = node.dirs.entry(p.to_string()).or_default();
+            }
+            node.files.push((base, i));
+        }
+        fn sort(node: &mut Node) {
+            node.files.sort();
+            for child in node.dirs.values_mut() {
+                sort(child);
             }
         }
-        let mut fs = node.files.clone();
-        fs.sort();
-        for (_, idx) in fs {
-            out.push(FileEntry::File { idx, depth });
+        sort(&mut root);
+        TreeNodes {
+            root,
+            built_from: files.len(),
         }
     }
-    let mut out = Vec::new();
-    emit(&root, "", 0, collapsed, &mut out);
-    out
+
+    fn emit(&self, collapsed: &HashSet<String>, out: &mut Vec<FileEntry>) {
+        walk(&self.root, "", 0, collapsed, out);
+    }
+}
+
+fn walk(
+    node: &Node,
+    prefix: &str,
+    depth: u16,
+    collapsed: &HashSet<String>,
+    out: &mut Vec<FileEntry>,
+) {
+    for (name, child) in &node.dirs {
+        // Compress chains of single-subdir folders with no files.
+        let mut label = name.clone();
+        let mut cur = child;
+        while cur.files.is_empty() && cur.dirs.len() == 1 {
+            let (n2, c2) = cur.dirs.iter().next().expect("len checked");
+            label.push('/');
+            label.push_str(n2);
+            cur = c2;
+        }
+        let path = if prefix.is_empty() {
+            label.clone()
+        } else {
+            format!("{prefix}/{label}")
+        };
+        out.push(FileEntry::Dir {
+            label,
+            path: path.clone(),
+            depth,
+        });
+        if !collapsed.contains(&path) {
+            walk(cur, &path, depth + 1, collapsed, out);
+        }
+    }
+    for (_, idx) in &node.files {
+        out.push(FileEntry::File { idx: *idx, depth });
+    }
 }
 
 // ------------------------------------------------------------------ jobs
@@ -1697,6 +1733,9 @@ pub struct App {
     pub tree_view: bool,
     pub collapsed_dirs: HashSet<String>,
     pub entries: Vec<FileEntry>,
+    /// The directory tree behind `entries`, cached so a collapse toggle
+    /// emits rows without rebuilding it. See [`TreeNodes`].
+    tree: TreeNodes,
     /// Width of the file panel in columns; dragged by the divider, seeded
     /// from the `file_panel_width` config key.
     pub file_panel_w: u16,
@@ -1932,6 +1971,7 @@ impl App {
             tree_view: true,
             collapsed_dirs: HashSet::new(),
             entries: Vec::new(),
+            tree: TreeNodes::default(),
             file_panel_w: FILE_PANEL_DEFAULT,
             dragging: Dragging::None,
             diff: None,
@@ -2430,7 +2470,7 @@ impl App {
                 self.selection = None;
                 self.editor = None;
                 self.collapsed_dirs.clear();
-                self.rebuild_entries();
+                self.rebuild_files();
                 if self.files.is_empty() {
                     self.diff = None;
                     self.display.clear();
@@ -2510,7 +2550,7 @@ impl App {
                 self.selection = None;
                 self.editor = None;
                 self.collapsed_dirs.clear();
-                self.rebuild_entries();
+                self.rebuild_files();
                 if self.files.is_empty() {
                     self.diff = None;
                     self.display.clear();
@@ -4424,7 +4464,26 @@ impl App {
 
     // ------------------------------------------------------- derived state
 
+    /// The file list changed: rebuild the directory tree, then the rows.
+    ///
+    /// Every path that assigns `self.files` ends here. Use
+    /// [`Self::rebuild_entries`] when only the view changed — a collapse,
+    /// or the tree/flat toggle — because that keeps the tree.
+    pub fn rebuild_files(&mut self) {
+        self.tree = TreeNodes::build(&self.files);
+        self.rebuild_entries();
+    }
+
+    /// The view changed: emit the rows from the cached tree.
+    ///
+    /// This is on the click path for every collapse and expand, so it must
+    /// stay free of the tree build. See [`TreeNodes`].
     pub fn rebuild_entries(&mut self) {
+        debug_assert_eq!(
+            self.tree.built_from,
+            self.files.len(),
+            "the cached tree is stale — call rebuild_files() after changing self.files"
+        );
         // Conflicted files come first under their own heading, in the flat
         // view and the tree alike. `local_changes` already sorts them to
         // the front of `files`, so they are contiguous here.
@@ -4447,7 +4506,7 @@ impl App {
         }
         if self.tree_view {
             // The tree skips conflicted files; they are already above it.
-            out.extend(build_tree_entries(&self.files, &self.collapsed_dirs));
+            self.tree.emit(&self.collapsed_dirs, &mut out);
         } else {
             out.extend(
                 self.files
@@ -9467,7 +9526,7 @@ impl App {
         self.pending_g = false;
         self.editor = None;
         self.screen = Screen::Review;
-        self.rebuild_entries();
+        self.rebuild_files();
         self.rebuild_display();
         // The view mode is shared between the sides, so a stored position
         // can be out of range if it changed while stashed — clamp.
@@ -9621,7 +9680,7 @@ impl App {
                 self.files = d.files;
                 self.viewed = d.viewed;
                 self.retarget_file_cursor(cur);
-                self.rebuild_entries();
+                self.rebuild_files();
                 self.reveal_current_file();
                 if self.files.is_empty() {
                     self.diff = None;
@@ -9667,7 +9726,7 @@ impl App {
                 let files = &self.files;
                 self.viewed.retain(|p| files.iter().any(|f| &f.path == p));
                 self.retarget_file_cursor(cur);
-                self.rebuild_entries();
+                self.rebuild_files();
                 self.reveal_current_file();
                 if self.files.is_empty() {
                     self.diff = None;
@@ -9890,7 +9949,7 @@ mod tests {
         app.repo = Some("acme/tool".into());
         app.pr = Some(pr_detail(7));
         app.files = vec![cf("src/a.rs")];
-        app.rebuild_entries();
+        app.rebuild_files();
         let old = "one\ntwo\nthree\nfour\n";
         let new = "one\nTWO\nthree\nFOUR\n";
         app.old_content = Some(old.into());
@@ -10248,7 +10307,7 @@ keep-four
         app.screen = Screen::Review;
         app.repo_root = dir.to_path_buf();
         app.files = vec![cf_conflicted("merge.txt")];
-        app.rebuild_entries();
+        app.rebuild_files();
         let d = load_conflict_data(0, &app.files[0], dir).expect("the markers parse");
         app.apply(Outcome::FileLoaded(Box::new(d)));
         app
@@ -10262,7 +10321,7 @@ keep-four
         app.files = vec![cf_conflicted("src/z.rs"), cf("a.rs"), cf("src/deep/b.rs")];
         for tree in [true, false] {
             app.tree_view = tree;
-            app.rebuild_entries();
+            app.rebuild_files();
             assert_eq!(
                 app.entries[0],
                 FileEntry::ConflictHeading { count: 1 },
@@ -10289,7 +10348,7 @@ keep-four
         }
         // With nothing conflicted the heading is gone entirely.
         app.files = vec![cf("a.rs")];
-        app.rebuild_entries();
+        app.rebuild_files();
         assert!(!app
             .entries
             .iter()
@@ -10465,7 +10524,7 @@ keep-four
         app.screen = Screen::Review;
         app.repo_root = dir.0.clone();
         app.files = vec![file];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.open_conflict_menu(0, 0, 0);
         let Overlay::ConflictMenu(menu) = &app.overlay else {
             panic!("the menu is open");
@@ -10504,7 +10563,7 @@ b2
         app.screen = Screen::Review;
         app.repo_root = dir.0.clone();
         app.files = vec![cf_conflicted("merge.txt")];
-        app.rebuild_entries();
+        app.rebuild_files();
         let d = load_conflict_data(0, &app.files[0], &dir.0).expect("markers");
         app.apply(Outcome::FileLoaded(Box::new(d)));
         app.collapse_unchanged = false;
@@ -10617,7 +10676,7 @@ b2
         app.screen = Screen::Review;
         app.repo_root = dir.0.clone();
         app.files = vec![cf_conflicted("merge.txt")];
-        app.rebuild_entries();
+        app.rebuild_files();
         let d = load_conflict_data(0, &app.files[0], &dir.0).expect("markers");
         app.apply(Outcome::FileLoaded(Box::new(d)));
         app.collapse_unchanged = false;
@@ -10660,7 +10719,7 @@ b2
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         std::fs::write(dir.join("PLAN.md"), body).expect("fixture written");
         app.new_content = Some(body.to_string());
         app
@@ -10727,7 +10786,7 @@ b2
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         std::fs::create_dir_all(dir.join("src")).expect("scratch src");
         std::fs::write(dir.join("src/main.rs"), SRC).expect("fixture written");
         app.new_content = Some(SRC.to_string());
@@ -11230,7 +11289,7 @@ b2
             conflicted: false,
         });
         app.files.push(cf("src/main.rs"));
-        app.rebuild_entries();
+        app.rebuild_files();
         std::fs::write(dir.0.join("NOTES.md"), "# Notes\n").unwrap();
         app.handle_key(key(KeyCode::Char('P')));
         assert!(app.preview.is_some());
@@ -11558,10 +11617,49 @@ b2
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The whole point of caching the tree: a collapse toggle must not pay
+    /// for the build.
+    ///
+    /// The bound is a ratio rather than a wall-clock number, so a slow
+    /// machine does not fail the suite. What it catches is the regression
+    /// that matters — someone moving the build back inside
+    /// `rebuild_entries`, at which point the two times converge and the
+    /// margin disappears.
+    #[test]
+    fn emitting_rows_does_not_rebuild_the_tree() {
+        let files: Vec<ChangedFile> = (0..20_000)
+            .map(|i| cf(&format!("pkg{}/mod{}/file{i}.rs", i % 40, i % 400)))
+            .collect();
+
+        let build_start = Instant::now();
+        let tree = TreeNodes::build(&files);
+        let build = build_start.elapsed();
+
+        // Everything collapsed is what a reader opens onto, per D11 of the
+        // plan, and it is the case a click has to stay fast in.
+        let collapsed: HashSet<String> = (0..40).map(|i| format!("pkg{i}")).collect();
+
+        let emit_start = Instant::now();
+        let mut rows = Vec::new();
+        for _ in 0..10 {
+            rows.clear();
+            tree.emit(&collapsed, &mut rows);
+        }
+        let emit = emit_start.elapsed();
+
+        assert!(!rows.is_empty(), "the tree emitted nothing");
+        assert!(
+            emit < build,
+            "ten emits ({emit:?}) should cost less than one build ({build:?}) — \
+             the build is back on the toggle path"
+        );
+    }
+
     #[test]
     fn tree_groups_files_under_dirs() {
         let files = vec![cf("src/app/x.rs"), cf("src/ui/y.rs"), cf("README.md")];
-        let entries = build_tree_entries(&files, &HashSet::new());
+        let mut entries = Vec::new();
+        TreeNodes::build(&files).emit(&HashSet::new(), &mut entries);
         assert_eq!(
             entries,
             vec![
@@ -11595,7 +11693,7 @@ b2
         app.repo_root = std::env::temp_dir();
         app.files = vec![cf("src/app.rs")];
         app.tree_view = false;
-        app.rebuild_entries();
+        app.rebuild_files();
         app.layout.file_list = Rect::new(0, 2, 30, 10);
         app.open_path_menu(4, 2);
 
@@ -11659,7 +11757,7 @@ b2
         app.repo_root = std::env::temp_dir();
         app.files = vec![cf("src/ui/panel.rs")];
         app.tree_view = true;
-        app.rebuild_entries();
+        app.rebuild_files();
         app.layout.file_list = Rect::new(0, 0, 30, 10);
         app.open_path_menu(2, 0);
 
@@ -11678,7 +11776,7 @@ b2
         app.repo_root = std::env::temp_dir();
         app.files = vec![cf("README.md")];
         app.tree_view = false;
-        app.rebuild_entries();
+        app.rebuild_files();
         app.layout.file_list = Rect::new(0, 0, 30, 10);
         app.open_path_menu(1, 0);
 
@@ -11704,7 +11802,7 @@ b2
         let mut app = App::new(LaunchMode::Local, None);
         app.files = vec![cf("README.md")];
         app.tree_view = false;
-        app.rebuild_entries();
+        app.rebuild_files();
         app.layout.file_list = Rect::new(0, 0, 30, 10);
         app.open_path_menu(1, 6);
         assert!(matches!(app.overlay, Overlay::None));
@@ -11713,7 +11811,8 @@ b2
     #[test]
     fn tree_compresses_single_child_chains() {
         let files = vec![cf("a/b/c/deep.rs")];
-        let entries = build_tree_entries(&files, &HashSet::new());
+        let mut entries = Vec::new();
+        TreeNodes::build(&files).emit(&HashSet::new(), &mut entries);
         assert_eq!(
             entries,
             vec![
@@ -11732,7 +11831,7 @@ b2
         let mut app = App::new(LaunchMode::Local, None);
         app.screen = Screen::Review;
         app.files = vec![cf("test.rs")];
-        app.rebuild_entries();
+        app.rebuild_files();
         let old: String = (1..=20).map(|i| format!("line{i}\n")).collect();
         let new = old.replace("line10\n", "LINE10\n");
         app.diff = Some(FileDiff::compute(Some(&old), Some(&new)));
@@ -11880,7 +11979,7 @@ b2
     fn an_idle_rescan_that_changes_nothing_leaves_the_panel_alone() {
         let mut app = idle_local_app();
         app.files = vec![cf("a.rs"), cf("b.rs"), cf("c.rs")];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.file_cursor = 0;
         // The reader scrolled away from the cursor to look at something.
         app.file_scroll = 2;
@@ -12582,7 +12681,8 @@ b2
         // compressed "src/app" — that path is also the collapse key.
         let mut collapsed = HashSet::new();
         collapsed.insert("src/app".to_string());
-        let entries = build_tree_entries(&files, &collapsed);
+        let mut entries = Vec::new();
+        TreeNodes::build(&files).emit(&collapsed, &mut entries);
         assert_eq!(
             entries,
             vec![
@@ -12615,7 +12715,7 @@ b2
     fn finder_filters_files_and_prefixes_switch_mode() {
         let mut app = folded_app();
         app.files = vec![cf("src/app.rs"), cf("src/ui/render.rs"), cf("README.md")];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.new_content = Some("fn alpha() {}\nfn beta() {}\n".into());
 
         app.open_finder(FinderMode::Files);
@@ -12775,7 +12875,7 @@ b2
     fn n_and_p_no_longer_step_files() {
         let mut app = folded_app();
         app.files = vec![cf("a.rs"), cf("b.rs")];
-        app.rebuild_entries();
+        app.rebuild_files();
         // `n` with no search says so instead of loading the next file.
         app.handle_key(key(KeyCode::Char('n')));
         assert_eq!(app.file_cursor, 0);
@@ -12790,7 +12890,7 @@ b2
         app.screen = Screen::Review;
         app.local = true;
         app.files = vec![cf(path)];
-        app.rebuild_entries();
+        app.rebuild_files();
         let content = format!("first\n{line}\nlast\n");
         // A file against itself: every row is context.
         app.diff = Some(FileDiff::compute(Some(&content), Some(&content)));
@@ -12877,7 +12977,7 @@ b2
     fn references_land_in_the_finder_with_their_source_lines() {
         let mut app = app_with_line("a.ts", "handleClick()");
         app.files = vec![cf("a.ts")];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.apply_locations(LocationsData {
             action: LspAction::References,
             word: "handleClick".into(),
@@ -12954,7 +13054,7 @@ b2
         app.screen = Screen::Review;
         app.local = true;
         app.files = vec![cf("a.ts")];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.old_content = Some(old.to_string());
         app.new_content = Some(new.to_string());
         app.diff = Some(FileDiff::compute(Some(old), Some(new)));
@@ -13111,7 +13211,7 @@ b2
         // Local review always has the working tree under it.
         app.checked_out = true;
         app.files = vec![cf("a.txt")];
-        app.rebuild_entries();
+        app.rebuild_files();
         let old = "a\nb\nc\nd\ne\nf\ng\n";
         let new = "a\nB\nc\nd\ne\nF1\nF2\ng\n";
         app.old_content = Some(old.into());
@@ -13250,7 +13350,7 @@ b2
             previous: None,
             conflicted: false,
         }];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.ask_revert_file(0);
         let Overlay::Revert(prompt) = &app.overlay else {
             panic!("expected a confirm prompt");
@@ -13348,7 +13448,7 @@ b2
     fn a_file_outside_the_change_opens_in_the_editor() {
         let mut app = folded_app();
         app.files = vec![cf("test.rs"), cf("other.rs")];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.file_cursor = 1;
         app.diff_scroll = 4;
         let files_before = app.files.len();
@@ -13406,7 +13506,7 @@ b2
     fn opening_a_hit_outside_the_changeset_opens_a_file() {
         let mut app = folded_app();
         app.files = vec![cf("test.rs")];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.open_finder(FinderMode::Grep);
         // A path that is not under review: this has to open the file,
         // not diff it against a base it has no place in.
@@ -13453,7 +13553,7 @@ b2
         app.local = true;
         app.checked_out = true;
         app.files = vec![cf("f.txt")];
-        app.rebuild_entries();
+        app.rebuild_files();
         app.collapse_unchanged = false;
         app.diff = Some(FileDiff::compute(Some("a\nb\n"), Some("a\nB\n")));
         app.rebuild_display();
