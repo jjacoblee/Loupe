@@ -80,3 +80,27 @@
 # names it, a rebase merge does not). One batched `gh` call per file,
 # cached for the session. Set false to stay entirely offline.
 #blame_pr_lookup = true
+
+# ---------------------------------------------------------------- servers
+#
+# Extra language servers. Loupe drives TypeScript, Go and Rust out of the
+# box; a `[[server]]` table adds another, or replaces one of those with a
+# server you prefer. Nothing is installed or downloaded — loupe looks for
+# `command` on your PATH and starts it the first time you ask a question
+# about a file it handles.
+#
+# An extension a built-in server also claims goes to the one here.
+# `loupe --lsp` says what it found and what is missing.
+
+# [[server]]
+# lang = "Python"
+# extensions = ["py", "pyi"]
+# command = "pyright-langserver"
+# args = ["--stdio"]
+# install = "npm install -g pyright"
+
+# [[server]]
+# lang = "Ruby"
+# extensions = ["rb", "rake"]
+# command = "ruby-lsp"
+# install = "gem install ruby-lsp"

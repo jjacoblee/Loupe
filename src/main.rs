@@ -394,6 +394,33 @@ fn theme_or_exit(name: &str) -> two_face::theme::EmbeddedThemeName {
     }
 }
 
+/// Hand the config file's `[[server]]` tables to the language-server
+/// registry. Called before anything can ask a question about a file —
+/// including `--lsp`, which returns before the main path loads config.
+///
+/// An entry missing its language, its command or its extensions is
+/// dropped rather than half-installed: a server loupe cannot name, run or
+/// match a file to is not a server.
+fn configure_servers(cfg: &config::Config) {
+    lsp::configure(
+        cfg.servers
+            .iter()
+            .filter(|s| !s.lang.is_empty() && !s.command.is_empty() && !s.extensions.is_empty())
+            .map(|s| lsp::ServerEntry {
+                lang: s.lang.clone(),
+                exts: s.extensions.clone(),
+                cmd: s.command.clone(),
+                args: s.args.clone(),
+                install: if s.install.is_empty() {
+                    format!("install {}", s.command)
+                } else {
+                    s.install.clone()
+                },
+            })
+            .collect(),
+    );
+}
+
 /// `loupe --lsp`: what is installed, what isn't, and what to run to fix
 /// that. Loupe never installs anything itself, so this is the whole
 /// story of why `gd` did or didn't work.
@@ -562,6 +589,11 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Ok(CliCmd::Lsp) => {
+            // `--lsp` has to answer for the config file's servers too, and
+            // it returns before the main path reads it.
+            if let Ok(cfg) = config::load(gitops::repo_root().as_deref()) {
+                configure_servers(&cfg);
+            }
             report_language_servers();
             return Ok(());
         }
@@ -612,6 +644,8 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+    configure_servers(&cfg);
+
     // Theme names are validated here, before the terminal goes raw, so a
     // typo is a plain error message rather than a flash of alternate screen.
     let startup = Startup {

@@ -68,7 +68,9 @@ pub struct ServerSpec {
 /// The three languages this supports today. Adding a fourth is a row
 /// here plus a `language_id` arm — the protocol is the same for all of
 /// them.
-pub const SERVERS: &[ServerSpec] = &[
+/// The servers loupe knows about: these three, plus whatever the config
+/// file adds. See [`servers`].
+const BUILT_IN: &[ServerSpec] = &[
     ServerSpec {
         lang: "TypeScript",
         exts: &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
@@ -93,12 +95,82 @@ pub const SERVERS: &[ServerSpec] = &[
     },
 ];
 
+/// One server from the config file, on its way to becoming a
+/// [`ServerSpec`]. Owned, because it is read from TOML; leaked by
+/// [`configure`], because a `ServerSpec` is `&'static` everywhere else.
+pub struct ServerEntry {
+    pub lang: String,
+    pub exts: Vec<String>,
+    pub cmd: String,
+    pub args: Vec<String>,
+    pub install: String,
+}
+
+/// Extra servers from the config file, installed once at startup.
+static CONFIGURED: std::sync::OnceLock<Vec<ServerSpec>> = std::sync::OnceLock::new();
+
+/// Every server loupe will drive.
+///
+/// The three built in, with anything the config file adds in front of
+/// them — first match wins, so a configured entry for an extension a
+/// built-in also claims replaces it. That is the point: somebody who
+/// prefers a different TypeScript server should be able to say so.
+pub fn servers() -> &'static [ServerSpec] {
+    match CONFIGURED.get() {
+        Some(extra) if !extra.is_empty() => extra,
+        _ => BUILT_IN,
+    }
+}
+
+/// Take the servers from the config file. Called once, before anything
+/// asks a question; later calls are ignored.
+///
+/// The strings are leaked deliberately. A `ServerSpec` is `&'static` all
+/// the way through `spec_for`, the registry and the UI, and this table is
+/// read for the life of the process — an owned form would cost a lifetime
+/// parameter in a dozen signatures to describe something that never goes
+/// away.
+pub fn configure(extra: Vec<ServerEntry>) {
+    if extra.is_empty() {
+        return;
+    }
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    let leak_all = |v: Vec<String>| -> &'static [&'static str] {
+        Box::leak(
+            v.into_iter()
+                .map(leak)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    };
+    let mut table: Vec<ServerSpec> = extra
+        .into_iter()
+        .map(|e| ServerSpec {
+            lang: leak(e.lang),
+            exts: leak_all(e.exts),
+            cmd: leak(e.cmd),
+            args: leak_all(e.args),
+            install: leak(e.install),
+        })
+        .collect();
+    // The built-ins stay, behind the configured ones. An extension both
+    // claim goes to the config file, which is what "configured" means.
+    table.extend(BUILT_IN.iter().map(|s| ServerSpec {
+        lang: s.lang,
+        exts: s.exts,
+        cmd: s.cmd,
+        args: s.args,
+        install: s.install,
+    }));
+    let _ = CONFIGURED.set(table);
+}
+
 pub fn spec_for(path: &str) -> Option<&'static ServerSpec> {
     let ext = Path::new(path)
         .extension()
         .and_then(|e| e.to_str())?
         .to_ascii_lowercase();
-    SERVERS.iter().find(|s| s.exts.contains(&ext.as_str()))
+    servers().iter().find(|s| s.exts.contains(&ext.as_str()))
 }
 
 /// The `languageId` a server expects in `didOpen`.
@@ -271,7 +343,7 @@ fn rustup_which(cmd: &str) -> Option<PathBuf> {
 /// What `loupe --lsp` reports: every supported server and where (or
 /// whether) it was found.
 pub fn doctor() -> Vec<(&'static ServerSpec, Option<PathBuf>)> {
-    SERVERS.iter().map(|s| (s, which(s.cmd))).collect()
+    servers().iter().map(|s| (s, which(s.cmd))).collect()
 }
 
 // ------------------------------------------------------------------ results
@@ -1439,7 +1511,7 @@ impl Lsp {
     /// One line per language: running, not installed, or never asked.
     pub fn status(&self) -> Vec<(&'static str, String)> {
         let map = lock(&self.slots);
-        SERVERS
+        servers()
             .iter()
             .map(|spec| {
                 let state = match map.get(spec.lang) {

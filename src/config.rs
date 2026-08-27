@@ -19,6 +19,22 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    /// What to call it in messages to the reader.
+    pub lang: String,
+    /// File extensions it handles, without the dot.
+    pub extensions: Vec<String>,
+    /// The program to run.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// What to tell somebody who does not have it.
+    #[serde(default)]
+    pub install: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Upstream GitHub organization (or user) that pull requests are opened
     /// against. When set, loupe lists and opens PRs on `<org>/<repo-name>`
@@ -67,6 +83,12 @@ pub struct Config {
     /// batched `gh` call per file, cached for the session; set false to
     /// stay entirely offline and rely on the subject alone.
     pub blame_pr_lookup: Option<bool>,
+    /// Extra language servers, as `[[server]]` tables. Each one needs a
+    /// `lang`, the `extensions` it handles and the `command` to run;
+    /// `args` and `install` are optional. An extension a built-in server
+    /// already claims goes to the one configured here.
+    #[serde(default, rename = "server")]
+    pub servers: Vec<ServerConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -133,6 +155,14 @@ impl Config {
             blame: over.blame.or(self.blame),
             blame_width: over.blame_width.or(self.blame_width),
             blame_pr_lookup: over.blame_pr_lookup.or(self.blame_pr_lookup),
+            // The nearer file replaces the list rather than adding to it.
+            // Two files each naming a Python server would otherwise start
+            // whichever one `spec_for` happened to reach first.
+            servers: if over.servers.is_empty() {
+                self.servers
+            } else {
+                over.servers
+            },
         }
     }
 }
@@ -234,6 +264,41 @@ pub fn ensure_global_exists() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// A `[[server]]` table adds a language, and the nearer config file
+    /// replaces the list rather than adding to it — two files each naming
+    /// a Python server would otherwise start whichever one `spec_for`
+    /// happened to reach first.
+    #[test]
+    fn a_config_file_can_add_a_language_server() {
+        let global: Config = parse(concat!(
+            "[[server]]\n",
+            "lang = \"Python\"\n",
+            "extensions = [\"py\"]\n",
+            "command = \"pyright-langserver\"\n",
+            "args = [\"--stdio\"]\n",
+            "install = \"npm install -g pyright\"\n",
+        ))
+        .unwrap();
+        assert_eq!(global.servers.len(), 1);
+        assert_eq!(global.servers[0].lang, "Python");
+        assert_eq!(global.servers[0].args, vec!["--stdio"]);
+
+        // `args` and `install` are optional; a server that takes neither
+        // should not have to say so.
+        let bare: Config = parse(concat!(
+            "[[server]]\n",
+            "lang = \"Ruby\"\n",
+            "extensions = [\"rb\"]\n",
+            "command = \"ruby-lsp\"\n",
+        ))
+        .unwrap();
+        assert!(bare.servers[0].args.is_empty());
+
+        let merged = global.merged(bare);
+        assert_eq!(merged.servers.len(), 1, "the nearer file replaces the list");
+        assert_eq!(merged.servers[0].lang, "Ruby");
+    }
+
     #[test]
     fn parses_all_keys() {
         let cfg = parse(concat!(
@@ -266,6 +331,7 @@ mod tests {
                 blame: Some(true),
                 blame_width: Some(26),
                 blame_pr_lookup: Some(false),
+                servers: Vec::new(),
             }
         );
     }
