@@ -4284,7 +4284,7 @@ mod tests {
     fn the_open_path_box_explains_itself() {
         let _guard = highlight::test_theme_lock();
         let mut app = pinned_app();
-        app.open_path_box();
+        app.open_path_box(crate::app::PathBoxKind::Open);
         let screen = screen_of(&mut app, 90, 20);
         assert!(screen.contains("Open a file"), "{screen}");
         assert!(screen.contains("does not have to be in the repository"));
@@ -5247,12 +5247,12 @@ mod tests {
                     crate::app::PathMenuItem {
                         key: 'r',
                         label: "Copy relative path",
-                        text: "src/app.rs".into(),
+                        action: crate::app::PathAction::Copy("src/app.rs".into()),
                     },
                     crate::app::PathMenuItem {
                         key: 'f',
                         label: "Copy full path",
-                        text: "/repo/src/app.rs".into(),
+                        action: crate::app::PathAction::Copy("/repo/src/app.rs".into()),
                     },
                 ],
                 sel: 0,

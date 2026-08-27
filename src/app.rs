@@ -164,9 +164,23 @@ pub enum Overlay {
     OpenPath(Box<OpenPathBox>),
 }
 
+/// What the one-line path box is asking for.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PathBoxKind {
+    /// `Ctrl+O`: open whatever path is typed.
+    #[default]
+    Open,
+    /// A new file in this directory. Empty for the repository root.
+    NewFile { dir: String },
+    /// A new name for a file that exists.
+    Rename { from: String },
+}
+
 /// The one-line path box behind `Ctrl+O`.
 #[derive(Default)]
 pub struct OpenPathBox {
+    /// What the box is asking for.
+    pub kind: PathBoxKind,
     /// What has been typed so far.
     pub input: String,
     /// Caret position, counted in characters rather than bytes so a path
@@ -347,8 +361,24 @@ pub struct PathMenuItem {
     /// The key that runs this line without selecting it first.
     pub key: char,
     pub label: &'static str,
-    /// What the line puts on the clipboard.
-    pub text: String,
+    pub action: PathAction,
+}
+
+/// What a line of the file-panel menu does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathAction {
+    /// Put a path on the clipboard.
+    Copy(String),
+    /// Ask for a name, then create an empty file beside this row.
+    NewFile,
+    /// Ask for a new name for this file.
+    Rename,
+    /// Offer to delete it. Choosing this only *asks* — see
+    /// [`PathAction::DeleteConfirmed`].
+    Delete,
+    /// Delete it, having asked. This is the only line loupe puts behind a
+    /// second press, because it is the only one that destroys a file.
+    DeleteConfirmed,
 }
 
 /// The right-click menu on a file-panel row: the ways to copy the path of
@@ -1367,6 +1397,30 @@ impl TreeNodes {
             node = node.dirs.entry(p.to_string()).or_default();
         }
         node
+    }
+
+    /// Drop one file from the tree.
+    ///
+    /// The path keeps its slot in `repo_paths` — the indices on screen
+    /// point into it, and closing the gap would repoint every row after
+    /// this one at the wrong file. Nothing reaches the slot once the tree
+    /// has forgotten it.
+    fn remove(&mut self, path: &str) -> bool {
+        let Some((dir, base)) = path.rsplit_once('/') else {
+            let before = self.root.files.len();
+            self.root.files.retain(|(name, _)| name != path);
+            return self.root.files.len() != before;
+        };
+        let mut node = &mut self.root;
+        for p in dir.split('/') {
+            match node.dirs.get_mut(p) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        let before = node.files.len();
+        node.files.retain(|(name, _)| name != base);
+        node.files.len() != before
     }
 
     /// Re-sort one directory's files, after a read added to them.
@@ -5151,7 +5205,7 @@ impl App {
                 if close {
                     self.overlay = Overlay::None;
                 } else if let Some(i) = hit {
-                    self.path_menu_copy(i);
+                    self.run_path_menu(i);
                 }
                 return;
             }
@@ -5942,7 +5996,7 @@ impl App {
                 // other context menu does.
                 if matches!(m.kind, MouseEventKind::Down(_)) {
                     match self.layout.button_at(x, y) {
-                        Some(ButtonId::PathMenuRow(i)) => self.path_menu_copy(i),
+                        Some(ButtonId::PathMenuRow(i)) => self.run_path_menu(i),
                         _ => self.overlay = Overlay::None,
                     }
                 }
@@ -6582,7 +6636,7 @@ impl App {
         let mut items = vec![PathMenuItem {
             key: 'r',
             label: "Copy relative path",
-            text: path.clone(),
+            action: PathAction::Copy(path.clone()),
         }];
         // A path git cannot express as a plain relative path has no
         // absolute form worth handing out, so that line is left off.
@@ -6590,8 +6644,31 @@ impl App {
             items.push(PathMenuItem {
                 key: 'f',
                 label: "Copy full path",
-                text: abs.to_string_lossy().into_owned(),
+                action: PathAction::Copy(abs.to_string_lossy().into_owned()),
             });
+        }
+        // Making and unmaking files belongs to the panel that shows the
+        // repository. In the change under review the same row means "part
+        // of this diff", and offering to delete it there reads as an offer
+        // to drop it from the change.
+        if self.panel == PanelMode::Files {
+            items.push(PathMenuItem {
+                key: 'n',
+                label: "New file here…",
+                action: PathAction::NewFile,
+            });
+            if !is_dir {
+                items.push(PathMenuItem {
+                    key: 'm',
+                    label: "Rename…",
+                    action: PathAction::Rename,
+                });
+                items.push(PathMenuItem {
+                    key: 'd',
+                    label: "Delete…",
+                    action: PathAction::Delete,
+                });
+            }
         }
         self.overlay = Overlay::PathMenu(Box::new(PathMenu {
             path,
@@ -6742,18 +6819,58 @@ impl App {
     }
 
     /// Copy line `i` of the right-click menu and close it.
-    fn path_menu_copy(&mut self, i: usize) {
+    fn run_path_menu(&mut self, i: usize) {
         let Overlay::PathMenu(menu) = &self.overlay else {
             return;
         };
         let Some(item) = menu.items.get(i) else {
             return;
         };
-        let text = item.text.clone();
-        self.overlay = Overlay::None;
-        match clipboard::copy(&text) {
-            Ok(via) => self.ok(format!("⧉ Copied {text} to the clipboard via {via}.")),
-            Err(e) => self.err(format!("Couldn't copy: {e:#}")),
+        let action = item.action.clone();
+        let path = menu.path.clone();
+        let is_dir = menu.is_dir;
+        match action {
+            PathAction::Copy(text) => {
+                self.overlay = Overlay::None;
+                match clipboard::copy(&text) {
+                    Ok(via) => self.ok(format!("⧉ Copied {text} to the clipboard via {via}.")),
+                    Err(e) => self.err(format!("Couldn't copy: {e:#}")),
+                }
+            }
+            PathAction::NewFile => {
+                self.overlay = Overlay::None;
+                // Beside the file that was clicked, or inside the folder.
+                let dir = if is_dir {
+                    path
+                } else {
+                    path.rsplit_once('/')
+                        .map(|(d, _)| d.to_string())
+                        .unwrap_or_default()
+                };
+                self.open_path_box(PathBoxKind::NewFile { dir });
+            }
+            PathAction::Rename => {
+                self.overlay = Overlay::None;
+                self.open_path_box(PathBoxKind::Rename { from: path });
+            }
+            PathAction::Delete => {
+                // Only asks. Deleting a file is the one thing this menu
+                // does that cannot be undone from inside loupe, so it gets
+                // the treatment the revert already has.
+                if let Overlay::PathMenu(menu) = &mut self.overlay {
+                    menu.items = vec![PathMenuItem {
+                        key: 'y',
+                        label: "Yes, delete it",
+                        action: PathAction::DeleteConfirmed,
+                    }];
+                    menu.sel = 0;
+                }
+                self.err(format!("Delete {path}? This cannot be undone from here."));
+            }
+            PathAction::DeleteConfirmed => {
+                self.overlay = Overlay::None;
+                self.delete_file(&path);
+            }
         }
     }
 
@@ -7146,7 +7263,7 @@ impl App {
             ButtonId::BufferTab(i) => self.open_buffer_at(i),
             ButtonId::PinClose(i) => self.close_pin(i),
             ButtonId::PinToggle => self.toggle_pin_current(),
-            ButtonId::PinOpenPath => self.open_path_box(),
+            ButtonId::PinOpenPath => self.open_path_box(PathBoxKind::Open),
             ButtonId::OpenPathGo => self.confirm_open_path(),
             ButtonId::OpenPathCancel => {
                 self.overlay = Overlay::None;
@@ -9795,7 +9912,9 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('o') | KeyCode::Char('O') if ctrl => self.open_path_box(),
+            KeyCode::Char('o') | KeyCode::Char('O') if ctrl => {
+                self.open_path_box(PathBoxKind::Open)
+            }
             KeyCode::Char(c @ '1'..='9') if alt => self.open_pin_number(c),
             KeyCode::Char('=') | KeyCode::Char('+') if alt => self.toggle_pin_current(),
             KeyCode::Char('-') if alt => self.close_open_pin(),
@@ -9856,9 +9975,130 @@ impl App {
     /// `Ctrl+O`: the path box. It is how a reader on a terminal that
     /// cannot report a drop still opens a file from anywhere, and how a
     /// path an agent just printed gets pasted straight in.
-    pub fn open_path_box(&mut self) {
-        self.overlay = Overlay::OpenPath(Box::default());
-        self.ok("Type or paste a path — Enter opens and pins it, Esc cancels.");
+    pub fn open_path_box(&mut self, kind: PathBoxKind) {
+        self.ok(match &kind {
+            PathBoxKind::Open => {
+                "Type or paste a path — Enter opens and pins it, Esc cancels.".to_string()
+            }
+            PathBoxKind::NewFile { dir } if dir.is_empty() => {
+                "Name for the new file — Enter creates and opens it, Esc cancels.".to_string()
+            }
+            PathBoxKind::NewFile { dir } => {
+                format!("Name for the new file in {dir} — Enter creates and opens it.")
+            }
+            PathBoxKind::Rename { from } => format!("New name for {from} — Esc cancels."),
+        });
+        self.overlay = Overlay::OpenPath(Box::new(OpenPathBox {
+            kind,
+            ..Default::default()
+        }));
+    }
+
+    /// Create an empty file and open it.
+    ///
+    /// Every guard the editor uses applies: a path that would escape the
+    /// repository is refused, and so is one that already exists — silently
+    /// opening a file somebody meant to create is how work gets
+    /// overwritten.
+    fn create_file(&mut self, path: &str) {
+        let Some(abs) = gitops::safe_repo_path(&self.repo_root, path) else {
+            self.err(format!("Refusing to create “{path}” — unsafe path."));
+            return;
+        };
+        if abs.exists() {
+            self.err(format!("{path} already exists."));
+            return;
+        }
+        if let Some(parent) = abs.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                self.err(format!("Couldn't make {}: {e}", parent.display()));
+                return;
+            }
+        }
+        if let Err(e) = std::fs::write(&abs, "") {
+            self.err(format!("Couldn't create {path}: {e}"));
+            return;
+        }
+        self.add_repo_path(path);
+        self.ok(format!("Created {path}."));
+        self.spawn_open_external(path.to_string(), None);
+        self.rescan_after_file_change();
+    }
+
+    fn rename_file(&mut self, from: &str, to: &str) {
+        if from == to {
+            self.ok("Same name — nothing done.");
+            return;
+        }
+        let (Some(a), Some(b)) = (
+            gitops::safe_repo_path(&self.repo_root, from),
+            gitops::safe_repo_path(&self.repo_root, to),
+        ) else {
+            self.err("Refusing to rename — unsafe path.");
+            return;
+        };
+        if b.exists() {
+            self.err(format!("{to} already exists."));
+            return;
+        }
+        if let Some(parent) = b.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::rename(&a, &b) {
+            self.err(format!("Couldn't rename {from}: {e}"));
+            return;
+        }
+        self.file_tree.remove(from);
+        self.add_repo_path(to);
+        self.ok(format!("{from} → {to}"));
+        self.rebuild_entries();
+        self.rescan_after_file_change();
+    }
+
+    fn delete_file(&mut self, path: &str) {
+        let Some(abs) = gitops::safe_repo_path(&self.repo_root, path) else {
+            self.err(format!("Refusing to delete “{path}” — unsafe path."));
+            return;
+        };
+        // Never through a symlink: the link is what should go, not
+        // whatever it happens to point at.
+        if is_symlink(&abs) {
+            self.err(format!(
+                "{path} is a symlink — refusing to delete through it."
+            ));
+            return;
+        }
+        if let Err(e) = std::fs::remove_file(&abs) {
+            self.err(format!("Couldn't delete {path}: {e}"));
+            return;
+        }
+        self.file_tree.remove(path);
+        self.ok(format!("Deleted {path}."));
+        self.rebuild_entries();
+        self.rescan_after_file_change();
+    }
+
+    /// Add one path to the repository list and its tree.
+    ///
+    /// Appended, never inserted, for the same reason a directory read is:
+    /// every `RowSrc::Path` on screen holds an index into this list.
+    fn add_repo_path(&mut self, path: &str) {
+        if self.repo_paths.iter().any(|p| p == path) {
+            return;
+        }
+        let src = RowSrc::Path(self.repo_paths.len());
+        self.repo_paths.push(path.to_string());
+        // A file somebody just made is one they mean to commit, so it is
+        // not drawn as ignored unless git says otherwise on the next read.
+        self.repo_ignored.push(false);
+        self.file_tree.insert(path, src);
+    }
+
+    /// A file appeared or vanished, so the change under review moved too.
+    fn rescan_after_file_change(&mut self) {
+        if self.local && self.quiet.is_none() {
+            self.spawn_quiet_local(false);
+        }
     }
 
     /// Enter in the path box.
@@ -9867,10 +10107,33 @@ impl App {
             return;
         };
         let typed = box_.input.trim().to_string();
+        let kind = box_.kind.clone();
         if typed.is_empty() {
             self.overlay = Overlay::None;
-            self.ok("Nothing typed — no file opened.");
+            self.ok("Nothing typed — nothing done.");
             return;
+        }
+        match kind {
+            PathBoxKind::Open => {}
+            PathBoxKind::NewFile { dir } => {
+                self.overlay = Overlay::None;
+                let path = if dir.is_empty() {
+                    typed
+                } else {
+                    format!("{dir}/{typed}")
+                };
+                self.create_file(&path);
+                return;
+            }
+            PathBoxKind::Rename { from } => {
+                self.overlay = Overlay::None;
+                let to = match from.rsplit_once('/') {
+                    Some((dir, _)) if !typed.contains('/') => format!("{dir}/{typed}"),
+                    _ => typed,
+                };
+                self.rename_file(&from, &to);
+                return;
+            }
         }
         // A path relative to the repository is the other half of what a
         // reader types here; absolute and `~` paths reach the rest of the
@@ -12381,7 +12644,93 @@ b2
         assert!(app.editor.as_ref().unwrap().dirty);
     }
 
-    /// Two buffers both called `mod.rs` name nothing, so a shared name
+    /// The three file operations, and the guards that stop each one
+    /// doing damage. All of them are refusals rather than clever recovery:
+    /// a path that escapes the repository, a name already taken, and a
+    /// symlink standing in for the file somebody meant to remove.
+    #[test]
+    fn making_and_unmaking_files_refuses_the_dangerous_shapes() {
+        let dir = std::env::temp_dir().join(format!("loupe-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/app.rs"), "fn main() {}\n").unwrap();
+
+        let mut app = App::new(LaunchMode::Local, None);
+        app.repo_root = dir.clone();
+        app.panel = PanelMode::Files;
+        app.apply_repo_listing(search::RepoListing {
+            paths: vec!["src/app.rs".into()],
+            ignored_from: 1,
+            stubs: Vec::new(),
+        });
+
+        // Escaping the repository is refused outright.
+        app.create_file("../escaped.rs");
+        assert!(!dir.parent().unwrap().join("escaped.rs").exists());
+
+        // So is writing over something that is already there.
+        app.create_file("src/app.rs");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/app.rs")).unwrap(),
+            "fn main() {}\n",
+            "the file that was already there is untouched"
+        );
+
+        app.create_file("src/new.rs");
+        assert!(dir.join("src/new.rs").exists());
+        assert!(
+            app.repo_paths.iter().any(|p| p == "src/new.rs"),
+            "and it is in the list without a re-read"
+        );
+
+        app.rename_file("src/new.rs", "src/renamed.rs");
+        assert!(!dir.join("src/new.rs").exists());
+        assert!(dir.join("src/renamed.rs").exists());
+
+        // A rename onto a name that exists is refused, both files intact.
+        app.rename_file("src/renamed.rs", "src/app.rs");
+        assert!(dir.join("src/renamed.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/app.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+
+        app.delete_file("src/renamed.rs");
+        assert!(!dir.join("src/renamed.rs").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting asks. It is the only thing this menu does that loupe
+    /// cannot undo, so choosing it replaces the menu with the question
+    /// rather than running.
+    #[test]
+    fn deleting_a_file_asks_before_it_does_it() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.panel = PanelMode::Files;
+        app.overlay = Overlay::PathMenu(Box::new(PathMenu {
+            path: "src/app.rs".into(),
+            is_dir: false,
+            items: vec![PathMenuItem {
+                key: 'd',
+                label: "Delete…",
+                action: PathAction::Delete,
+            }],
+            sel: 0,
+            anchor: (0, 0),
+        }));
+
+        app.run_path_menu(0);
+
+        let Overlay::PathMenu(menu) = &app.overlay else {
+            panic!("the menu is still open, asking");
+        };
+        assert_eq!(menu.items.len(), 1);
+        assert_eq!(menu.items[0].action, PathAction::DeleteConfirmed);
+        assert_eq!(menu.items[0].key, 'y', "and it takes a deliberate key");
+    }
+
+    /// Two buffers both called `mod.rs` name nothing    /// Two buffers both called `mod.rs` name nothing, so a shared name
     /// costs both of them their parent directory — the rule the pins
     /// already use.
     #[test]
@@ -12869,12 +13218,15 @@ b2
         assert_eq!(menu.path, "src/app.rs");
         assert!(!menu.is_dir);
         assert_eq!(menu.items.len(), 2);
-        assert_eq!(menu.items[0].text, "src/app.rs");
+        assert_eq!(menu.items[0].action, PathAction::Copy("src/app.rs".into()));
         // Spelled with `Path` rather than `/`: on Windows the absolute
         // form is `C:\…\src\app.rs` (canonicalize adds a `\\?\` prefix
         // as well), so a check for a leading slash would test the
         // platform instead of the menu.
-        let full = std::path::Path::new(&menu.items[1].text);
+        let PathAction::Copy(full) = &menu.items[1].action else {
+            panic!("the second line copies the full path");
+        };
+        let full = std::path::Path::new(full);
         assert!(full.is_absolute(), "{full:?}");
         assert!(full.ends_with("src/app.rs"), "{full:?}");
     }
@@ -12932,7 +13284,7 @@ b2
         };
         assert!(menu.is_dir);
         assert_eq!(menu.path, "src/ui");
-        assert_eq!(menu.items[0].text, "src/ui");
+        assert_eq!(menu.items[0].action, PathAction::Copy("src/ui".into()));
     }
 
     /// The menu is a menu: arrows move, Esc closes, nothing is copied.
