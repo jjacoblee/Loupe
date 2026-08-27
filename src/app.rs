@@ -11,7 +11,7 @@ use crate::blame::{self, Blame};
 use crate::clipboard;
 use crate::conflict::{Conflicted, Resolution};
 use crate::ctx;
-use crate::diff::{DisplayEntry, FileDiff, Pos, RowKind, Selection, Side};
+use crate::diff::{DisplayEntry, FileDiff, Layer, Pos, RowKind, Selection, Side};
 use crate::editor::Editor;
 use crate::github::{
     self, ChangedFile, CommentSide, PrDetail, PrRef, PrSummary, ReviewComment, Verdict,
@@ -72,6 +72,54 @@ pub enum PanelMode {
 pub enum ViewMode {
     SideBySide,
     Inline,
+}
+
+/// How many layers of the change the diff draws.
+///
+/// A branch under review has two steps in it, not one: what the remote
+/// already has, and what the working tree has done since. Every diff tool
+/// shows the sum of the two and calls it the change, which answers "what
+/// does this branch do" and cannot answer "am I rewriting what I already
+/// wrote". These three settings are that second question, and `s` walks
+/// between them. See [`crate::diff::Layer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layers {
+    /// One layer: the change as a whole, the way every diff tool draws
+    /// it. What loupe has always shown.
+    #[default]
+    Off,
+    /// Only what the working tree has changed since that middle version,
+    /// with the lines it had already changed marked. The quiet view:
+    /// your own newer edits, and which of them are second attempts.
+    Mine,
+    /// All three versions at once: the base branch on the left, the
+    /// working tree on the right, and each row painted by the step that
+    /// wrote it.
+    Full,
+}
+
+impl Layers {
+    /// The next setting `s` moves to.
+    pub fn next(self) -> Self {
+        match self {
+            Layers::Off => Layers::Full,
+            Layers::Full => Layers::Mine,
+            Layers::Mine => Layers::Off,
+        }
+    }
+
+    /// What the status line and the ☰ menu call it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Layers::Off => "off",
+            Layers::Full => "the whole stack",
+            Layers::Mine => "only what is new",
+        }
+    }
+
+    pub fn on(self) -> bool {
+        self != Layers::Off
+    }
 }
 
 pub struct CommentDraft {
@@ -1203,6 +1251,8 @@ pub enum ButtonId {
     /// One row that flips between split and inline (the toolbar used to
     /// spend two buttons on this).
     ViewToggle,
+    /// ☰ → the layers line: one layer of the change, or three.
+    LayersCycle,
     /// One row that flips the file panel between tree and flat.
     TreeToggle,
     /// The finder, opened straight into one of its three modes.
@@ -1957,6 +2007,10 @@ struct Workspace {
     pr: Option<PrDetail>,
     checked_out: bool,
     merge_base: String,
+    /// The two sides always travel together: a pull request's stack is
+    /// written against its base branch, and local review's against
+    /// `origin/HEAD`, so the swap has to carry the right one.
+    stack_base: String,
     files: Vec<ChangedFile>,
     viewed: HashSet<String>,
     stage: HashMap<String, StageState>,
@@ -2101,6 +2155,9 @@ pub struct LocalOpenedData {
     merge_op: Option<MergeOp>,
     /// How far the branch has drifted from the branch it tracks.
     tracking: Option<Tracking>,
+    /// What the branch's whole change is written against, for the stacked
+    /// diff. See [`gitops::default_base`].
+    stack_base: Option<String>,
 }
 
 /// A finished revert: what it undid, and the file reloaded from disk when
@@ -2451,6 +2508,14 @@ pub struct App {
     /// other action clears it, so the second press has to be deliberate.
     discard_armed: bool,
     pub merge_base: String,
+    /// The commit the branch's whole change is written against — the
+    /// bottom of the stacked diff. The same thing as `merge_base` under a
+    /// pull request; local review diffs against HEAD instead, so it reads
+    /// this from `origin/HEAD` when it opens. Empty when the repository
+    /// cannot say, which is what turns [`Layers`] off.
+    pub stack_base: String,
+    /// How many layers of the change the diff draws. See [`Layers`].
+    pub layers: Layers,
     pub files: Vec<ChangedFile>,
     /// Paths marked as viewed (mirrors the GitHub PR page checkmarks).
     /// PR review only — local review stages files instead.
@@ -2854,6 +2919,8 @@ impl App {
             review: ReviewBox::new(),
             discard_armed: false,
             merge_base: String::new(),
+            stack_base: String::new(),
+            layers: Layers::default(),
             files: Vec::new(),
             viewed: HashSet::new(),
             stage: HashMap::new(),
@@ -3687,6 +3754,9 @@ impl App {
                 // Old side of every diff: HEAD (empty in a commitless repo —
                 // show_file then yields None and files render as added).
                 self.merge_base = d.head.unwrap_or_default();
+                // …and the bottom of the stack: what the whole branch is
+                // written against, rather than what its last commit was.
+                self.stack_base = d.stack_base.unwrap_or_default();
                 self.reset_blame_review();
                 self.files = d.files;
                 self.viewed.clear();
@@ -3759,6 +3829,9 @@ impl App {
                 }
                 self.checked_out = d.checked_out;
                 self.merge_base = d.merge_base;
+                // Under a pull request the two are the same commit: the
+                // change is already written against the base branch.
+                self.stack_base = self.merge_base.clone();
                 self.reset_blame_review();
                 self.files = d.files;
                 self.viewed = d.viewed;
@@ -4134,6 +4207,7 @@ impl App {
                     stage: gitops::stage_states(&root).unwrap_or_default(),
                     merge_op: gitops::merge_op(&root),
                     tracking: gitops::tracking(&root),
+                    stack_base: gitops::default_base(&root),
                 })))
             },
         );
@@ -4211,6 +4285,11 @@ impl App {
                 new_ref: c.oid.clone(),
                 from_disk: false,
                 anchor: false,
+                // A commit is one step of the change, already; there is
+                // no second step under it to layer.
+                layers: Layers::Off,
+                stack_base: String::new(),
+                pushed_ref: String::new(),
                 root: self.repo_root.clone(),
             },
             None => LoadCtx {
@@ -4222,8 +4301,77 @@ impl App {
                     .unwrap_or_default(),
                 from_disk: self.checked_out,
                 anchor: !self.local,
+                layers: self.layers_now(),
+                stack_base: self.stack_base.clone(),
+                pushed_ref: self.pushed_ref(),
                 root: self.repo_root.clone(),
             },
+        }
+    }
+
+    /// The middle version of the stack: the branch as it already stood,
+    /// before whatever the reader is doing to it now.
+    ///
+    /// A pull request names its own head, which is exactly the copy
+    /// GitHub is showing reviewers. Local review has no pull request to
+    /// ask, so it takes the branch's upstream — the same commit whenever
+    /// the pull request is up to date, and the honest answer when it is
+    /// not. A branch with nothing on the remote falls back to HEAD: the
+    /// middle is then what is committed and the top is what is not, which
+    /// is the same question one step earlier and the one that matters
+    /// before the first push.
+    ///
+    /// Empty only where there is no such version at all — a repository
+    /// with no commits.
+    fn pushed_ref(&self) -> String {
+        if let Some(pr) = &self.pr {
+            return pr.head_ref_oid.clone();
+        }
+        if let Some(up) = self.tracking.as_ref().map(|t| t.upstream.clone()) {
+            if !up.is_empty() {
+                return up;
+            }
+        }
+        // Local review's old side is HEAD already, so this is it.
+        if self.local {
+            return self.merge_base.clone();
+        }
+        String::new()
+    }
+
+    /// True where all three versions of a file exist to be read: a
+    /// working tree on top, something on the remote (or committed) under
+    /// it, and a base branch under that.
+    pub fn layers_possible(&self) -> bool {
+        self.checked_out
+            && self.open_commit.is_none()
+            && !self.stack_base.is_empty()
+            && !self.pushed_ref().is_empty()
+    }
+
+    /// The layers actually in force.
+    ///
+    /// The setting itself can arrive from the config file, which is read
+    /// before any review is open and so before there is anything to check
+    /// it against — and a review can stop being able to draw them
+    /// afterwards, by opening a commit. Everything that reads the setting
+    /// reads it through here, so the diff, the change bar and the title
+    /// never disagree about what is on screen.
+    pub fn layers_now(&self) -> Layers {
+        if self.layers_possible() {
+            self.layers
+        } else {
+            Layers::Off
+        }
+    }
+
+    /// What the middle version of the stack is, in words: the message
+    /// that offers the setting has to say what the purple stands for.
+    fn pushed_label(&self) -> &'static str {
+        if self.pr.is_some() || self.tracking.is_some() {
+            "already pushed"
+        } else {
+            "already committed"
         }
     }
 
@@ -4253,6 +4401,86 @@ impl App {
         self.spawn(format!("Loading {}", file.path), true, false, move || {
             load_file_data(idx, file, ctx).map(|d| Outcome::FileLoaded(Box::new(d)))
         });
+    }
+
+    /// Read the file on screen again, whatever the pane already holds
+    /// for it.
+    ///
+    /// [`Self::spawn_load_file`] swaps to a tab it already has, which is
+    /// what makes a tab a place. This is for the one case where every
+    /// tab in hand is out of date: a change of [`Layers`] means each was
+    /// read between the wrong two versions of its file.
+    fn reload_open_file(&mut self) {
+        // The parked tabs were read under the old setting too. Dropping
+        // them costs their scroll and their folds, and is what lets the
+        // row promise that every tab in it agrees with the status line.
+        // The row itself is `tab_order`, so no tab is closed by this;
+        // opening one reads it again.
+        self.parked_diffs.clear();
+        let Some(idx) = self
+            .diff_path()
+            .and_then(|p| self.files.iter().position(|f| f.path == p))
+        else {
+            return;
+        };
+        let Some(file) = self.files.get(idx).cloned() else {
+            return;
+        };
+        let ctx = self.file_load_ctx();
+        self.spawn(format!("Loading {}", file.path), true, false, move || {
+            load_file_data(idx, file, ctx).map(|d| Outcome::FileLoaded(Box::new(d)))
+        });
+    }
+
+    /// `s`: walk between one layer of the change and three (see
+    /// [`Layers`]).
+    ///
+    /// It refuses rather than turning on a setting that would draw the
+    /// same thing twice: with nothing pushed there is no middle version
+    /// to layer against, and with no `origin/HEAD` there is no bottom.
+    /// Both messages say which half is missing.
+    pub fn cycle_layers(&mut self) {
+        if self.open_commit.is_some() {
+            self.err("A commit is one step of the change already — s layers a branch.");
+            return;
+        }
+        let next = self.layers.next();
+        let under = self.pushed_label();
+        if next.on() {
+            // The top of the stack is the working tree. A read-only
+            // review has none: its new side is the pushed branch itself,
+            // so every row would come out purple and the setting would
+            // look broken rather than empty.
+            if !self.checked_out {
+                self.err(
+                    "This review is read-only — there is no working tree over the pushed branch to lay anything on. Check the branch out first.",
+                );
+                return;
+            }
+            if self.pushed_ref().is_empty() {
+                self.err(
+                    "This branch has no commits yet — there is nothing under your changes to lay them over.",
+                );
+                return;
+            }
+            if self.stack_base.is_empty() {
+                self.err(
+                    "No default branch on the remote — loupe cannot tell where this branch's own change starts.",
+                );
+                return;
+            }
+        }
+        self.layers = next;
+        self.ok(match next {
+            Layers::Off => "Layers off — the change as a whole.".to_string(),
+            Layers::Full => format!(
+                "Layers: the whole stack — purple is {under}, green and red are new, amber is written twice."
+            ),
+            Layers::Mine => format!(
+                "Layers: only what is new — amber where it lands on lines {under}."
+            ),
+        });
+        self.reload_open_file();
     }
 
     // -------------------------------------------------------- blame pane
@@ -4722,6 +4950,21 @@ impl App {
             return None;
         }
         self.diff.as_ref()?.section_at(self.entry_row(entry))
+    }
+
+    /// True when the section on this display row holds a line the change
+    /// has now written twice — the ‡ the change bar marks while the
+    /// layers are on. See [`crate::diff::Layer::Rework`].
+    pub fn rework_on_row(&self, display_row: usize) -> bool {
+        let Some((s, e)) = self.section_on_row(display_row) else {
+            return false;
+        };
+        let Some(d) = self.diff.as_ref() else {
+            return false;
+        };
+        d.rows[s..e.min(d.rows.len())]
+            .iter()
+            .any(|r| r.layer == Layer::Rework)
     }
 
     /// What the change bar draws on a display row: `Some(true)` on the first
@@ -5414,6 +5657,17 @@ impl App {
 
     /// The same guard, for a file named by the row that was clicked.
     fn revert_allowed_for(&mut self, idx: usize) -> bool {
+        // The layered diff is a reading of three versions, not a
+        // before-and-after of two: its left column is the base branch,
+        // and putting a section back would write the pull request's own
+        // work out of the file along with the edit the reader meant. `s`
+        // is one key away, and the flat diff reverts as it always has.
+        if self.layers_now().on() {
+            self.err(
+                "Layers are on — the left column is the base branch, not the file as it was. Press s to turn them off before reverting.",
+            );
+            return false;
+        }
         if self.file_conflicted(idx) {
             self.err(
                 "This file has a merge conflict — press o to resolve it. Reverting would undo the merge.",
@@ -7517,6 +7771,10 @@ impl App {
                     KeyCode::Esc => self.back_to_pr_list(),
                     KeyCode::Char('v') => self.toggle_view(),
                     KeyCode::Char('z') => self.toggle_fold(),
+                    // The three layers of a branch's change: one, three,
+                    // and the step in between. `S` is the stash, and the
+                    // two are as unrelated as `b` and `B` already are.
+                    KeyCode::Char('s') => self.cycle_layers(),
                     // Put changes back: the section at the cursor, or (with
                     // shift) the whole file. Both ask first.
                     KeyCode::Char('u') => self.ask_revert_section(self.diff_cursor),
@@ -9111,6 +9369,16 @@ impl App {
             ButtonId::FoldToggle,
             self.collapse_unchanged,
         ));
+        // Greyed rather than hidden when the branch has nothing pushed:
+        // "there is nothing under your changes yet" is a more useful
+        // answer than a menu that quietly has one fewer line.
+        rows.push(MenuRow::Item(MenuItem {
+            label: format!("▤  Layers — {}", self.layers.label()),
+            hint: "s",
+            id: ButtonId::LayersCycle,
+            enabled: self.layers_possible(),
+            checked: Some(self.layers.on()),
+        }));
         rows.push(switch(
             "🌲 Tree file panel".into(),
             "",
@@ -9724,6 +9992,7 @@ impl App {
         }
         match id {
             ButtonId::ViewToggle => self.toggle_view(),
+            ButtonId::LayersCycle => self.cycle_layers(),
             ButtonId::EditorFind => {
                 if let Some(ed) = &mut self.editor {
                     ed.open_find();
@@ -13207,6 +13476,15 @@ impl App {
             self.editor = None;
             self.preview = None;
             self.ok(format!("{path} — {} open.", self.tab_order.len()));
+            return;
+        }
+        // The tab is in the row but its diff is not in hand: a change of
+        // [`Layers`] dropped every parked one, because each was read
+        // between the wrong two versions. Read this one again.
+        if let Some(idx) = self.files.iter().position(|f| f.path == path) {
+            self.editor = None;
+            self.preview = None;
+            self.spawn_load_file(idx);
         }
     }
 
@@ -13864,6 +14142,7 @@ impl App {
             pr: self.pr.take(),
             checked_out: self.checked_out,
             merge_base: std::mem::take(&mut self.merge_base),
+            stack_base: std::mem::take(&mut self.stack_base),
             files: std::mem::take(&mut self.files),
             viewed: std::mem::take(&mut self.viewed),
             stage: std::mem::take(&mut self.stage),
@@ -13894,6 +14173,7 @@ impl App {
         self.pr = ws.pr;
         self.checked_out = ws.checked_out;
         self.merge_base = ws.merge_base;
+        self.stack_base = ws.stack_base;
         self.reset_blame_review();
         self.files = ws.files;
         self.viewed = ws.viewed;
@@ -14008,6 +14288,7 @@ impl App {
                     stage: gitops::stage_states(&root).unwrap_or_default(),
                     merge_op: gitops::merge_op(&root),
                     tracking: gitops::tracking(&root),
+                    stack_base: gitops::default_base(&root),
                 })))
             })());
         });
@@ -14080,6 +14361,9 @@ impl App {
                 let cur = self.files.get(self.file_cursor).map(|f| f.path.clone());
                 self.pr = Some(d.detail);
                 self.merge_base = d.merge_base;
+                // Under a pull request the two are the same commit: the
+                // change is already written against the base branch.
+                self.stack_base = self.merge_base.clone();
                 // A refresh that found nothing must leave the pane alone;
                 // resetting here would blank it with nothing on the way
                 // to fill it back in.
@@ -14270,6 +14554,7 @@ fn scan_local(root: &Path) -> Result<LocalOpenedData> {
         stage: gitops::stage_states(root).unwrap_or_default(),
         merge_op: gitops::merge_op(root),
         tracking: gitops::tracking(root),
+        stack_base: gitops::default_base(root),
     })
 }
 
@@ -14291,6 +14576,14 @@ pub struct LoadCtx {
     /// Also read the copy at `new_ref`, which is what an inline comment
     /// anchors its line numbers to. Only a pull request has comments.
     anchor: bool,
+    /// How many layers of the change to draw. See [`Layers`].
+    layers: Layers,
+    /// Bottom of the stack: what the branch's whole change is written
+    /// against. Empty means there is none to read, and the layers fall
+    /// back to the flat diff.
+    stack_base: String,
+    /// Middle of the stack: the branch as the remote has it. Same.
+    pushed_ref: String,
     root: PathBuf,
 }
 
@@ -14300,6 +14593,9 @@ fn load_file_data(idx: usize, file: ChangedFile, ctx: LoadCtx) -> Result<FileLoa
         new_ref,
         from_disk,
         anchor,
+        layers,
+        stack_base,
+        pushed_ref,
         root,
     } = ctx;
     // A conflicted file is a different question, so it gets a different
@@ -14351,7 +14647,40 @@ fn load_file_data(idx: usize, file: ChangedFile, ctx: LoadCtx) -> Result<FileLoa
             _ => true,
         }
     };
-    let diff = FileDiff::compute(old.as_deref(), new.as_deref());
+    // With the layers on, the diff reads a third version of the file —
+    // the branch as the remote has it — and says of every row which step
+    // of the change wrote it. The left column moves with it: the whole
+    // stack is drawn against the base branch, "since the push" against
+    // the push itself. Anything the repository cannot answer (no
+    // upstream, no `origin/HEAD`, a conflicted file) falls back to the
+    // flat diff rather than showing a stack with a layer missing.
+    let layered =
+        (layers.on() && !file.conflicted && !stack_base.is_empty() && !pushed_ref.is_empty()).then(
+            || {
+                let base = gitops::show_file(&root, &stack_base, file.old_path());
+                // A rename the push already carries sits at the new path there;
+                // one made since the push is still at the old one.
+                let pushed = gitops::show_file(&root, &pushed_ref, &file.path)
+                    .or_else(|| gitops::show_file(&root, &pushed_ref, file.old_path()));
+                match layers {
+                    Layers::Mine => (
+                        pushed.clone(),
+                        FileDiff::since_push(base.as_deref(), pushed.as_deref(), new.as_deref()),
+                    ),
+                    _ => (
+                        base.clone(),
+                        FileDiff::stack(base.as_deref(), pushed.as_deref(), new.as_deref()),
+                    ),
+                }
+            },
+        );
+    let (old, diff) = match layered {
+        Some(pair) => pair,
+        None => {
+            let d = FileDiff::compute(old.as_deref(), new.as_deref());
+            (old, d)
+        }
+    };
     // Highlighting dominates load time (hundreds of ms per side on
     // large files); do the two sides in parallel.
     let (old_hl, new_hl) = thread::scope(|s| {
@@ -15943,6 +16272,162 @@ b2
         for c in text.chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
+    }
+
+    /// An app in local review with something pushed under it, so the
+    /// layers have all three versions to read.
+    fn layered_app() -> App {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.stack_base = "b".repeat(40);
+        // The top of the stack is the working tree, so the branch has to
+        // be checked out for any of this to mean anything.
+        app.checked_out = true;
+        app.tracking = Some(crate::gitops::Tracking {
+            upstream: "origin/feature".into(),
+            ahead: 1,
+            behind: 0,
+        });
+        app
+    }
+
+    /// `s` walks the three settings and comes back to where it started.
+    #[test]
+    fn s_walks_the_layers_and_back() {
+        let mut app = layered_app();
+        assert_eq!(app.layers, Layers::Off);
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.layers, Layers::Full);
+        assert!(app.status.contains("whole stack"), "{}", app.status);
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.layers, Layers::Mine);
+        assert!(app.status.contains("only what is new"), "{}", app.status);
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.layers, Layers::Off);
+    }
+
+    /// With no middle version at all the setting would draw exactly what
+    /// is already on screen. Refuse it and say why, rather than turning
+    /// on something that looks broken.
+    #[test]
+    fn the_layers_refuse_a_branch_with_no_commits() {
+        let mut app = layered_app();
+        app.tracking = None;
+        app.local = false;
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.layers, Layers::Off);
+        assert!(app.status_err);
+        assert!(app.status.contains("no commits yet"), "{}", app.status);
+    }
+
+    /// …and one whose remote has no default branch has no bottom.
+    #[test]
+    fn the_layers_refuse_a_repository_with_no_default_branch() {
+        let mut app = layered_app();
+        app.stack_base = String::new();
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.layers, Layers::Off);
+        assert!(app.status_err);
+        assert!(app.status.contains("No default branch"), "{}", app.status);
+    }
+
+    /// The layered diff reads the base branch on the left, so putting a
+    /// section back would write the pull request's own work out of the
+    /// file along with the edit the reader meant. Refused, with the key
+    /// that undoes the refusal in the message.
+    #[test]
+    fn a_revert_is_refused_while_the_layers_are_on() {
+        let mut app = layered_app();
+        app.files = vec![ChangedFile {
+            path: "code.rs".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            previous: None,
+            conflicted: false,
+        }];
+        app.rebuild_files();
+        app.diff = Some(FileDiff::stack(
+            Some("one\ntwo\n"),
+            Some("one\nTWO\n"),
+            Some("one\nTHREE\n"),
+        ));
+        app.rebuild_display();
+        app.layers = Layers::Full;
+        app.handle_key(key(KeyCode::Char('u')));
+        assert!(app.status_err);
+        assert!(app.status.contains("Press s"), "{}", app.status);
+        assert!(
+            matches!(app.overlay, Overlay::None),
+            "no confirm prompt was opened"
+        );
+    }
+
+    /// The refs a load carries. The layers need a bottom and a middle,
+    /// and either one wrong would draw a stack of the wrong versions.
+    #[test]
+    fn a_load_carries_the_refs_the_layers_need() {
+        let mut app = layered_app();
+        app.layers = Layers::Full;
+        let ctx = app.file_load_ctx();
+        assert_eq!(ctx.layers, Layers::Full);
+        assert_eq!(ctx.stack_base, "b".repeat(40));
+        assert_eq!(ctx.pushed_ref, "origin/feature");
+    }
+
+    /// A branch with nothing on the remote still has a middle version:
+    /// what is committed. The layers then say which of the edits in front
+    /// of the reader land on lines this branch's own commits already
+    /// wrote — the same question, one step before the first push.
+    #[test]
+    fn an_unpushed_branch_layers_against_its_own_commits() {
+        let mut app = layered_app();
+        app.tracking = None;
+        // Local review's old side is HEAD, and so is the middle version.
+        app.merge_base = "a".repeat(40);
+        assert_eq!(app.pushed_ref(), "a".repeat(40));
+        assert_eq!(app.pushed_label(), "already committed");
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.layers, Layers::Full);
+        assert!(
+            app.status.contains("already committed"),
+            "the message says what the purple stands for: {}",
+            app.status
+        );
+    }
+
+    /// A read-only review has no working tree over the pushed branch, so
+    /// there is no top layer and every row would come out purple.
+    #[test]
+    fn the_layers_refuse_a_read_only_review() {
+        let mut app = layered_app();
+        app.checked_out = false;
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.layers, Layers::Off);
+        assert!(app.status_err);
+        assert!(app.status.contains("read-only"), "{}", app.status);
+    }
+
+    /// A commit out of the Commits panel is one step of the change
+    /// already; there is no second step under it to lay anything over.
+    #[test]
+    fn the_layers_stand_down_on_a_commits_panel_file() {
+        let mut app = layered_app();
+        app.open_commit = Some(OpenCommit {
+            oid: "a".repeat(40),
+            short: "aaaaaaa".into(),
+            subject: "a commit".into(),
+            parent: "b".repeat(40),
+            file: 0,
+        });
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.layers, Layers::Off);
+        assert!(
+            app.status.contains("A commit is one step"),
+            "{}",
+            app.status
+        );
     }
 
     /// The theme picker previews live (selection switches the process-wide
@@ -17964,6 +18449,7 @@ b2
                 stage: HashMap::new(),
                 merge_op: None,
                 tracking: None,
+                stack_base: None,
             })),
             true,
         );
@@ -19100,6 +19586,7 @@ more
             pr: Some(pr_detail(number)),
             checked_out: true,
             merge_base: "c".repeat(40),
+            stack_base: "c".repeat(40),
             files: vec![cf("other.rs")],
             viewed: HashSet::new(),
             stage: HashMap::new(),

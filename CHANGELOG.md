@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Three layers of your own change, in three colours (`s`).** A branch
+  has two steps in it, not one: what the remote already has, and what you
+  have done since. Every diff tool draws the sum of the two, which
+  answers *what does this branch do* and cannot answer *am I rewriting
+  what I already wrote*. `s` reads three versions of the file — the base
+  branch, the branch as the remote has it (or your last commit, before
+  you push), and the working tree — and paints every row by the step that
+  wrote it: purple for what is already pushed and reviewed, green and red
+  for what is new since, and amber for a line this change has now written
+  **twice**. A `‡` in the change bar marks every section with amber in
+  it, and the title counts them — `‡ 3 lines written twice`, or `nothing
+  written twice`. `s` again drops the pull request's own changes and
+  leaves your newer edits alone with the amber still on them; once more
+  turns it off. It matters most when an agent wrote the diff: a hundred
+  green lines look the same whether they are new work or a third attempt
+  at the same function. Reverting is refused while the layers are on —
+  the left column is the base branch, not the file as it was.
+
 - **Loupe follows the terminal from light to dark and back, while it
   runs.** The background was asked about once at startup; it is asked
   again every half minute while you are idle, so a system that turns dark

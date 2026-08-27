@@ -83,6 +83,23 @@
 # `r` or the ⟳ button. Toggle it for one session from the ☰ menu.
 #auto_refresh = true
 
+# How many layers of your own change the diff draws when it opens, and
+# what `s` starts on. A branch has two steps in it — what the remote
+# already has, and what you have done since — and this reads three
+# versions of each file instead of two: the base branch, the branch as
+# the remote has it (or your last commit, before you push), and the
+# working tree.
+#
+#   "off"    one layer, the change as a whole (the default)
+#   "stack"  all three: purple is already pushed, green and red are new,
+#            amber is a line this change has now written twice
+#   "new"    only what has changed since the push, amber still marked
+#
+# Off by default: it costs two more `git show` calls per file opened, and
+# most reviews are of somebody else's branch, where "what have I already
+# changed" is not the question. `s` walks the three either way.
+#layers = "off"
+
 # The blame pane, between the file panel and the diff: who last touched
 # each line, how long ago, and the pull request it landed in. Off by
 # default — it costs a `git blame` per file and about 30 columns of

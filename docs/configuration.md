@@ -367,6 +367,28 @@ that moves a few times a day. `r` (or the `⟳` button) fetches it, and
 Set `false` to turn the idle re-scan off for good, or flip it for one
 session from `☰ → Refresh while idle`.
 
+### `layers` — start the diff layered
+
+```toml
+layers = "off"     # the default
+```
+
+How many layers of your own change the diff draws when it opens, and what
+`s` starts on.
+
+| Value | What the diff shows |
+| --- | --- |
+| `"off"` | One layer: the change as a whole. What every diff tool shows |
+| `"stack"` | All three versions: purple is already pushed, green and red are new since, amber is a line this change has now written twice |
+| `"new"` | Only what has changed since the push, with the amber still marked |
+
+Off by default. It costs two more `git show` calls per file opened, and
+most reviews are of somebody else's branch, where *"what have I already
+changed"* is not the question. `s` walks the three either way, and the
+`☰` menu has the same line.
+
+See [Layers](keys-and-mouse.md#layers--what-you-already-changed-and-what-is-new).
+
 ### `blame` / `blame_width` / `blame_pr_lookup` — the blame pane
 
 ```toml

@@ -270,6 +270,64 @@ less than painting neither. A whole added or removed line has no
 counterpart to differ from, so every character of it is the change and it
 keeps one shade too.
 
+## Layers — what you already changed, and what is new
+
+Press `s`.
+
+A branch has two steps in it, not one: what the remote already has, and
+what you have done since. Every diff tool draws the sum of the two and
+calls it the change. That answers *"what does this branch do"* and cannot
+answer *"am I rewriting what I already wrote"* — the question that
+matters when an agent hands you a hundred lines and you have to tell new
+work from a second attempt at old work.
+
+`s` reads three versions of the file instead of two:
+
+| Version | Where it comes from |
+| --- | --- |
+| **Base** | The merge base with the base branch (a PR) or with `origin/HEAD` (local review) |
+| **Pushed** | The PR head on GitHub, or the branch's upstream. With nothing pushed yet, your last commit |
+| **Working tree** | The file on disk |
+
+The diff still reads base on the left and working tree on the right — it
+is the same change a reviewer would see. What is new is the colour:
+
+| Colour | Meaning |
+| --- | --- |
+| **Purple** | The pushed branch changed this line and you have not touched it since — already in the pull request |
+| **Green / red** | Only the working tree changed it — new work, not pushed yet |
+| **Amber** | Both changed it — this change has now written the line **twice** |
+
+Amber is the one the setting exists for. A `‡` in the change bar marks
+every section with amber in it, and the title counts them:
+
+```
+ src/app.rs — +48 −6 · the whole stack · ‡ 3 lines written twice
+```
+
+…or `nothing written twice`, which is the answer you want.
+
+`s` again switches to **only what is new**: the pull request's own
+changes drop off the screen and you are left with your newer edits alone,
+with the amber still on the ones that land on lines the pull request had
+already rewritten. `s` once more turns the layers off.
+
+`▤  Layers` in the `☰` menu does the same, and is greyed out where there
+is nothing to layer — a branch with no commits, or a remote with no
+default branch.
+
+Two notes:
+
+- **A line you added since the push is green, not amber**, even inside a
+  block the pull request rewrote: it has no counterpart in the pushed
+  version for the pull request to have changed. The whole stack shows the
+  purple around it.
+- **Reverting is refused while the layers are on** (`u`, `U`, and the
+  `↺` marks, which stand down). The left column is the base branch, not
+  the file as it was, so putting a section back would write the pull
+  request's own work out of the file along with the edit you meant. Press
+  `s` to turn the layers off first.
+
 ## Diff view — move
 
 | Key | Action |
@@ -309,6 +367,7 @@ cursor.
 | Click `⌃⌃⌃ … click to fold ⌃⌃⌃` | Re-fold that run |
 | `z` or `☰ → Fold unchanged lines` | Fold / unfold every unchanged section |
 | `v` or `☰ → Switch to inline` / `Switch to split` | Toggle side-by-side vs. inline layout |
+| `s` or `☰ → Layers` | Walk the [layers](#layers--what-you-already-changed-and-what-is-new): off → the whole stack → only what is new |
 | `e` / `i`, double-click a new-side line, or `✎ Edit` | Edit the file at the cursor line |
 | `P` or `📖 Preview` | Render a markdown file as a document (see [Markdown preview](#markdown-preview)) |
 | `x` | Toggle *viewed* (stages the file in local review) |

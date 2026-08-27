@@ -11,7 +11,7 @@
 //! starts) rather than silently ignored — a typo'd config that "works" is
 //! worse than one that complains.
 
-use crate::app::LaunchMode;
+use crate::app::{LaunchMode, Layers};
 use crate::theme::Appearance;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -73,6 +73,14 @@ pub struct Config {
     /// with the editor or an overlay open, and never for a pull request —
     /// that side is refreshed on demand with `r` or the ⟳ button.
     pub auto_refresh: Option<bool>,
+    /// Start with the diff layered: `"off"` (the default), `"stack"` for
+    /// all three versions at once, or `"new"` for only what has changed
+    /// since the push. `s` walks the three either way.
+    ///
+    /// Off by default because it costs two more `git show` calls per file
+    /// opened, and because most reviews are of somebody else's branch,
+    /// where "what have I already changed" is not the question.
+    pub layers: Option<ConfigLayers>,
     /// Show the blame pane between the file panel and the diff from the
     /// start. Default false: it costs a `git blame` per file and about
     /// 30 columns of width, and not every review wants it. `B` (or the
@@ -129,6 +137,26 @@ pub enum ConfigMode {
     Local,
 }
 
+/// `layers = "off" | "stack" | "new"` — how many layers of the change the
+/// diff draws when it opens. See [`crate::app::Layers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigLayers {
+    Off,
+    Stack,
+    New,
+}
+
+impl From<ConfigLayers> for Layers {
+    fn from(l: ConfigLayers) -> Self {
+        match l {
+            ConfigLayers::Off => Layers::Off,
+            ConfigLayers::Stack => Layers::Full,
+            ConfigLayers::New => Layers::Mine,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfigAppearance {
@@ -183,6 +211,7 @@ impl Config {
             format_on_save: over.format_on_save.or(self.format_on_save),
             suggest_while_typing: over.suggest_while_typing.or(self.suggest_while_typing),
             auto_refresh: over.auto_refresh.or(self.auto_refresh),
+            layers: over.layers.or(self.layers),
             blame: over.blame.or(self.blame),
             blame_width: over.blame_width.or(self.blame_width),
             blame_pr_lookup: over.blame_pr_lookup.or(self.blame_pr_lookup),
@@ -351,6 +380,7 @@ mod tests {
             "language_servers = false\n",
             "format_on_save = true\n",
             "auto_refresh = false\n",
+            "layers = \"stack\"\n",
             "blame = true\n",
             "blame_width = 26\n",
             "blame_pr_lookup = false\n",
@@ -369,6 +399,7 @@ mod tests {
                 format_on_save: Some(true),
                 suggest_while_typing: None,
                 auto_refresh: Some(false),
+                layers: Some(ConfigLayers::Stack),
                 blame: Some(true),
                 blame_width: Some(26),
                 blame_pr_lookup: Some(false),

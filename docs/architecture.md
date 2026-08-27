@@ -11,7 +11,7 @@ threading model, and the invariants that are easy to break by accident.
 | `main.rs` | CLI parsing, config load, terminal setup/teardown, the event loop |
 | `app.rs` | All application state (`App`), input handling, background-job orchestration |
 | `ui.rs` | Rendering: layout, file panel, diff view, buttons, overlays, status bar |
-| `diff.rs` | The diff engine: `FileDiff` computation, folding, display entries, line widths |
+| `diff.rs` | The diff engine: `FileDiff` computation, the three-version `stack`, folding, display entries, line widths |
 | `conflict.rs` | Merge conflict markers: parsing them into hunks, building the two sides, writing a resolution back |
 | — | Reviews live in `github.rs` (the request) and `app.rs` (the held batch and the composer) |
 | `blame.rs` | `git blame --porcelain` parsing, the age heat ramp, the change set |
@@ -49,6 +49,13 @@ background they are drawn on:
 - **`highlight.rs`** owns the syntax colors, which come from the syntect
   theme. Themes classify themselves as light or dark by their own
   background color, and `for_appearance` maps one to its counterpart.
+
+A diff row's background comes from two questions, not one: which side of
+the change it is on, and — with the layers on — which step of the change
+wrote it. `Palette::layer` answers the second by handing back a `Shades`
+of four colors, and `ui::diff_bg` picks one of the four by side and row
+kind. `Layer::Local` reads its shades off the flat `added` / `removed`
+fields, so an ordinary two-way diff paints exactly what it always did.
 
 `main.rs` settles the appearance once, immediately after
 `ratatui::init()` — raw mode is on, and nothing is reading events yet, so

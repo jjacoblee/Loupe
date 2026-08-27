@@ -62,6 +62,12 @@ double-click the divider to reset. A starting width can be set with the
   the same extended syntax set as [bat](https://github.com/sharkdp/bat),
   with green/red backgrounds layered underneath added/removed lines. Pick
   a theme with the `theme` config key (`loupe --themes` lists all 32).
+- **Layers**: `s` reads three versions of the file instead of two — the
+  base branch, the PR head on GitHub, and your working tree — and paints
+  every row by the step that wrote it. Purple is already pushed and
+  reviewed, green and red are your edits since, amber is a line this
+  change has now written **twice**. The title counts the amber. See
+  [Layers](keys-and-mouse.md#layers--what-you-already-changed-and-what-is-new).
 - **Folding**: unchanged stretches collapse to a
   `··· N unchanged lines ···` row; click to expand. Expanded runs keep a
   `⌃⌃⌃ … click to fold ⌃⌃⌃` header to put them back. `☰ → Fold unchanged lines`

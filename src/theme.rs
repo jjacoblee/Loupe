@@ -25,6 +25,7 @@
 //! restart. Steps 1 and 2 turn that off: pinning an appearance means
 //! pinning it. See [`crate::app::App::wants_appearance_check`].
 
+use crate::diff::Layer;
 use ratatui::style::Color;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -68,6 +69,25 @@ impl Appearance {
 
 // ------------------------------------------------------------------ palette
 
+/// The four backgrounds one layer of a diff is painted in: the two sides
+/// of a change, and the stronger shade the changed words take inside each.
+///
+/// One hue per layer, two lightnesses per hue. The column a row sits in
+/// already says whether it is the old side or the new one, so the hue is
+/// free to say something the column cannot: which layer of the change
+/// wrote the line (see [`crate::diff::Layer`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Shades {
+    /// Background of the old side.
+    pub old: Color,
+    /// Background of the new side.
+    pub new: Color,
+    /// The stronger shade the changed words take on the old side…
+    pub old_word: Color,
+    /// …and on the new one.
+    pub new_word: Color,
+}
+
 /// Every color the UI paints itself with. Two instances exist: [`DARK`] and
 /// [`LIGHT`]. Syntax colors are *not* here — those come from the syntect
 /// theme, which is chosen to match the appearance.
@@ -85,6 +105,21 @@ pub struct Palette {
     /// where. A second hue would be a second thing to learn.
     pub added_word: Color,
     pub removed_word: Color,
+
+    /// The two layers a stacked diff paints besides the red and green
+    /// above (see [`crate::diff::Layer`] and [`Palette::layer`]).
+    ///
+    /// `pushed` is the pull request's own change — already on the remote,
+    /// already reviewed. It is the purple the `PR #N` badge is, so one
+    /// color means the pull request everywhere loupe draws it.
+    ///
+    /// `rework` is a line the pull request changed and the working tree
+    /// is changing again. Amber, because it is the one the reader is
+    /// looking for: everything else on screen is work, and this is work
+    /// done twice.
+    pub pushed: Shades,
+    pub rework: Shades,
+
     /// Filler where one side of a side-by-side diff has no line at all.
     pub empty: Color,
     /// Background of a selected diff line.
@@ -211,11 +246,42 @@ pub struct Palette {
 }
 
 /// For a dark terminal background. These are the colors loupe shipped with.
+impl Palette {
+    /// The four shades one layer of a stacked diff is painted in.
+    ///
+    /// [`Layer::Local`] is the red and green every diff has, so it reads
+    /// its shades off the flat fields rather than repeating them.
+    pub fn layer(&self, layer: Layer) -> Shades {
+        match layer {
+            Layer::Local => Shades {
+                old: self.removed,
+                new: self.added,
+                old_word: self.removed_word,
+                new_word: self.added_word,
+            },
+            Layer::Pushed => self.pushed,
+            Layer::Rework => self.rework,
+        }
+    }
+}
+
 pub const DARK: Palette = Palette {
     added: Color::Rgb(16, 50, 26),
     removed: Color::Rgb(58, 22, 22),
     added_word: Color::Rgb(28, 104, 52),
     removed_word: Color::Rgb(118, 38, 38),
+    pushed: Shades {
+        old: Color::Rgb(34, 24, 52),
+        new: Color::Rgb(46, 30, 74),
+        old_word: Color::Rgb(76, 50, 124),
+        new_word: Color::Rgb(98, 64, 158),
+    },
+    rework: Shades {
+        old: Color::Rgb(56, 36, 12),
+        new: Color::Rgb(72, 48, 14),
+        old_word: Color::Rgb(126, 84, 24),
+        new_word: Color::Rgb(158, 106, 28),
+    },
     empty: Color::Rgb(24, 24, 28),
     selected: Color::Rgb(28, 66, 120),
     matched: Color::Rgb(122, 92, 20),
@@ -289,6 +355,18 @@ pub const LIGHT: Palette = Palette {
     removed: Color::Rgb(255, 223, 219),
     added_word: Color::Rgb(154, 226, 175),
     removed_word: Color::Rgb(255, 175, 166),
+    pushed: Shades {
+        old: Color::Rgb(234, 228, 249),
+        new: Color::Rgb(223, 213, 247),
+        old_word: Color::Rgb(204, 188, 241),
+        new_word: Color::Rgb(186, 164, 236),
+    },
+    rework: Shades {
+        old: Color::Rgb(252, 238, 206),
+        new: Color::Rgb(250, 228, 178),
+        old_word: Color::Rgb(244, 213, 140),
+        new_word: Color::Rgb(238, 196, 106),
+    },
     empty: Color::Rgb(240, 240, 244),
     selected: Color::Rgb(200, 222, 250),
     matched: Color::Rgb(252, 222, 138),

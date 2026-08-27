@@ -279,6 +279,26 @@ Two ways to take over:
 - **`☰ → Refresh while idle`** — turn the polling off for this session.
   `auto_refresh = false` in your config turns it off for good.
 
+### Is it redoing its own work?
+
+Reading an agent's diff, the hard question is not *what does this do* —
+it is *have I seen this line before*. A hundred green lines look the same
+whether they are new work or the third attempt at the same function.
+
+`s` answers it. It layers three versions of the file — the base branch,
+what is already pushed (or committed, before you push), and the working
+tree — and paints each row by the step that wrote it: purple for what is
+already on the remote, green and red for what is new since, **amber for a
+line this change has now written twice**. The title counts the amber, so
+the answer arrives before you read a word:
+
+```
+ src/api.rs — +61 −18 · the whole stack · ‡ 12 lines written twice
+```
+
+Twelve lines rewritten twice in one file is thrash. Zero is progress.
+See [Layers](keys-and-mouse.md#layers--what-you-already-changed-and-what-is-new).
+
 ## The rest of the review
 
 These work the same way here as they do on a pull request, so they are

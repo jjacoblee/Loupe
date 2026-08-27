@@ -697,6 +697,29 @@ pub fn unpushed_base(root: &Path) -> Option<String> {
         .filter(|s| !s.is_empty() && s != "origin/HEAD")
 }
 
+/// The commit this branch's own work starts from: the merge base with the
+/// branch `origin/HEAD` names.
+///
+/// The bottom of the stacked diff (see [`crate::diff::FileDiff::stack`]).
+/// Local review reads its diff against HEAD, which is what one commit
+/// left behind rather than what the branch has done; this is what the
+/// whole branch is written against, and so what "the change against
+/// main" means.
+///
+/// `None` where the repository cannot answer: a clone with no
+/// `origin/HEAD` recorded, or no origin at all.
+pub fn default_base(root: &Path) -> Option<String> {
+    let r = root.to_string_lossy().into_owned();
+    let default = run_git(&["-C", &r, "rev-parse", "--abbrev-ref", "origin/HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "origin/HEAD")?;
+    run_git(&["-C", &r, "merge-base", &default, "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Most commits the panel will list. A branch that tracks nothing and
 /// forked long ago can be thousands of commits from the default branch,
 /// and a panel that long is a panel nobody reads.
@@ -946,6 +969,106 @@ mod tests {
         // Paths with spaces survive: only the first two columns are status.
         let m = parse_status_z("M  a file.txt\0");
         assert_eq!(m.get("a file.txt"), Some(&StageState::Staged));
+    }
+
+    /// The stacked diff, end to end against a real repository with a real
+    /// remote: the three refs it reads, the three versions they hold, and
+    /// the layer each row comes out with.
+    ///
+    /// The unit tests in `diff` prove the merge; this proves the plumbing
+    /// underneath it — that `origin/HEAD` names the base, that the
+    /// upstream names the pushed version, and that `git show` hands back
+    /// the right blob for each.
+    #[test]
+    fn the_stack_reads_three_real_versions() {
+        use crate::diff::{FileDiff, Layer, RowKind};
+
+        let root = std::env::temp_dir().join(format!("loupe-stack-{}", std::process::id()));
+        let bare = std::env::temp_dir().join(format!("loupe-stack-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&bare).unwrap();
+        let r = root.to_string_lossy().into_owned();
+        let b = bare.to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-C", r.as_str()];
+            full.extend_from_slice(args);
+            run_git(&full).unwrap();
+        };
+        run_git(&["init", "-q", "--bare", b.as_str()]).unwrap();
+        git(&["init", "-q", "."]);
+        // Name the default branch without relying on `git init -b`.
+        git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&["config", "user.email", "loupe@test"]);
+        git(&["config", "user.name", "loupe"]);
+        git(&["config", "core.autocrlf", "false"]);
+        git(&["remote", "add", "origin", b.as_str()]);
+
+        // The base branch.
+        std::fs::write(root.join("f.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["push", "-q", "-u", "origin", "main"]);
+        git(&["remote", "set-head", "origin", "-a"]);
+
+        // The branch, pushed: it rewrites "two" and "four".
+        git(&["checkout", "-q", "-b", "feature"]);
+        std::fs::write(root.join("f.txt"), "one\nTWO\nthree\nFOUR\n").unwrap();
+        git(&["commit", "-qam", "the pushed work"]);
+        git(&["push", "-q", "-u", "origin", "feature"]);
+
+        // …and the working tree since: a new edit to "three", and a
+        // second attempt at "four".
+        std::fs::write(root.join("f.txt"), "one\nTWO\nTHREE\nfour again\n").unwrap();
+
+        let base = default_base(&root).expect("origin/HEAD names the default branch");
+        let up = tracking(&root).expect("the branch tracks origin/feature");
+        assert_eq!(up.upstream, "origin/feature");
+        assert_eq!(up.ahead, 0, "everything on the branch is pushed");
+
+        let base_txt = show_file(&root, &base, "f.txt").unwrap();
+        let pushed_txt = show_file(&root, &up.upstream, "f.txt").unwrap();
+        let local_txt = std::fs::read_to_string(root.join("f.txt")).unwrap();
+        assert_eq!(base_txt, "one\ntwo\nthree\nfour\n");
+        assert_eq!(pushed_txt, "one\nTWO\nthree\nFOUR\n");
+
+        let d = FileDiff::stack(Some(&base_txt), Some(&pushed_txt), Some(&local_txt));
+        let seen: Vec<_> = d
+            .rows
+            .iter()
+            .map(|r| (r.kind, r.layer, r.new_text.as_deref()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (RowKind::Context, Layer::Local, Some("one")),
+                (RowKind::Modified, Layer::Pushed, Some("TWO")),
+                (RowKind::Modified, Layer::Local, Some("THREE")),
+                (RowKind::Modified, Layer::Rework, Some("four again")),
+            ]
+        );
+        assert_eq!(d.reworked, 1, "one line written twice");
+
+        // And the quiet half: the same three versions, without the
+        // branch's own change on screen.
+        let mine = FileDiff::since_push(Some(&base_txt), Some(&pushed_txt), Some(&local_txt));
+        let changed: Vec<_> = mine
+            .rows
+            .iter()
+            .filter(|r| r.kind != RowKind::Context)
+            .map(|r| (r.layer, r.new_text.as_deref()))
+            .collect();
+        assert_eq!(
+            changed,
+            vec![
+                (Layer::Local, Some("THREE")),
+                (Layer::Rework, Some("four again")),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bare);
     }
 
     /// Round-trip against a real repository: git is a hard dependency of

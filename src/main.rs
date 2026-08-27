@@ -22,7 +22,7 @@ mod ui;
 mod wizard;
 
 use anyhow::Result;
-use app::{App, LaunchMode};
+use app::{App, LaunchMode, Layers};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
@@ -532,6 +532,8 @@ struct Startup {
     /// `auto_refresh` — re-scan local changes while the reader is idle.
     auto_refresh: bool,
     /// `blame` — show the blame pane from the start.
+    /// How many layers the diff draws when it opens (`s` walks them).
+    layers: Layers,
     blame: bool,
     /// `blame_width` — its starting width in columns.
     blame_width: Option<u16>,
@@ -708,6 +710,7 @@ fn main() -> Result<()> {
         suggest_while_typing: cfg.suggest_while_typing.unwrap_or(true),
         linters: cfg.linters.unwrap_or(true),
         auto_refresh: cfg.auto_refresh.unwrap_or(true),
+        layers: cfg.layers.map(Layers::from).unwrap_or_default(),
         blame: cfg.blame.unwrap_or(false),
         blame_width: cfg.blame_width,
         blame_pr_lookup: cfg.blame_pr_lookup.unwrap_or(true),
@@ -772,6 +775,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, startup: Startup) -> Result<()> 
     app.suggest_while_typing = startup.suggest_while_typing;
     app.lint_enabled = startup.linters;
     app.auto_refresh = startup.auto_refresh;
+    app.layers = startup.layers;
     app.blame_on = startup.blame;
     app.blame_pr_lookup = startup.blame_pr_lookup;
     if let Some(w) = startup.file_panel_width {
@@ -918,6 +922,7 @@ mod tests {
             suggest_while_typing: true,
             linters: true,
             auto_refresh: true,
+            layers: Layers::default(),
             blame: false,
             blame_width: None,
             blame_pr_lookup: true,

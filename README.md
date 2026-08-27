@@ -61,6 +61,20 @@ leaving your terminal or touching a browser.
   rewrites only that conflict; the last one resolved stages the file so
   git knows it is settled. A conflict git could not write markers for
   (one side deleted the file) resolves whole from the index instead.
+- **Three layers of your own change, in three colors** — `s` stops the
+  diff pretending your branch happened all at once. It reads three
+  versions of the file — the base branch, the branch as the remote has it
+  (or your last commit, before you push), and the working tree — and
+  paints every row by the step that wrote it: **purple** for what is
+  already pushed and reviewed, **green and red** for what is new since,
+  and **amber** for a line this change has now written *twice*. A `‡` in
+  the change bar marks every section with amber in it and the title
+  counts them — *"3 lines written twice"*, or *"nothing written twice"*.
+  That is the question no other diff tool answers: when an agent hands
+  you a hundred lines, are you reviewing new work, or watching it redo
+  what it wrote an hour ago? `s` again drops the pull request's own
+  changes and leaves just your newer edits with the amber still on them;
+  once more turns it off.
 - **How far you have drifted** — `↑3 ↓2 origin/main` beside the branch
   name: commits you have not pushed, and commits waiting for you. `≡`
   when you are level with the upstream.

@@ -58,6 +58,30 @@ pub enum RowKind {
     Modified,
 }
 
+/// Which of a stacked diff's three layers changed a row.
+///
+/// An ordinary two-way diff has one layer and every row is
+/// [`Layer::Local`]. A stacked diff ([`FileDiff::stack`]) reads three
+/// versions of the file — the base branch, the branch as the remote has
+/// it, and the working tree — and says of each row which of the two
+/// steps between them produced it.
+///
+/// The one it exists for is [`Layer::Rework`]: a line the pushed branch
+/// already rewrote and the working tree is rewriting again. Nothing in a
+/// two-way diff can tell that apart from new work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layer {
+    /// The working tree changed it and the pushed branch did not. New
+    /// work, not on the remote yet.
+    #[default]
+    Local,
+    /// The pushed branch changed it and the working tree has not touched
+    /// it since. Already in the pull request.
+    Pushed,
+    /// Both changed it.
+    Rework,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Row {
     pub kind: RowKind,
@@ -75,6 +99,9 @@ pub struct Row {
     /// the reader has to compare character by character.
     pub old_words: Ranges,
     pub new_words: Ranges,
+    /// Which layer of a stacked diff changed this row. Always
+    /// [`Layer::Local`] in an ordinary two-way diff, which has one layer.
+    pub layer: Layer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +126,9 @@ pub struct FileDiff {
     /// Display width of the widest line on either side, tabs expanded —
     /// the bound for horizontal scrolling.
     pub max_width: usize,
+    /// Rows carrying [`Layer::Rework`] — lines this change has now
+    /// rewritten twice. Zero in an ordinary two-way diff.
+    pub reworked: usize,
 }
 
 /// Display width of a diff line, expanding tabs the way the renderer does.
@@ -261,8 +291,6 @@ impl FileDiff {
         let mut rows: Vec<Row> = Vec::new();
         let mut dels: Vec<(usize, String)> = Vec::new();
         let mut inss: Vec<(usize, String)> = Vec::new();
-        let mut additions = 0usize;
-        let mut deletions = 0usize;
 
         let flush = |rows: &mut Vec<Row>,
                      dels: &mut Vec<(usize, String)>,
@@ -281,6 +309,7 @@ impl FileDiff {
                     new_text: Some(inss[i].1.clone()),
                     old_words,
                     new_words,
+                    layer: Layer::Local,
                 });
             }
             for d in dels.iter().skip(paired) {
@@ -321,14 +350,8 @@ impl FileDiff {
                         ..Row::default()
                     });
                 }
-                ChangeTag::Delete => {
-                    deletions += 1;
-                    dels.push((change.old_index().unwrap_or(0) + 1, text));
-                }
-                ChangeTag::Insert => {
-                    additions += 1;
-                    inss.push((change.new_index().unwrap_or(0) + 1, text));
-                }
+                ChangeTag::Delete => dels.push((change.old_index().unwrap_or(0) + 1, text)),
+                ChangeTag::Insert => inss.push((change.new_index().unwrap_or(0) + 1, text)),
             }
         }
         flush(&mut rows, &mut dels, &mut inss);
@@ -338,7 +361,17 @@ impl FileDiff {
             rows.clear();
         }
 
-        let mut inline = Vec::with_capacity(rows.len() + additions);
+        Self::assemble(rows)
+    }
+
+    /// Everything a [`FileDiff`] holds beyond its rows: the inline view,
+    /// the counts, and the width to scroll to.
+    ///
+    /// Both the two-way [`Self::compute`] and the stacked [`Self::stack`]
+    /// end here, so a stacked diff scrolls, folds and counts exactly the
+    /// way an ordinary one does.
+    fn assemble(rows: Vec<Row>) -> Self {
+        let mut inline = Vec::with_capacity(rows.len() * 2);
         for (i, row) in rows.iter().enumerate() {
             match row.kind {
                 RowKind::Context => inline.push(InlineEntry {
@@ -376,13 +409,233 @@ impl FileDiff {
             .max()
             .unwrap_or(0);
 
+        let additions = rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::Added | RowKind::Modified))
+            .count();
+        let deletions = rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::Removed | RowKind::Modified))
+            .count();
+        let reworked = rows
+            .iter()
+            .filter(|r| r.kind != RowKind::Context && r.layer == Layer::Rework)
+            .count();
+
         FileDiff {
             rows,
             inline,
             additions,
             deletions,
             max_width,
+            reworked,
         }
+    }
+
+    /// The whole stack of a change, as one before-and-after: `base` on the
+    /// left, the working tree on the right, and every row labelled with
+    /// the layer that changed it.
+    ///
+    /// `pushed` is the middle version — the branch as the remote has it.
+    /// It never appears on screen; it is the spine the two steps of the
+    /// change are measured against. A row whose line the pushed branch
+    /// changed is [`Layer::Pushed`], one only the working tree changed is
+    /// [`Layer::Local`], and one both changed is [`Layer::Rework`].
+    ///
+    /// Both steps are diffed against that same middle version, so their
+    /// rows line up on the pushed line number and the merge is exact —
+    /// no third diff, and no guessing which change a row came from.
+    ///
+    /// It costs two line diffs rather than one, and the caller two more
+    /// `git show` calls to read the versions. That is why the setting is
+    /// off by default.
+    ///
+    /// Two cases have nothing to draw and so are absent from the result,
+    /// as they are from any base-to-working-tree diff: a line the pushed
+    /// branch added and the working tree deleted, and one the pushed
+    /// branch changed and the working tree changed back to what the base
+    /// said.
+    pub fn stack(base: Option<&str>, pushed: Option<&str>, local: Option<&str>) -> Self {
+        let up = Self::compute(base, pushed);
+        let down = Self::compute(pushed, local);
+
+        // Length of the middle version, taken from whichever step saw the
+        // last of its lines.
+        let n = up
+            .rows
+            .iter()
+            .filter_map(|r| r.new_ln)
+            .chain(down.rows.iter().filter_map(|r| r.old_ln))
+            .max()
+            .unwrap_or(0);
+
+        // What the base had at each line of the middle version, and
+        // whether the two differ. `None` where the pushed branch added
+        // the line, so the base has nothing there.
+        let mut was: Vec<Option<(usize, String)>> = vec![None; n];
+        let mut pushed_changed = vec![false; n];
+        // Base lines the pushed branch dropped, each keyed by the middle
+        // line it sits in front of.
+        let mut dropped: Vec<(usize, usize, String)> = Vec::new();
+        let mut at = 0usize;
+        for row in &up.rows {
+            match row.new_ln {
+                Some(p) => {
+                    at = p;
+                    was[p - 1] = row
+                        .old_ln
+                        .map(|b| (b, row.old_text.clone().unwrap_or_default()));
+                    pushed_changed[p - 1] = row.kind != RowKind::Context;
+                }
+                None => {
+                    if let (Some(b), Some(t)) = (row.old_ln, row.old_text.as_ref()) {
+                        dropped.push((at + 1, b, t.clone()));
+                    }
+                }
+            }
+        }
+
+        // The same read of the second step: what the working tree has at
+        // each line of the middle version, and what it added between them.
+        let mut now: Vec<Option<(usize, String)>> = vec![None; n];
+        let mut local_changed = vec![false; n];
+        let mut inserted: Vec<(usize, usize, String)> = Vec::new();
+        let mut at = 0usize;
+        for row in &down.rows {
+            match row.old_ln {
+                Some(p) => {
+                    at = p;
+                    now[p - 1] = row
+                        .new_ln
+                        .map(|l| (l, row.new_text.clone().unwrap_or_default()));
+                    local_changed[p - 1] = row.kind != RowKind::Context;
+                }
+                None => {
+                    if let (Some(l), Some(t)) = (row.new_ln, row.new_text.as_ref()) {
+                        inserted.push((at + 1, l, t.clone()));
+                    }
+                }
+            }
+        }
+
+        let mut rows: Vec<Row> = Vec::with_capacity(n + dropped.len() + inserted.len());
+        let (mut di, mut ii) = (0usize, 0usize);
+        // One pass down the middle version. Anything anchored in front of
+        // a line goes first, in the order it reads: what the base lost,
+        // then what the working tree gained. The extra step past `n`
+        // flushes whatever is anchored at the end of the file.
+        for p in 1..=n + 1 {
+            while di < dropped.len() && dropped[di].0 <= p {
+                let (_, b, t) = &dropped[di];
+                rows.push(Row {
+                    kind: RowKind::Removed,
+                    old_ln: Some(*b),
+                    old_text: Some(t.clone()),
+                    layer: Layer::Pushed,
+                    ..Row::default()
+                });
+                di += 1;
+            }
+            while ii < inserted.len() && inserted[ii].0 <= p {
+                let (_, l, t) = &inserted[ii];
+                rows.push(Row {
+                    kind: RowKind::Added,
+                    new_ln: Some(*l),
+                    new_text: Some(t.clone()),
+                    layer: Layer::Local,
+                    ..Row::default()
+                });
+                ii += 1;
+            }
+            if p > n {
+                break;
+            }
+            let layer = match (pushed_changed[p - 1], local_changed[p - 1]) {
+                (true, true) => Layer::Rework,
+                (true, false) => Layer::Pushed,
+                _ => Layer::Local,
+            };
+            match (was[p - 1].take(), now[p - 1].take()) {
+                // Added by the push and deleted since: in neither of the
+                // two versions on screen.
+                (None, None) => {}
+                (Some((b, old)), None) => rows.push(Row {
+                    kind: RowKind::Removed,
+                    old_ln: Some(b),
+                    old_text: Some(old),
+                    layer,
+                    ..Row::default()
+                }),
+                (None, Some((l, new))) => rows.push(Row {
+                    kind: RowKind::Added,
+                    new_ln: Some(l),
+                    new_text: Some(new),
+                    layer,
+                    ..Row::default()
+                }),
+                (Some((b, old)), Some((l, new))) if old == new => rows.push(Row {
+                    kind: RowKind::Context,
+                    old_ln: Some(b),
+                    new_ln: Some(l),
+                    old_text: Some(old),
+                    new_text: Some(new),
+                    ..Row::default()
+                }),
+                (Some((b, old)), Some((l, new))) => {
+                    let (old_words, new_words) = changed_words(&old, &new);
+                    rows.push(Row {
+                        kind: RowKind::Modified,
+                        old_ln: Some(b),
+                        new_ln: Some(l),
+                        old_text: Some(old),
+                        new_text: Some(new),
+                        old_words,
+                        new_words,
+                        layer,
+                    });
+                }
+            }
+        }
+        Self::assemble(rows)
+    }
+
+    /// Only what the working tree changed since the push — `pushed` on
+    /// the left, the working tree on the right — with every row that
+    /// lands on a line the pushed branch had already changed marked
+    /// [`Layer::Rework`].
+    ///
+    /// The quiet half of [`Self::stack`]: the same question about the
+    /// same three versions, without the pull request's own changes on
+    /// screen. A line you added since the push is new work and reads as
+    /// [`Layer::Local`], because it has no counterpart in the pushed
+    /// version for the pull request to have changed; the stacked view is
+    /// where you see whether it landed inside a block the pull request
+    /// had already rewritten.
+    pub fn since_push(base: Option<&str>, pushed: Option<&str>, local: Option<&str>) -> Self {
+        let up = Self::compute(base, pushed);
+        let n = up.rows.iter().filter_map(|r| r.new_ln).max().unwrap_or(0);
+        let mut pushed_changed = vec![false; n];
+        for row in &up.rows {
+            if let Some(p) = row.new_ln {
+                pushed_changed[p - 1] = row.kind != RowKind::Context;
+            }
+        }
+        let mut d = Self::compute(pushed, local);
+        for row in &mut d.rows {
+            if row.kind == RowKind::Context {
+                continue;
+            }
+            let again = row
+                .old_ln
+                .is_some_and(|p| pushed_changed.get(p - 1).copied().unwrap_or(false));
+            row.layer = if again { Layer::Rework } else { Layer::Local };
+        }
+        d.reworked = d
+            .rows
+            .iter()
+            .filter(|r| r.kind != RowKind::Context && r.layer == Layer::Rework)
+            .count();
+        d
     }
 
     /// Every run of changed rows, as `[start, end)` row ranges. One run is
@@ -726,6 +979,149 @@ mod tests {
         let d = FileDiff::compute(Some("x\n"), None);
         assert_eq!(d.rows.len(), 1);
         assert_eq!(d.rows[0].kind, RowKind::Removed);
+    }
+
+    // --------------------------------------------------- the stacked diff
+
+    /// base → pushed → local, with one line changed by each step and one
+    /// changed by both.
+    const BASE: &str = "one\ntwo\nthree\nfour\n";
+    const PUSHED: &str = "one\nTWO\nthree\nFOUR\n";
+    const LOCAL: &str = "one\nTWO\nTHREE\nfour again\n";
+
+    #[test]
+    fn stack_labels_each_layer() {
+        let d = FileDiff::stack(Some(BASE), Some(PUSHED), Some(LOCAL));
+        assert_eq!(d.rows.len(), 4);
+        // "one" is untouched by both steps.
+        assert_eq!(d.rows[0].kind, RowKind::Context);
+        // "two" → "TWO" is the push's, and the working tree left it alone.
+        assert_eq!(d.rows[1].kind, RowKind::Modified);
+        assert_eq!(d.rows[1].layer, Layer::Pushed);
+        assert_eq!(d.rows[1].old_text.as_deref(), Some("two"));
+        assert_eq!(d.rows[1].new_text.as_deref(), Some("TWO"));
+        // "three" → "THREE" is the working tree's alone.
+        assert_eq!(d.rows[2].layer, Layer::Local);
+        // "four" was rewritten by the push and again since.
+        assert_eq!(d.rows[3].layer, Layer::Rework);
+        assert_eq!(d.rows[3].old_text.as_deref(), Some("four"));
+        assert_eq!(d.rows[3].new_text.as_deref(), Some("four again"));
+        assert_eq!(d.reworked, 1);
+    }
+
+    #[test]
+    fn stack_left_side_is_the_base() {
+        // Every row reads base on the left and working tree on the right,
+        // so the stacked view is still the diff a reviewer would see.
+        let d = FileDiff::stack(Some(BASE), Some(PUSHED), Some(LOCAL));
+        let left: Vec<_> = d
+            .rows
+            .iter()
+            .filter_map(|r| r.old_text.as_deref())
+            .collect();
+        let right: Vec<_> = d
+            .rows
+            .iter()
+            .filter_map(|r| r.new_text.as_deref())
+            .collect();
+        assert_eq!(left, vec!["one", "two", "three", "four"]);
+        assert_eq!(right, vec!["one", "TWO", "THREE", "four again"]);
+    }
+
+    #[test]
+    fn stack_matches_a_plain_diff_of_the_two_ends() {
+        // The rows are the same ones a two-way diff of base and working
+        // tree gives; only the labels are new.
+        let flat = FileDiff::compute(Some(BASE), Some(LOCAL));
+        let d = FileDiff::stack(Some(BASE), Some(PUSHED), Some(LOCAL));
+        assert_eq!(d.additions, flat.additions);
+        assert_eq!(d.deletions, flat.deletions);
+        let kinds: Vec<_> = d.rows.iter().map(|r| r.kind).collect();
+        let flat_kinds: Vec<_> = flat.rows.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, flat_kinds);
+    }
+
+    #[test]
+    fn stack_marks_a_line_the_push_added_and_the_tree_changed() {
+        let d = FileDiff::stack(Some("a\n"), Some("a\nb\n"), Some("a\nB\n"));
+        assert_eq!(d.rows.len(), 2);
+        assert_eq!(d.rows[1].kind, RowKind::Added);
+        assert_eq!(d.rows[1].new_text.as_deref(), Some("B"));
+        assert_eq!(d.rows[1].layer, Layer::Rework);
+    }
+
+    #[test]
+    fn stack_hides_a_line_the_push_added_and_the_tree_deleted() {
+        // Neither end of the stack has it, so there is nothing to draw.
+        let d = FileDiff::stack(Some("a\n"), Some("a\nb\n"), Some("a\n"));
+        assert_eq!(d.rows.len(), 1);
+        assert_eq!(d.rows[0].kind, RowKind::Context);
+        assert_eq!(d.reworked, 0);
+    }
+
+    #[test]
+    fn stack_keeps_what_the_push_removed() {
+        let d = FileDiff::stack(Some("a\nb\n"), Some("a\n"), Some("a\n"));
+        assert_eq!(d.rows.len(), 2);
+        assert_eq!(d.rows[1].kind, RowKind::Removed);
+        assert_eq!(d.rows[1].layer, Layer::Pushed);
+    }
+
+    #[test]
+    fn stack_keeps_what_the_tree_added() {
+        let d = FileDiff::stack(Some("a\n"), Some("a\n"), Some("a\nz\n"));
+        assert_eq!(d.rows.len(), 2);
+        assert_eq!(d.rows[1].kind, RowKind::Added);
+        assert_eq!(d.rows[1].layer, Layer::Local);
+    }
+
+    #[test]
+    fn since_push_shows_only_the_second_step() {
+        let d = FileDiff::since_push(Some(BASE), Some(PUSHED), Some(LOCAL));
+        // The push's own change to "two" is not a change here.
+        let changed: Vec<_> = d
+            .rows
+            .iter()
+            .filter(|r| r.kind != RowKind::Context)
+            .map(|r| (r.new_text.as_deref(), r.layer))
+            .collect();
+        assert_eq!(
+            changed,
+            vec![
+                (Some("THREE"), Layer::Local),
+                (Some("four again"), Layer::Rework),
+            ]
+        );
+        assert_eq!(d.reworked, 1);
+    }
+
+    #[test]
+    fn since_push_with_nothing_pushed_yet() {
+        // No second step: every row is context and nothing is rework.
+        let d = FileDiff::since_push(Some(BASE), Some(PUSHED), Some(PUSHED));
+        assert!(d.rows.iter().all(|r| r.kind == RowKind::Context));
+        assert_eq!(d.reworked, 0);
+    }
+
+    #[test]
+    fn stack_of_an_added_file() {
+        let d = FileDiff::stack(None, Some("x\n"), Some("X\n"));
+        assert_eq!(d.rows.len(), 1);
+        assert_eq!(d.rows[0].kind, RowKind::Added);
+        assert_eq!(d.rows[0].layer, Layer::Rework);
+    }
+
+    #[test]
+    fn stack_without_a_push_reads_as_all_local() {
+        // Nothing is on the remote yet, so the middle version is the base
+        // and every change belongs to the working tree.
+        let d = FileDiff::stack(Some(BASE), Some(BASE), Some(LOCAL));
+        assert!(d
+            .rows
+            .iter()
+            .filter(|r| r.kind != RowKind::Context)
+            .all(|r| r.layer == Layer::Local));
+        assert_eq!(d.reworked, 0);
     }
 
     #[test]

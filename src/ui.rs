@@ -2,11 +2,11 @@
 //! `app.layout` so the mouse handlers can hit-test against it.
 
 use crate::app::{
-    App, ButtonId, Dragging, FileEntry, FinderMode, MenuRow, Overlay, Screen, StageSection,
+    App, ButtonId, Dragging, FileEntry, FinderMode, Layers, MenuRow, Overlay, Screen, StageSection,
     ViewMode, FINDER_ROWS,
 };
 use crate::blame::{self, Heat};
-use crate::diff::{DisplayEntry, Row, RowKind, Selection, Side, TAB_WIDTH};
+use crate::diff::{DisplayEntry, FileDiff, Row, RowKind, Selection, Side, TAB_WIDTH};
 use crate::github::Verdict;
 use crate::gitops::StageState;
 use crate::highlight::HlLine;
@@ -1337,8 +1337,10 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                 let indent = *depth as usize;
                 // ↺ at the end of the row throws the whole file's changes
                 // away (after asking). Only when there is a working tree to
-                // put back — a read-only PR keeps the columns for the name.
-                let revert_w = if app.can_revert() && !conflicted {
+                // put back — a read-only PR keeps the columns for the name
+                // — and not while the layers are on, where the revert is
+                // refused for the reason `App::revert_allowed_for` gives.
+                let revert_w = if app.can_revert() && !conflicted && !app.layers_now().on() {
                     crate::app::REVERT_W as usize
                 } else {
                     0
@@ -1765,22 +1767,28 @@ fn draw_review_confirm(f: &mut Frame, app: &mut App, area: Rect) {
 /// Only a modified row has one. A whole added or removed line has no
 /// counterpart to differ from, so every character of it is the change
 /// and a second shade would mean nothing.
-fn word_bg(kind: RowKind, side: Side) -> Option<Color> {
-    let p = palette();
-    match (kind, side) {
-        (RowKind::Modified, Side::Left) => Some(p.removed_word),
-        (RowKind::Modified, Side::Right) => Some(p.added_word),
+fn word_bg(row: &Row, side: Side) -> Option<Color> {
+    let sh = palette().layer(row.layer);
+    match (row.kind, side) {
+        (RowKind::Modified, Side::Left) => Some(sh.old_word),
+        (RowKind::Modified, Side::Right) => Some(sh.new_word),
         _ => None,
     }
 }
 
-fn diff_bg(kind: RowKind, side: Side) -> Option<Color> {
-    let p = palette();
-    match (kind, side) {
-        (RowKind::Added, Side::Right) => Some(p.added),
-        (RowKind::Removed, Side::Left) => Some(p.removed),
-        (RowKind::Modified, Side::Left) => Some(p.removed),
-        (RowKind::Modified, Side::Right) => Some(p.added),
+/// The background one side of a row is painted.
+///
+/// The hue comes from the row's layer, so with the layers on a line says
+/// which step of the change wrote it as well as which side it is on. An
+/// ordinary diff has one layer and gets the red and green it always had.
+/// See [`crate::diff::Layer`] and [`crate::theme::Palette::layer`].
+fn diff_bg(row: &Row, side: Side) -> Option<Color> {
+    let sh = palette().layer(row.layer);
+    match (row.kind, side) {
+        (RowKind::Added, Side::Right) => Some(sh.new),
+        (RowKind::Removed, Side::Left) => Some(sh.old),
+        (RowKind::Modified, Side::Left) => Some(sh.old),
+        (RowKind::Modified, Side::Right) => Some(sh.new),
         _ => None,
     }
 }
@@ -1955,7 +1963,7 @@ fn cell<'a>(
             let bg = if linewise {
                 Some(p.selected)
             } else {
-                diff_bg(row.kind, side).or(if cursor { Some(p.cursor) } else { None })
+                diff_bg(row, side).or(if cursor { Some(p.cursor) } else { None })
             };
             let mut ln_style = Style::default().fg(p.line_no);
             let mut base = Style::default();
@@ -1979,7 +1987,7 @@ fn cell<'a>(
                 Side::Left => row.old_words.as_slice(),
                 Side::Right => row.new_words.as_slice(),
             };
-            let words = word_bg(row.kind, side)
+            let words = word_bg(row, side)
                 .filter(|_| !linewise && !changed.is_empty())
                 .map(|bg| (changed, bg));
             let mut spans = vec![Span::styled(ln_str, ln_style)];
@@ -2238,6 +2246,23 @@ fn draw_blame(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// What the diff's title says about the layers.
+///
+/// Nothing at all when they are off. When they are on it names the
+/// setting and then answers the question the setting was turned on to
+/// ask: how much of this file the change has now written twice.
+fn layer_note(layers: Layers, d: &FileDiff) -> String {
+    if !layers.on() {
+        return String::new();
+    }
+    let what = layers.label();
+    match d.reworked {
+        0 => format!(" · {what} · nothing written twice"),
+        1 => format!(" · {what} · ‡ 1 line written twice"),
+        n => format!(" · {what} · ‡ {n} lines written twice"),
+    }
+}
+
 fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
     let p = palette();
     let file = app.open_file();
@@ -2272,10 +2297,11 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                 tail_truncate(&c.subject, 40)
             ),
             None => format!(
-                " {} — +{} −{}{}{hoff} ",
+                " {} — +{} −{}{}{}{hoff} ",
                 fl.path,
                 d.additions,
                 d.deletions,
+                layer_note(app.layers_now(), d),
                 if app.checked_out { "" } else { " · read-only" }
             ),
         },
@@ -2346,8 +2372,20 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
         if bar_w > 0 {
             // ↺ puts a change back; ⚑ opens the resolve menu. Two marks,
             // because they do two very different things to the file.
+            //
+            // With the layers on there is a third: ‡ on a section this
+            // change has now written twice. The ↺ stands down there,
+            // because the left column is the base branch and a revert
+            // would write the pull request's own work out of the file
+            // along with the edit the reader meant.
             let (mark, color) = if conflicted {
                 ("⚑ ", p.conflict)
+            } else if app.layers_now().on() {
+                if app.rework_on_row(app.diff_scroll + n) {
+                    ("‡ ", p.rework.new_word)
+                } else {
+                    ("┃ ", p.divider)
+                }
             } else {
                 ("↺ ", p.accent)
             };
@@ -2427,8 +2465,8 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                     Some(p.selected)
                 } else {
                     match mark {
-                        '+' => Some(p.added),
-                        '-' => Some(p.removed),
+                        '+' => Some(p.layer(row.layer).new),
+                        '-' => Some(p.layer(row.layer).old),
                         _ if cur => Some(p.cursor),
                         _ => None,
                     }
@@ -2464,7 +2502,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                     Side::Left => row.old_words.as_slice(),
                     Side::Right => row.new_words.as_slice(),
                 };
-                let words = word_bg(row.kind, side)
+                let words = word_bg(row, side)
                     .filter(|_| !linewise && !changed.is_empty())
                     .map(|bg| (changed, bg));
                 spans.push(Span::styled(gutter, gs));
@@ -4052,6 +4090,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             ("v", "split / inline view"),
         ),
         row(
+            ("s", "layers — what is pushed, what is new"),
+            ("‡ in the change bar", "you changed this line before"),
+        ),
+        row(
             ("t then a", "switch light / dark"),
             ("?", "this help"),
         ),
@@ -5155,6 +5197,146 @@ mod tests {
         assert!(screen.contains("☐ todo"), "and unticked ones: {screen}");
         assert!(screen.contains("PLAN.md"), "the file panel is still there");
         assert!(screen.contains("P source"), "the way back is offered");
+    }
+
+    /// A one-file local review of a three-version stack, with the layers
+    /// on. `two` is the push's own line, `three` is a new local edit, and
+    /// `four` was written by the push and written again since.
+    fn stacked(app: &mut App) {
+        app.screen = Screen::Review;
+        app.local = true;
+        app.layers = Layers::Full;
+        // What `App::layers_possible` wants: a working tree on top, a
+        // pushed branch under it, and a base branch under that.
+        app.checked_out = true;
+        app.stack_base = "b".repeat(40);
+        app.tracking = Some(crate::gitops::Tracking {
+            upstream: "origin/feature".into(),
+            ahead: 0,
+            behind: 0,
+        });
+        app.files = vec![ChangedFile {
+            path: "code.rs".into(),
+            status: "modified".into(),
+            additions: 3,
+            deletions: 3,
+            previous: None,
+            conflicted: false,
+        }];
+        app.rebuild_files();
+        app.diff = Some(FileDiff::stack(
+            Some("one\ntwo\nthree\nfour\n"),
+            Some("one\nTWO\nthree\nFOUR\n"),
+            Some("one\nTWO\nTHREE\nfour again\n"),
+        ));
+        app.rebuild_display();
+    }
+
+    /// The whole point of the layers: three colours, one per step of the
+    /// change. Without them a line already on the remote and a line
+    /// written a minute ago are the same green, and "am I rewriting what
+    /// I already wrote" has no answer on screen.
+    #[test]
+    fn each_layer_is_painted_in_its_own_colour() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.view = ViewMode::Inline;
+        stacked(&mut app);
+
+        let buf = render(&mut app);
+        let p = crate::theme::palette();
+        let painted = |bg: ratatui::style::Color| -> String {
+            (0..buf.area.height)
+                .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+                .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(bg))
+                .map(|(x, y)| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        };
+        assert!(
+            painted(p.pushed.new).contains("TWO"),
+            "the push's own line is purple"
+        );
+        assert!(
+            painted(p.added).contains("THREE"),
+            "a line only the working tree changed keeps its green"
+        );
+        // "four again" keeps the word "four" from the version the push
+        // left behind, so the row is amber and the two words that are new
+        // this time are the stronger amber inside it.
+        assert!(
+            painted(p.rework.new).contains("four"),
+            "a line written twice is amber"
+        );
+        assert!(
+            painted(p.rework.new_word).contains("again"),
+            "and the words that changed this time are stronger inside it"
+        );
+        assert!(!painted(p.added).contains("again"), "none of it is green");
+    }
+
+    /// The change bar answers the question while scrolling: ‡ where this
+    /// change has already written the lines it is writing again.
+    #[test]
+    fn the_change_bar_marks_what_was_written_twice() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        stacked(&mut app);
+        let buf = render(&mut app);
+        let screen: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("‡"), "the rework mark is drawn: {screen}");
+        assert!(
+            !screen.contains("↺"),
+            "and the revert mark stands down, because reverting is refused here: {screen}"
+        );
+    }
+
+    /// The title carries the count, so the reader gets the answer without
+    /// reading the file: how much of this is a second attempt.
+    #[test]
+    fn the_title_counts_what_was_written_twice() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        stacked(&mut app);
+        let buf = render(&mut app);
+        let screen: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("the whole stack"),
+            "the title names the setting: {screen}"
+        );
+        assert!(
+            screen.contains("1 line written twice"),
+            "and counts the rework: {screen}"
+        );
+    }
+
+    /// With nothing written twice the title says so, rather than leaving
+    /// the reader to scan for a colour that is not there.
+    #[test]
+    fn the_title_says_when_nothing_was_written_twice() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        stacked(&mut app);
+        app.diff = Some(FileDiff::stack(
+            Some("one\ntwo\n"),
+            Some("one\nTWO\n"),
+            Some("one\nTWO\nthree\n"),
+        ));
+        app.rebuild_display();
+        let buf = render(&mut app);
+        let screen: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("nothing written twice"),
+            "the title says so: {screen}"
+        );
     }
 
     /// A modified line is painted whole, and the words that actually
