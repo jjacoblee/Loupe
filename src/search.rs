@@ -166,10 +166,41 @@ fn parse_record(record: &str, prefix: Option<&str>, query: &str, regex: bool) ->
     })
 }
 
+/// What `git ls-files` found in a repository.
+///
+/// The two lists are kept apart because git reports two different kinds
+/// of thing and the caller wants only one of them. See [`list_files`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RepoFiles {
+    /// Every file, as a repo-relative path.
+    pub files: Vec<String>,
+    /// Directories git reported instead of walking into them: a nested
+    /// repository, or a linked worktree someone put inside the clone.
+    /// Stored without the trailing slash git writes.
+    pub stubs: Vec<String>,
+}
+
 /// Every file in the repository — the haystack for a repo-wide fuzzy file
 /// search. Reads a commit when given one, so it matches what the diff
 /// view is showing.
-pub fn list_files(root: &Path, rev: Option<&str>) -> Result<Vec<String>> {
+///
+/// ## Why the result is split
+///
+/// `git ls-files` refuses to walk into a nested repository boundary and
+/// reports the directory itself, with a trailing slash:
+///
+/// ```text
+/// wt/feat/          <- a worktree someone put inside the clone
+/// .gitignore
+/// src/main.rs
+/// ```
+///
+/// Mixed into the file list, `wt/feat/` reaches the tree builder, which
+/// splits on `/` and pops an empty last component — a file row with no
+/// name, pointing at a directory. So the stubs come back on their own:
+/// the file finder drops them, and the file tree draws them as folders it
+/// has not opened yet.
+pub fn list_files(root: &Path, rev: Option<&str>) -> Result<RepoFiles> {
     let root = root.to_string_lossy().to_string();
     let mut args: Vec<&str> = vec!["-C", &root];
     match rev {
@@ -193,11 +224,17 @@ pub fn list_files(root: &Path, rev: Option<&str>) -> Result<Vec<String>> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    let mut out_files = RepoFiles::default();
+    for entry in String::from_utf8_lossy(&out.stdout)
         .split('\0')
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect())
+    {
+        match entry.strip_suffix('/') {
+            Some(dir) => out_files.stubs.push(dir.to_string()),
+            None => out_files.files.push(entry.to_string()),
+        }
+    }
+    Ok(out_files)
 }
 
 // ------------------------------------------------------------------ matching
@@ -929,6 +966,58 @@ mod tests {
         assert!(!smart_case("Handle"));
     }
 
+    /// A nested repository — the shape a linked worktree takes when
+    /// someone puts it inside the clone — makes `git ls-files` report a
+    /// directory instead of walking into it. That entry must never reach
+    /// the file list, or the tree builder turns it into a nameless row.
+    #[test]
+    fn a_directory_git_would_not_walk_into_is_not_a_file() {
+        let root = std::env::temp_dir().join(format!("loupe-stub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("wt/feat")).unwrap();
+        let r = root.to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["-C", &r, "init", "-q", "."]);
+        std::fs::write(root.join("src.rs"), "fn main() {}\n").unwrap();
+        // A repository inside the repository: git stops at the boundary.
+        git(&[
+            "-C",
+            &root.join("wt/feat").to_string_lossy(),
+            "init",
+            "-q",
+            ".",
+        ]);
+        std::fs::write(root.join("wt/feat/inner.rs"), "fn inner() {}\n").unwrap();
+
+        let found = list_files(&root, None).unwrap();
+
+        assert!(
+            found.files.iter().all(|f| !f.ends_with('/')),
+            "a trailing slash means a directory, not a file: {:?}",
+            found.files
+        );
+        assert!(
+            found.files.contains(&"src.rs".to_string()),
+            "ordinary files still come back: {:?}",
+            found.files
+        );
+        assert!(
+            !found.files.iter().any(|f| f.starts_with("wt/feat/")),
+            "git never walked in, so nothing inside is listed: {:?}",
+            found.files
+        );
+        assert_eq!(
+            found.stubs,
+            vec!["wt/feat".to_string()],
+            "the boundary comes back on its own, without the slash"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The parser is written against real `git grep -z -n` output, so the
     /// test drives a real repository rather than a fixture string.
     #[test]
@@ -1023,7 +1112,7 @@ mod tests {
 
         // A file list, for whole-repo file matching.
         let files = list_files(&root, None).unwrap();
-        assert!(files.contains(&"src/a.ts".to_string()));
+        assert!(files.files.contains(&"src/a.ts".to_string()));
 
         let _ = std::fs::remove_dir_all(&root);
     }

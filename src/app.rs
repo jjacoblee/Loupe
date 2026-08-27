@@ -7324,7 +7324,12 @@ impl App {
         let rev = self.search_rev();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(search::list_files(&root, rev.as_deref()).map(SearchOutcome::Files));
+            let _ = tx.send(
+                // Only the files: a stub is a directory git would not walk
+                // into, and the finder has nothing to open there.
+                search::list_files(&root, rev.as_deref())
+                    .map(|found| SearchOutcome::Files(found.files)),
+            );
         });
         self.search_job = Some(SearchJob {
             rx,
