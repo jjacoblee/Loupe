@@ -30,7 +30,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     // The tab row only takes a line when something is pinned, so a reader
     // who never pins a file never pays for the feature.
-    let tabs = u16::from(!app.pins.is_empty() || app.buffers().count() > 1);
+    let tabs = u16::from(!app.pins.is_empty() || app.buffers().count() > 0);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -69,6 +69,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Finder(_) => draw_finder(f, app, area),
         Overlay::Hover(_) => draw_hover(f, app, area),
         Overlay::CodeActions(_) => draw_code_actions(f, app, area),
+        Overlay::Problem(_) => draw_problem(f, app, area),
         Overlay::PathMenu(_) => draw_path_menu(f, app, area),
         Overlay::BlameMenu(_) => draw_blame_menu(f, app, area),
         Overlay::ConflictMenu(_) => draw_conflict_menu(f, app, area),
@@ -95,12 +96,16 @@ fn draw_pin_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     // `app` mutably to record the click targets.
     let labels = app.pins.labels();
     let outside: Vec<bool> = app.pins.items.iter().map(|i| i.outside).collect();
+    // A pinned file's tab is this one, so this is where the mark saying
+    // "not on disk yet" goes. It draws no buffer tab of its own.
+    let unsaved: Vec<bool> = (0..labels.len()).map(|i| app.pin_dirty(i)).collect();
     let width = |s: &str| disp_width(s) as u16;
-    // " 1 name ✕ " — the number, the name, the close mark, and the spaces
-    // that keep two tabs from reading as one.
+    // " 1 ● name ✕ " — the number, the unsaved mark, the name, the close
+    // mark, and the spaces that keep two tabs from reading as one.
     let tab_w = |i: usize| {
         let mark = if outside[i] { 2 } else { 0 };
-        width(&labels[i]) + width(&format!("{} ", i + 1)) + mark + 4
+        let dot = if unsaved[i] { 2 } else { 0 };
+        width(&labels[i]) + width(&format!("{} ", i + 1)) + mark + dot + 4
     };
 
     // Keep the open tab on screen. A narrow window shows a window onto
@@ -181,6 +186,16 @@ fn draw_pin_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             // not part of what you are reviewing".
             spans.push(Span::styled("↗ ", Style::default().bg(bg).fg(p.accent)));
         }
+        if unsaved[i] {
+            // The same two colors the buffer tabs use, for the same
+            // reason: one of them disappears on one of the backgrounds.
+            let fg = if active {
+                p.tab_dirty_active
+            } else {
+                p.tab_dirty
+            };
+            spans.push(Span::styled("● ", Style::default().bg(bg).fg(fg)));
+        }
         spans.push(Span::styled(
             labels[i].clone(),
             if active {
@@ -223,8 +238,11 @@ fn draw_pin_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     // together and addressed apart: a pin is a bookmark the reader chose
     // and a buffer is a file that happens to be open, and merging their
     // numbering would renumber the pins every time a file was opened.
+    // One open file gets a tab of its own. It is the only place the
+    // reader is told which file the editor holds, whether one click
+    // opened it, and whether it has unsaved work in it.
     let bufs = app.buffer_tabs();
-    if bufs.len() > 1 {
+    if !bufs.is_empty() {
         // A divider, so the two kinds of tab do not read as one run.
         if x + 2 <= right && !labels.is_empty() {
             f.render_widget(
@@ -241,30 +259,69 @@ fn draw_pin_tabs(f: &mut Frame, app: &mut App, area: Rect) {
             );
             x += 1;
         }
-        for (i, (label, dirty, active)) in bufs.iter().enumerate() {
-            // " ●name " — the dot only when there is unsaved work in it.
-            let w = width(label) + if *dirty { 1 } else { 0 } + 2;
-            if x + w > right.saturating_sub(1) {
+        for (i, tab) in bufs.iter().enumerate() {
+            // " ● name ✕ " — a space on each side of the name so the dot
+            // does not read as part of it, and a ✕ that closes the file.
+            let w = width(&tab.label) + if tab.dirty { 2 } else { 0 } + 4;
+            // A seam between one tab and the next. Without it a row of
+            // tabs reads as one run of file names with no telling where
+            // one ends, which is what the row is for.
+            let seam = u16::from(i > 0);
+            if x + w + seam > right.saturating_sub(1) {
                 hidden += bufs.len() - i;
                 break;
             }
-            let (bg, fg) = if *active {
+            if seam > 0 {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "│",
+                        Style::default().bg(p.btn_bg).fg(p.faint),
+                    ))),
+                    Rect {
+                        x,
+                        y: area.y,
+                        width: 1,
+                        height: 1,
+                    },
+                );
+                x += 1;
+            }
+            let (bg, fg) = if tab.active {
                 (p.btn_active_bg, p.btn_active_fg)
             } else {
                 (p.btn_bg, p.btn_fg)
             };
             let base = Style::default().bg(bg).fg(fg);
             let mut spans = vec![Span::styled(" ", base)];
-            if *dirty {
-                spans.push(Span::styled("●", Style::default().bg(bg).fg(p.accent)));
-            }
-            spans.push(Span::styled(
-                label.clone(),
-                if *active {
-                    base.add_modifier(Modifier::BOLD)
+            if tab.dirty {
+                // The selected tab's background is a saturated blue and
+                // the row's is grey, so the mark takes its color from
+                // which one it is sitting on.
+                let dot = if tab.active {
+                    p.tab_dirty_active
                 } else {
-                    base
-                },
+                    p.tab_dirty
+                };
+                spans.push(Span::styled("● ", Style::default().bg(bg).fg(dot)));
+            }
+            // Italic says this is the peek tab — one click opened it and
+            // the next click replaces it. Bold says it is the buffer on
+            // screen. A tab can be both, so the two modifiers are added
+            // rather than chosen between.
+            let mut name = base;
+            if tab.active {
+                name = name.add_modifier(Modifier::BOLD);
+            }
+            if tab.peek {
+                name = name.add_modifier(Modifier::ITALIC);
+            }
+            spans.push(Span::styled(tab.label.clone(), name));
+            spans.push(Span::styled(" ", base));
+            spans.push(Span::styled(
+                "✕",
+                Style::default()
+                    .bg(bg)
+                    .fg(if tab.active { fg } else { p.faint }),
             ));
             spans.push(Span::styled(" ", base));
             let rect = Rect {
@@ -274,6 +331,18 @@ fn draw_pin_tabs(f: &mut Frame, app: &mut App, area: Rect) {
                 height: 1,
             };
             f.render_widget(Paragraph::new(Line::from(spans)), rect);
+            // The ✕ is the second-to-last column; everything else in the
+            // tab opens the file. `button_at` takes the first rect that
+            // holds the click, so the ✕ has to be recorded first.
+            app.layout.buttons.push((
+                Rect {
+                    x: x + w - 2,
+                    y: area.y,
+                    width: 1,
+                    height: 1,
+                },
+                ButtonId::BufferClose(i),
+            ));
             app.layout.buttons.push((rect, ButtonId::BufferTab(i)));
             x += w;
         }
@@ -1013,7 +1082,7 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                 )));
             }
             FileEntry::Dir { label, path, depth } => {
-                let arrow = if app.collapsed_dirs.contains(path) {
+                let arrow = if app.collapsed_set().contains(path) {
                     "▸"
                 } else {
                     "▾"
@@ -1025,12 +1094,14 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                 )));
             }
             FileEntry::File { src, depth } => {
-                let (file, idx) = match app.changed_of(*src) {
-                    Some(file) => (file, app.changed_idx(*src).unwrap_or(usize::MAX)),
-                    // A file the change never touched: a name, and none of
-                    // the marks. There is no diff behind it to stage, to
-                    // mark viewed, or to put back, so the columns that say
-                    // so would all be lying.
+                let (file, idx) = match app.diff_row(*src) {
+                    Some(file) => (file, app.diff_row_idx(*src).unwrap_or(usize::MAX)),
+                    // A row with no diff behind it: a name, and none of
+                    // the marks. There is no diff to stage, to mark
+                    // viewed, or to put back, so the columns that say so
+                    // would all be lying. That is every row in the Files
+                    // panel, which lists the repository rather than the
+                    // change, and the untouched files in the Changes one.
                     None => {
                         let Some(path) = app.row_path(*src) else {
                             continue;
@@ -1048,9 +1119,18 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                         // worth opening and worth knowing is not committed,
                         // so the row says both at once.
                         let fg = if app.row_ignored(*src) { p.dim } else { p.text };
+                        // The row whose file the editor holds. There is no
+                        // file cursor to follow here — the panel lists the
+                        // repository, and what is open is the only thing
+                        // "here" can mean.
+                        let base = if app.buffer_showing(path) {
+                            Style::default().bg(p.row).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        };
                         lines.push(Line::from(Span::styled(
                             truncate_pad(&text, inner.width as usize),
-                            Style::default().fg(fg),
+                            base.fg(fg),
                         )));
                         continue;
                     }
@@ -2740,12 +2820,143 @@ fn draw_blame_menu(f: &mut Frame, app: &mut App, area: Rect) {
 
 /// The ☰ menu: everything the top bar no longer has room for, grouped
 /// under headings, with the key that does the same thing on the right.
+/// One problem, laid out: the claim, then each reason under the one it
+/// explains, with names and types picked out of the prose.
+///
+/// The status bar already carries the message for the cursor line, in
+/// one line. This is the other half of the same information — for the
+/// message that does not fit in one line, and whose real answer is three
+/// levels inside the sentence. See [`crate::explain`].
+fn draw_problem(f: &mut Frame, app: &App, area: Rect) {
+    let Overlay::Problem(panel) = &app.overlay else {
+        return;
+    };
+    let p = palette();
+    let color = match panel.severity {
+        1 => p.err,
+        2 => p.warn,
+        _ => p.hint,
+    };
+    let mark = match panel.severity {
+        1 => '✗',
+        2 => '▲',
+        3 => 'ℹ',
+        _ => '·',
+    };
+
+    // Lay the rows out first, so the box can be the size of what is in
+    // it rather than a guess that clips the last line.
+    let w = (area.width.saturating_sub(8)).clamp(30, 88);
+    let inner_w = w.saturating_sub(4) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, row) in panel.rows.iter().enumerate() {
+        // The claim carries the severity mark; every reason under it is
+        // introduced by an elbow, so the chain is visible as a shape and
+        // not only as indentation.
+        let lead = if i == 0 {
+            format!("{mark} ")
+        } else {
+            format!("{}└ ", "  ".repeat(row.depth))
+        };
+        let mut spans = vec![Span::styled(
+            lead.clone(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )];
+        let hang = " ".repeat(disp_width(&lead));
+        let mut used = disp_width(&lead);
+        for part in &row.parts {
+            let (text, style) = match part {
+                crate::explain::Part::Text(t) => (t.clone(), Style::default().fg(p.text)),
+                crate::explain::Part::Quoted(t) => (
+                    t.clone(),
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                ),
+            };
+            // A wrapped type arrives with newlines already in it; every
+            // other part is wrapped here, to the width of the box.
+            for (n, chunk) in text.split('\n').enumerate() {
+                if n > 0 {
+                    lines.push(Line::from(std::mem::take(&mut spans)));
+                    spans.push(Span::raw(hang.clone()));
+                    used = hang.len();
+                }
+                for word in wrap_words(chunk, inner_w.saturating_sub(hang.len()).max(8)) {
+                    if used + disp_width(&word) > inner_w && used > hang.len() {
+                        lines.push(Line::from(std::mem::take(&mut spans)));
+                        spans.push(Span::raw(hang.clone()));
+                        used = hang.len();
+                    }
+                    used += disp_width(&word);
+                    spans.push(Span::styled(word, style));
+                }
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    if let Some(code) = &panel.code {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{code} · line {}", panel.line),
+            Style::default().fg(p.faint),
+        )));
+    }
+    if panel.of > 1 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} more on this line — Alt+E lists them",
+                panel.of.saturating_sub(1)
+            ),
+            Style::default().fg(p.faint),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "any key closes",
+        Style::default().fg(p.faint),
+    )));
+
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let rect = centered(area, w, h);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(format!(
+            " {} ",
+            match panel.severity {
+                1 => "Error",
+                2 => "Warning",
+                3 => "Note",
+                _ => "Hint",
+            }
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Split text into words, keeping the space that followed each one, so
+/// re-joining them reproduces the line.
+fn wrap_words(text: &str, _width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    for ch in text.chars() {
+        word.push(ch);
+        if ch == ' ' {
+            out.push(std::mem::take(&mut word));
+        }
+    }
+    if !word.is_empty() {
+        out.push(word);
+    }
+    out
+}
+
 fn draw_menu(f: &mut Frame, app: &mut App, area: Rect) {
     let Overlay::Menu(menu) = &app.overlay else {
         return;
     };
     let p = palette();
-    let title = " ☰ Menu ";
+    let title = menu.title.clone();
     // Two columns of padding, the widest label, a gap, the widest hint,
     // and two columns for the on/off mark.
     let label_w = menu
@@ -2766,17 +2977,22 @@ fn draw_menu(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .max()
         .unwrap_or(0);
-    let w = ((label_w + hint_w + 5).max(disp_width(title)) as u16 + 2).min(area.width);
+    let w = ((label_w + hint_w + 5).max(disp_width(&title)) as u16 + 2).min(area.width);
     let want = menu.rows.len() as u16 + 2;
     let (ax, ay) = menu.anchor;
-    // Hang below the button, pulled left until the whole panel is on
-    // screen. A menu taller than the room below it is shortened and
-    // scrolls, rather than being flipped up over the top bar — the ☰ it
-    // belongs to has to stay visible.
+    // Hang below the anchor, pulled left until the whole panel is on
+    // screen. The ☰ menu is shortened and scrolls rather than flipped up
+    // over the top bar — the ☰ it belongs to has to stay visible. A menu
+    // opened at the pointer has no such button, so it flips instead: a
+    // right click near the last line would otherwise throw its menu to
+    // the top of the screen, nowhere near what was clicked.
     let x = ax.min(area.x + area.width.saturating_sub(w));
     let below = (area.y + area.height).saturating_sub(ay + 1);
     let (y, h) = if below >= want || below >= MENU_MIN_H {
         (ay + 1, want.min(below))
+    } else if menu.flip {
+        let h = want.min(area.height).min(ay.saturating_sub(area.y));
+        (ay.saturating_sub(h).max(area.y), h.max(1))
     } else {
         (area.y, want.min(area.height))
     };
@@ -3521,6 +3737,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             ("right-click PR #n", "copy the link to the PR"),
             ("double-click the divider", "reset the panel width"),
         ),
+        row(
+            ("double-click a word", "select it (in the editor)"),
+            ("right-click the editor", "the code menu for that word"),
+        ),
         Line::from(""),
         Line::from(Span::styled("Move (the cursor row is underlined)", head)),
         row(
@@ -3581,6 +3801,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         row(
             ("gd / gr", "definition / references"),
             ("K", "what is this? (type + docs)"),
+        ),
+        row(
+            ("F12 / F10", "the same two, on function keys"),
+            ("F3 / Shift+F3", "next / previous match"),
         ),
         Line::from(""),
         Line::from(Span::styled("Act", head)),
@@ -3654,7 +3878,23 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             dim,
         )),
         Line::from(Span::styled(
-            "  Editor + language server: Ctrl+Space complete · Ctrl+G what is this? · Ctrl+] definition · Ctrl+T format",
+            "  Editor + language server: suggestions appear as you type (Tab takes one) · Ctrl+Space asks now · Ctrl+G what is this? · Ctrl+T format",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  Problems: ✗ error (red) · ▲ warning (yellow) · the span is underlined and the message sits in the margin · Alt+X explains one · F8 walks them · Alt+E lists them",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  Lint runs beside the compiler — eslint and ruff, the project's own copy first, on the buffer rather than the file on disk. loupe --lsp says what it found.",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  Editor, on the function keys: F12 definition · F10 (or Shift+F12) every use · F2 rename · F8 / Shift+F8 next / previous problem · Alt+E lists them · F1 this help",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "  Editor, with the mouse: double-click a word to select it (every other use lights up) · triple-click takes the line · right-click asks the language server about it",
             dim,
         )),
         Line::from(Span::styled(
@@ -3760,40 +4000,74 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(Paragraph::new(line), area);
         return;
     }
+    // A language-server request the reader asked for outranks everything
+    // else in here: they pressed a key, and the answer can be half a
+    // minute away on a server that is still indexing. Silence for that
+    // long reads as a key that did nothing.
+    if let Some((frame, label)) = app.editor_waiting() {
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {frame} "),
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(label.to_string(), Style::default().fg(p.key)),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
     // In the editor, what the language server says about the cursor line
     // outranks the last status message — it is about the code, not about
     // what loupe just did.
     if let Some(editor) = &app.editor {
         if let Some(d) = editor.diagnostics_here().first() {
-            let color = if d.is_error() { p.err } else { p.stage_partial };
-            let code = match &d.code {
+            let color = crate::editor::diagnostic_color(d);
+            let code = match d.code_label() {
                 Some(c) => format!("  {c}"),
                 None => String::new(),
             };
-            let hints = " Ctrl+S save · Ctrl+G what is this? · ? help";
+            let hints = " Alt+X explains · F8 next · ? help";
             let msg_w = area.width.saturating_sub(hints.chars().count() as u16 + 1) as usize;
-            let line = Line::from(vec![
-                Span::styled(
-                    truncate_pad(
-                        &format!(
-                            "{} {}{code}",
-                            if d.is_error() { "✗" } else { "▲" },
-                            d.message
+            // The quoted names are the part a reader looks for, so they
+            // are picked out here the way the panel picks them out.
+            // Everything else about this line stays one line: the status
+            // bar has exactly one.
+            let mut spans = vec![Span::styled(
+                format!("{} ", d.mark()),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )];
+            let mut used = 2usize;
+            let flat = crate::editor::one_line(&d.message);
+            for row in crate::explain::rows(&flat) {
+                for part in row.parts {
+                    let (text, style) = match part {
+                        crate::explain::Part::Text(t) => (t, Style::default().fg(color)),
+                        crate::explain::Part::Quoted(t) => (
+                            t,
+                            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
                         ),
-                        msg_w,
-                    ),
-                    Style::default().fg(color),
-                ),
-                Span::styled(hints, Style::default().fg(p.faint)),
-            ]);
-            f.render_widget(Paragraph::new(line), area);
+                    };
+                    let text = crate::editor::one_line(&text);
+                    if used >= msg_w {
+                        break;
+                    }
+                    let clipped = truncate_pad(&text, disp_width(&text).min(msg_w - used));
+                    used += disp_width(&clipped);
+                    spans.push(Span::styled(clipped, style));
+                }
+            }
+            if used < msg_w {
+                let tail = truncate_pad(&code, msg_w - used);
+                spans.push(Span::styled(tail, Style::default().fg(p.faint)));
+            }
+            spans.push(Span::styled(hints, Style::default().fg(p.faint)));
+            f.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
         }
         // Nothing wrong on this line, but something is wrong somewhere:
         // say how much, so a problem off screen isn't invisible.
-        if !editor.diagnostics.is_empty() && app.status.is_empty() {
+        if !editor.problems().is_empty() && app.status.is_empty() {
             let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
-            for d in &editor.diagnostics {
+            for d in editor.problems() {
                 *counts.entry(d.label()).or_default() += 1;
             }
             let summary = counts
@@ -3801,7 +4075,7 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
                 .map(|(what, n)| format!("{n} {what}{}", if *n == 1 { "" } else { "s" }))
                 .collect::<Vec<_>>()
                 .join(" · ");
-            let worst_is_error = editor.diagnostics.iter().any(|d| d.is_error());
+            let worst_is_error = editor.problems().iter().any(|d| d.is_error());
             let line = Line::from(Span::styled(
                 format!(" {summary} in this file"),
                 Style::default().fg(if worst_is_error {
@@ -3907,6 +4181,91 @@ mod tests {
             previous: None,
             conflicted,
         }
+    }
+
+    /// The two panels share their rows and mean different things by them.
+    /// The Changes panel row is a diff: a staging box, a status letter and
+    /// the +/- counts. The Files panel row is a file, and carries none of
+    /// them even when the change happens to touch that file.
+    #[test]
+    fn the_files_panel_lists_files_not_diffs() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.files = vec![ChangedFile {
+            path: "src/app.rs".into(),
+            status: "modified".into(),
+            additions: 10,
+            deletions: 2,
+            previous: None,
+            conflicted: false,
+        }];
+        app.rebuild_files();
+        app.apply_repo_listing(crate::search::RepoListing {
+            paths: vec!["src/app.rs".into(), "docs/plan.md".into()],
+            ignored_from: 2,
+            stubs: Vec::new(),
+        });
+
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(
+            screen.contains("+10 −2"),
+            "the Changes panel counts the diff: {screen}"
+        );
+        assert!(screen.contains("[+]"), "and offers to stage it: {screen}");
+
+        app.set_panel(crate::app::PanelMode::Files);
+        app.collapsed().remove("src");
+        app.rebuild_entries();
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(
+            screen.contains("app.rs"),
+            "the same file is listed: {screen}"
+        );
+        assert!(
+            !screen.contains("+10 −2"),
+            "with no counts — this panel is not the change: {screen}"
+        );
+        assert!(
+            !screen.contains("[+]") && !screen.contains("[ ]"),
+            "and no staging box: {screen}"
+        );
+    }
+
+    /// The Files panel keeps its own collapse set. The arrow has to read
+    /// that one, or every folder in the repository draws open however the
+    /// reader shuts it.
+    #[test]
+    fn the_files_panel_arrow_follows_the_folder() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.apply_repo_listing(crate::search::RepoListing {
+            paths: vec!["src/app.rs".into(), "docs/plan.md".into()],
+            ignored_from: 2,
+            stubs: Vec::new(),
+        });
+        app.set_panel(crate::app::PanelMode::Files);
+
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(
+            screen.contains("\u{25b8} src") && screen.contains("\u{25b8} docs"),
+            "a shut folder points right: {screen}"
+        );
+
+        app.collapsed().remove("src");
+        app.rebuild_entries();
+        let screen = screen_of(&mut app, 110, 24);
+        assert!(
+            screen.contains("\u{25be} src"),
+            "and an open one points down: {screen}"
+        );
+        assert!(
+            screen.contains("\u{25b8} docs"),
+            "while the folder beside it is unchanged: {screen}"
+        );
     }
 
     /// A conflict is impossible to miss: a heading and a red row at the top
@@ -4271,6 +4630,203 @@ mod tests {
         assert!(row.contains("1 PLAN.md"), "{row}");
         assert!(row.contains("2 ↗ review.md"), "{row}");
         assert_eq!(row.matches('✕').count(), 2, "one close mark each: {row}");
+    }
+
+    /// The row is the only place a reader is told which files are open,
+    /// which one a click is about to replace, and which hold work that is
+    /// not on disk yet. Italic says the first, a dot says the second, and
+    /// the dot has to read on the selected tab as well as the rest —
+    /// the selected tab is the one being typed into.
+    #[test]
+    fn the_tab_row_marks_the_peek_tab_and_unsaved_work() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.open_buffer(crate::editor::Editor::new(
+            "src/kept.rs",
+            "src/kept.rs".into(),
+            "one\n",
+        ));
+        app.open_buffer(crate::editor::Editor::new(
+            "src/glance.rs",
+            "src/glance.rs".into(),
+            "two\n",
+        ));
+        app.set_peek_for_test("src/glance.rs");
+        // Back to the first file, which is the case the dot has to
+        // survive: the tab being typed into is the selected one.
+        app.switch_buffer("src/kept.rs");
+        app.editor.as_mut().unwrap().dirty = true;
+
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let row: String = (0..buf.area.width).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(
+            row.contains("● kept.rs"),
+            "the unsaved one has a dot, spaced off the name: {row}"
+        );
+        assert!(
+            !row.contains("● glance.rs"),
+            "the saved one does not: {row}"
+        );
+        assert!(row.contains('│'), "a seam divides the tabs: {row}");
+        assert_eq!(row.matches('✕').count(), 2, "one close mark each: {row}");
+
+        let cell = |s: &str| {
+            let at = row.find(s).unwrap_or_else(|| panic!("no {s}: {row}"));
+            buf[(at as u16, 1)].style()
+        };
+        // Italic on the peek tab, and on that one only.
+        let italic = |s: &str| cell(s).add_modifier.contains(Modifier::ITALIC);
+        assert!(italic("glance.rs"), "the peek tab is italic: {row}");
+        assert!(!italic("kept.rs"), "the kept tab is not: {row}");
+
+        // The dot is not the color it is sitting on. `kept.rs` is the
+        // buffer on screen, so its dot is on the selected tab's blue —
+        // which is where a single dot color used to disappear.
+        let dot = cell("●");
+        assert_ne!(
+            dot.fg, dot.bg,
+            "the unsaved mark is visible on the selected tab"
+        );
+        assert_eq!(
+            dot.fg,
+            Some(crate::theme::palette().tab_dirty_active),
+            "and it is the color meant for that background"
+        );
+    }
+
+    /// Click, hold and drag a tab to put it where you want it. Driven
+    /// through the mouse handler rather than the move itself, because the
+    /// row's click targets are rebuilt on every draw and the drag is the
+    /// one thing that reads them while they are changing underneath it.
+    #[test]
+    fn a_tab_can_be_dragged_to_a_new_place_in_the_row() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        for path in ["a.rs", "b.rs", "c.rs"] {
+            app.open_buffer(crate::editor::Editor::new(path, path.into(), "one\n"));
+        }
+        let labels = |app: &App| -> Vec<String> {
+            app.buffer_tabs().iter().map(|t| t.label.clone()).collect()
+        };
+        assert_eq!(labels(&app), vec!["a.rs", "b.rs", "c.rs"]);
+
+        // The x of each tab, read off the row the draw just laid out.
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let tab_x = |app: &App, i: usize| -> u16 {
+            app.layout
+                .buttons
+                .iter()
+                .find(|(_, id)| matches!(id, ButtonId::BufferTab(n) if *n == i))
+                .map(|(r, _)| r.x + 1)
+                .unwrap_or_else(|| panic!("no rect for tab {i}"))
+        };
+        let y = app.layout.pin_row.y;
+        let (first, last) = (tab_x(&app, 0), tab_x(&app, 2));
+
+        let ev = |kind, x| MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        // Pick the last tab up and drop it on the first.
+        app.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left), last));
+        app.handle_mouse(ev(MouseEventKind::Drag(MouseButton::Left), first));
+        app.handle_mouse(ev(MouseEventKind::Up(MouseButton::Left), first));
+
+        assert_eq!(
+            labels(&app),
+            vec!["c.rs", "a.rs", "b.rs"],
+            "the dragged tab took the place it was dropped on"
+        );
+        assert_eq!(
+            app.editor.as_ref().unwrap().path,
+            "c.rs",
+            "and it is the file on screen, because the press opened it"
+        );
+
+        // The drag ended, so moving the pointer over the row again does
+        // not carry the tab along with it.
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let third = tab_x(&app, 2);
+        app.handle_mouse(ev(MouseEventKind::Drag(MouseButton::Left), third));
+        assert_eq!(labels(&app), vec!["c.rs", "a.rs", "b.rs"], "nothing moved");
+    }
+
+    /// The pane must not blink back to the diff between two files.
+    ///
+    /// A click on the tree starts a read, and a read takes a frame or
+    /// two. Loupe used to close the old buffer at the click and open the
+    /// new one when the read landed, so every frame in between drew a
+    /// pane with nothing in it — which is the diff. Clicking down a list
+    /// of ten files flashed the whole window ten times.
+    ///
+    /// This is that complaint measured: draw the frames the reader would
+    /// actually see, in order, and read what is on them.
+    #[test]
+    fn switching_files_in_the_tree_never_blinks_back_to_the_diff() {
+        use crate::app::tests::{click_file, tree_app};
+        let _guard = highlight::test_theme_lock();
+        let dir = std::env::temp_dir().join(format!("loupe-noflash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = tree_app(&dir);
+        click_file(&mut app, "src/one.rs");
+        assert!(
+            screen_of(&mut app, 110, 24).contains("fn one()"),
+            "the first file is on screen"
+        );
+
+        // The click that starts the second read, and then every frame
+        // between it and the file landing.
+        // Aimed at the row as the draw just laid it out: the panel has a
+        // border, so its first row is not the first row of the window.
+        let at = app
+            .entries
+            .iter()
+            .position(|e| match e {
+                crate::app::FileEntry::File { src, .. } => app.row_path(*src) == Some("src/two.rs"),
+                _ => false,
+            })
+            .expect("a row for src/two.rs");
+        let fl = app.layout.file_list;
+        let y = fl.y + (at - app.file_scroll) as u16;
+        app.handle_mouse(crate::app::tests::mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            fl.x + 6,
+            y,
+        ));
+
+        let mut frames = 0;
+        loop {
+            let screen = screen_of(&mut app, 110, 24);
+            assert!(
+                screen.contains("fn one()") || screen.contains("fn two()"),
+                "frame {frames} shows neither file — the pane fell back:\n{screen}"
+            );
+            if screen.contains("fn two()") {
+                break;
+            }
+            frames += 1;
+            assert!(frames < 500, "the file never landed");
+            app.poll_jobs();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        // And the row swapped the file into the tab rather than growing.
+        let tabs = app.buffer_tabs();
+        assert_eq!(tabs.len(), 1, "one tab, not two");
+        assert_eq!(tabs[0].label, "two.rs");
+        assert!(tabs[0].peek, "still the tab a click replaces");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Nothing pinned means no row at all — the feature costs no height
@@ -5280,6 +5836,205 @@ mod tests {
         assert_eq!(count(&plain), 0, "nothing is highlighted before a search");
         // "alpha" on both sides of a side-by-side view.
         assert_eq!(count(&marked), 10, "both copies of the match are marked");
+    }
+
+    /// Four things say a problem at once, and each of them has to
+    /// actually reach the screen: the gutter mark, the underline under
+    /// the span, the message in the margin, and the color that says how
+    /// bad it is.
+    #[test]
+    fn a_problem_is_marked_underlined_and_named_in_the_margin() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        let mut ed = crate::editor::Editor::new(
+            "a.ts",
+            "a.ts".into(),
+            "const x = totl;
+const y = 2;
+",
+        );
+        ed.set_server_diagnostics(vec![crate::lsp::Diagnostic {
+            line: 1,
+            col: 11,
+            end_col: 15,
+            severity: 1,
+            message: "Cannot find name 'totl'.".into(),
+            code: Some("2552".into()),
+            source: Some("typescript".into()),
+        }]);
+        ed.set_lint_diagnostics(vec![crate::lsp::Diagnostic {
+            line: 2,
+            col: 7,
+            end_col: 8,
+            severity: 2,
+            message: "'y' is never used.".into(),
+            code: Some("no-unused-vars".into()),
+            source: Some("eslint".into()),
+        }]);
+        // The cursor is parked on the blank third line: the cursor's own
+        // row is underlined too, and this test is about the underline
+        // the *diagnostic* draws.
+        ed.jump_to_line(3);
+        app.open_buffer(ed);
+
+        let buf = render(&mut app);
+        let p = palette();
+        let all: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(all.contains('✗'), "the error is marked: {all}");
+        assert!(all.contains('▲'), "and the warning differently: {all}");
+        assert!(
+            all.contains("Cannot find name"),
+            "the message is in the margin: {all}"
+        );
+        assert!(all.contains("'y' is never used."), "{all}");
+
+        // The span itself: red and underlined for the error, yellow for
+        // the lint warning.
+        let underlined_in = |color| {
+            (0..buf.area.height).any(|y| {
+                (0..buf.area.width).any(|x| {
+                    let cell = &buf[(x, y)];
+                    cell.fg == color
+                        && cell.modifier.contains(Modifier::UNDERLINED)
+                        && cell.symbol() != " "
+                })
+            })
+        };
+        assert!(
+            underlined_in(p.err),
+            "the bad name is red and underlined — color alone is not readable to everyone"
+        );
+        assert!(
+            underlined_in(p.warn),
+            "and the lint warning is yellow, not red"
+        );
+    }
+
+    /// A message too long for the status bar is laid out: the claim, the
+    /// reason under it, and the names picked out of the prose. This is
+    /// the whole reason the panel exists.
+    #[test]
+    fn the_problem_panel_lays_the_reasoning_out() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        let mut ed = crate::editor::Editor::new("a.ts", "a.ts".into(), "const s: string = 1;\n");
+        ed.set_server_diagnostics(vec![crate::lsp::Diagnostic {
+            line: 1,
+            col: 7,
+            end_col: 8,
+            severity: 1,
+            message: "Type 'A' is not assignable to type 'B'.\n  Types of property 'a' are \
+                      incompatible.\n    Type 'number' is not assignable to type 'string'."
+                .into(),
+            code: Some("2322".into()),
+            source: Some("typescript".into()),
+        }]);
+        app.open_buffer(ed);
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+
+        let buf = render(&mut app);
+        let all: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("Error"), "the box says how bad it is: {all}");
+        assert!(all.contains("not assignable"), "{all}");
+        assert!(
+            all.contains("Types of property"),
+            "the reason comes with it: {all}"
+        );
+        assert!(all.contains("└"), "and it hangs under the claim: {all}");
+        assert!(all.contains("typescript(2322)"), "with who said so: {all}");
+        // Any key puts it away.
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(matches!(app.overlay, crate::app::Overlay::None));
+    }
+
+    /// A cold language server can take half a minute to answer. The
+    /// status bar has to say so for the whole wait, or the key that
+    /// asked reads as a key that did nothing.
+    #[test]
+    fn the_status_bar_names_what_the_editor_is_waiting_for() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.open_buffer(crate::editor::Editor::new(
+            "src/a.rs",
+            "src/a.rs".into(),
+            "fn count_items() {}\n",
+        ));
+        app.set_editor_waiting_for_test("Finding the definition of count_items…");
+
+        let buf = render(&mut app);
+        let status = row_text(&buf, buf.area.height - 1);
+        assert!(
+            status.contains("Finding the definition of count_items"),
+            "the wait is invisible: {status:?}"
+        );
+        assert!(
+            app.searching(),
+            "and the main loop keeps ticking, so the spinner turns"
+        );
+    }
+
+    /// The editor's right-click menu names the word it is about and
+    /// flips above the pointer when a click near the last line would
+    /// otherwise throw it to the top of the screen.
+    #[test]
+    fn the_code_menu_names_the_word_and_flips_up() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.open_buffer(crate::editor::Editor::new(
+            "src/a.rs",
+            "src/a.rs".into(),
+            "fn count_items() {}\n",
+        ));
+        // One frame first: the editor learns its own rectangle from it,
+        // and the click needs that to land on a buffer position.
+        render(&mut app);
+
+        // A right click on `count_items`, through the same path a real
+        // one takes: the click takes the word, and the menu is about it.
+        app.handle_mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            column: 44,
+            row: 3,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        let buf = render(&mut app);
+        let all: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("⌁ count_items"),
+            "the title names the word: {all}"
+        );
+        assert!(
+            all.contains("Go to the definition"),
+            "and the menu offers the lookup: {all}"
+        );
+        assert!(all.contains("F12"), "the key is shown beside it: {all}");
+        // Flipped: the box ends at the pointer rather than starting at
+        // the top of the screen.
+        assert!(
+            !row_text(&buf, 18).contains("Go to the definition"),
+            "nothing is drawn below the pointer"
+        );
     }
 
     /// The right-click menu opens at the pointer, names the row it is

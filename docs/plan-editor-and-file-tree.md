@@ -13,37 +13,6 @@ The numbers come from this machine. Reproduce them before you trust them.
 2. **A full file tree.** See every file in the repository in the file
    panel, not only the files the change touches.
 
-## On reading other editors
-
-Lapce and Warp both solve parts of this, and both are worth reading when a
-question comes up. Neither is worth relicensing loupe over. Loupe is
-**MIT**.
-
-| Project | Licence | What copying costs |
-| --- | --- | --- |
-| lapce | Apache-2.0 | Attribution and a NOTICE obligation |
-| Warp — `warpui`, `warpui_core` | MIT | Nothing, but it is their UI toolkit and we use ratatui |
-| Warp — **everything else** | **AGPL-3.0** | **Loupe becomes AGPL**, network use included |
-
-Every Warp crate that touches our problems is on the AGPL side:
-`editor`, `lsp`, `jsonrpc`, `fuzzy_match`, `sum_tree`, `syntax_tree`,
-`virtual_fs`, `languages`, `vim`.
-
-**The rule:**
-
-- **Copy no code and no comments, from either project.** Read it,
-  understand the technique, close the tab, then write ours against loupe's
-  own types and job engine.
-- **Treat AGPL more carefully than Apache-2.0.** Apache-2.0 copying is a
-  paperwork mistake. AGPL copying relicenses the whole project. Where the
-  same technique is documented somewhere friendlier, read that instead —
-  we lose nothing.
-- Cite the file when a decision came from reading it, as D12, D14 and D15
-  do. A citation is a pointer for the next reader, not a licence to paste.
-- A technique — a count per node, a thread that owns a pipe, a tree whose
-  nodes cache a summary — is an idea. Ideas are not what a licence covers.
-  The expression is.
-
 ## The speed budget
 
 The event loop (`main.rs:740`) drains input, then draws. Everything on
@@ -199,13 +168,9 @@ calls `write_all` on the server's stdin. Measured above: a 536 KB buffer is
 9 times the macOS pipe buffer. A server busy indexing does not drain it,
 and the UI thread stops.
 
-**Lapce reaches the same conclusion**, and its shape is better than the
-obvious one. Read `lapce-proxy/src/plugin/lsp.rs` for the idea: one thread
-per server owns the pipe, and every other thread reaches it through a
-channel. A send becomes a channel push, so nothing that talks to a server
-can block a caller.
-
-Write our own. See the licence rule below.
+**The shape to build is one thread per server that owns the pipe**, with
+every other thread reaching it through a channel. A send becomes a channel
+push, so nothing that talks to a server can block a caller.
 
 **Take this design, not "spawn a worker per sync".** A worker per sync
 would have introduced a bug: two syncs racing could deliver `didChange`
@@ -249,11 +214,10 @@ The background job runs **two** commands, not one:
 
 Total added cost at load: 14 ms on the background thread.
 
-**Lapce does it differently, and worse for this requirement.** Its
-explorer ignores git entirely and filters through a glob setting,
-`editor.files_exclude` (`lapce-app/src/file_explorer/data.rs`). So a lapce
-user hides `node_modules` by hand, and nothing tells them `.env` is
-special. Git already knows both facts. Keep D14.
+**The alternative is a glob setting**, which is what an explorer that
+ignores git has to fall back on. That makes the reader hide
+`node_modules` by hand, and nothing tells them `.env` is special. Git
+already knows both facts. Keep D14.
 
 **This also solves D9's nested-worktree trap.** `wt/feat/` and
 `node_modules/` are the same shape — a path with a trailing slash that
@@ -262,8 +226,8 @@ accordingly: do not drop those entries, render them as directories.
 
 ### D15 — Keep `children_open_count` in reserve
 
-Lapce never flattens its tree, and the technique is worth knowing. Read
-`lapce-rpc/src/file.rs` for it. Described rather than copied:
+A tree that is never flattened can still answer "what is in this
+viewport" cheaply:
 
 Every directory node carries a running count of the visible rows its whole
 subtree contributes when open. To fetch the rows for a viewport, walk down
@@ -274,12 +238,11 @@ root's count, read in constant time.
 The result is a window that costs depth plus window size, whatever the
 repository holds, with no flattened list anywhere.
 
-**The idea generalises, and Warp shows how far.** Its `crates/sum_tree` is
-a B-tree whose every node caches a summary of its subtree, so one
-structure answers "how many rows", "which row sits at position N", and
-"what offset is line N" in logarithmic time. A per-node row count is the
-one-summary case of that. If loupe ever outgrows D15, that is the shape to
-grow into — read an MIT or Apache implementation of it, not Warp's.
+**The idea generalises.** A B-tree whose every node caches a summary of
+its subtree answers "how many rows", "which row sits at position N" and
+"what offset is line N" in logarithmic time, from one structure. A
+per-node row count is the one-summary case of that, and it is the shape
+to grow into if loupe ever outgrows D15.
 
 That is strictly better than a flattened `Vec`. **Do not build it yet.**
 Measured, loupe's emit costs 724 µs at 16,761 paths fully expanded and
@@ -503,9 +466,8 @@ is no slower than it is today.
   directory, then splices the result into the cached node tree. Never
   recurse. A second expand inside it reads one more level.
 - Carry a "children fetched" flag on the node, false until the read lands.
-  Lapce takes the same approach and never reads synchronously; see
-  `lapce-app/src/file_explorer/data.rs` for the idea, then write ours
-  against our own job engine.
+  Never read synchronously — the read goes through our own job engine
+  like every other piece of blocking work.
 - `node_modules/` must stay one row until the reader asks. That is the
   whole reason D14 is affordable.
 
@@ -656,6 +618,31 @@ Needs STEP 8 and STEP 9, per D7.
 Bracket match, comment toggle, auto-indent. All in `editor.rs`.
 **Size:** 1 day.
 
+### STEP 17 — Word selection, the code menu, and the function keys
+
+The three things a reader coming from another editor tries first, and the
+last places loupe made them reach for a key list instead.
+
+- One `word_range` in `editor.rs` behind the cursor word, the double
+  click and the other-uses highlight, so all three agree on where a word
+  starts. `App::click_run` counts presses on one cell: one places the
+  cursor, two take the word, three take the line.
+- The right-click menu reuses `Overlay::Menu` rather than adding a
+  fourth popup type. `Menu` grew a `title` and a `flip`: the ☰ menu must
+  leave its own button visible, a menu at the pointer must not fall off
+  the bottom of the screen. Every line is an existing `ButtonId`, so a
+  menu line and its key cannot drift apart.
+- `F12` / `F10` / `F2` / `F8` / `F3` / `F1` in the editor and, where they
+  mean something, in the diff view. `Shift+F12` finds every use as well,
+  because some terminals keep `F10` for their own menu bar.
+- Problems: `Editor::step_problem` walks them in line order and wraps;
+  `FinderMode::Problems` lists them in the overlay references already
+  use, so `Enter` goes to the line for free.
+
+**Done when:** a double click selects a name, a right click asks about
+it, and `F12` goes there.
+**Size:** 1 day.
+
 ---
 
 ## Totals
@@ -686,11 +673,3 @@ in STEP 0 and STEP 4, and the timing tests in STEP 5. Those are what keep
 - [tui-textarea repository](https://github.com/rhysd/tui-textarea)
 - [`ignore` crate `WalkBuilder`](https://docs.rs/ignore/latest/ignore/struct.WalkBuilder.html)
 - [LSP 3.17 specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/)
-- [lapce](https://github.com/lapce/lapce) (Apache-2.0, **reference only**)
-  — `lapce-rpc/src/file.rs`, `lapce-app/src/file_explorer/data.rs`,
-  `lapce-proxy/src/plugin/lsp.rs`
-- [Warp](https://github.com/warpdotdev/warp) (**AGPL-3.0** outside
-  `warpui`/`warpui_core`, **reference only, read with care**) —
-  `crates/sum_tree`, `crates/editor`, `crates/lsp`, `crates/fuzzy_match`
-- [ratatui-explorer](https://github.com/tatounee/ratatui-explorer)
-- [tui-tree-widget](https://crates.io/crates/tui-tree-widget)

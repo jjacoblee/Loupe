@@ -16,8 +16,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A rich, clickable TUI for reviewing GitHub pull requests **and your own
-uncommitted changes**, inspired by the VS Code GitHub Pull Requests
-extension. Built with Rust + [ratatui](https://ratatui.rs).
+uncommitted changes**, with the file trees, inline comments and viewed
+checkboxes of a graphical review tool. Built with Rust +
+[ratatui](https://ratatui.rs).
 
 Click through file trees, read syntax-highlighted side-by-side diffs,
 post review comments, mark files viewed (synced to GitHub), stage your
@@ -168,12 +169,35 @@ leaving your terminal or touching a browser.
 - **Edit in place, with the language server attached** — double-click a
   new-side line to open an editor with live incremental highlighting,
   completion (`Ctrl+Space`), type-and-docs at the cursor (`Ctrl+G`),
-  go-to-definition (`Ctrl+]`), find-every-use (`Alt+R`), the signature
+  go-to-definition (`F12`), find-every-use (`F10`), the signature
   of the call you are in (`Alt+S`), formatting (`Ctrl+T`), and
   diagnostics that appear as you type rather than after you push.
   `Alt+F` finds and replaces, `Alt+C` comments a line or a selection,
   and `Enter` keeps your indent. `Ctrl+S` refreshes the diff; you commit
   when you're ready.
+- **Double-click a word, right-click for the rest** — a double click
+  takes the whole identifier and lights up every other place it appears
+  in the file; a right click opens a menu about that word, from go-to-
+  definition down to the fixes the server offers. The function keys are
+  where an editor puts them: `F12` definition, `F10` every use, `F2`
+  rename, `F8` the next problem, `F1` the help card.
+- **Suggestions as you type** — the popup opens on its own after a
+  character of a name, and after a character the server asks to be told
+  about, so `object.` in TypeScript lists the object's fields. `Tab`
+  takes one. Loupe reads the trigger characters from the server rather
+  than guessing them.
+- **Problems you can read** — the span is colored *and* underlined, the
+  gutter carries `✗` or `▲`, and the message itself sits in the margin
+  past the end of the line. Errors red, warnings yellow. `Alt+X` lays
+  one out properly: TypeScript folds its reasoning into a single
+  sentence, and the panel puts each reason under the one it explains.
+- **Lint beside the compiler** — `eslint` and `ruff` run over the buffer
+  as you edit, the project's own copy first, and their findings sit
+  alongside the language server's with the tool named on each:
+  `eslint(no-undef)`, `typescript(2552)`.
+- **Walk what is wrong** — `F8` and `Shift+F8` step through the
+  problems in the file in line order, and `Alt+E` lists them all with
+  the server's own codes, to filter and jump from.
 - **Rename a symbol and read every file it touched** — `Alt+M` renames
   it everywhere the server knows about, and `Alt+.` offers the fixes and
   refactors on hand. Neither writes to disk. Every file the change

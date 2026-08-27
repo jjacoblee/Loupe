@@ -25,7 +25,9 @@ threading model, and the invariants that are easy to break by accident.
 | `theme.rs` | Light/dark appearance: terminal background detection and the two UI color palettes |
 | `config.rs` | TOML config discovery, parsing, and merging (global + per-repo) |
 | `search.rs` | Fuzzy path matching, the pattern-based definition scanner, and `git grep` |
-| `lsp.rs` | Language servers: process lifecycle, JSON-RPC over stdio, symbols/definition/references/hover |
+| `lsp.rs` | Language servers: process lifecycle, JSON-RPC over stdio, symbols/definition/references/hover/completion |
+| `linter.rs` | Linters: running one over the buffer on stdin, and turning its JSON into diagnostics |
+| `explain.rs` | Splitting a diagnostic message into the claim, its reasons, and the names quoted inside them |
 | `clipboard.rs` | Copying out: a clipboard command when there is one, OSC 52 when there isn't |
 | `ctx.rs` | The context provider: the snapshot of what is on screen, and the unix socket that serves it |
 | `hooks.rs` | Installing that context into a coding agent: the `UserPromptSubmit` merge for Claude Code and Codex |
@@ -527,7 +529,76 @@ an answer about text you have already typed past is worse than no answer.
 `typescript-language-server` needs pointing at a `tsserver.js`
 (`tsserver` itself speaks its own protocol, not LSP). Loupe prefers the
 project's own `node_modules` copy so a pinned TypeScript is what does the
-analysis.
+analysis. Having the wrapper without a `typescript` package to drive is a
+server that starts and then dies on every question, so `--lsp` checks for
+both and says which half is missing.
+
+### A loading server answers, and its answer is wrong
+
+`request_when_ready` exists because there are three ways a server that is
+still loading a project answers a question about it:
+
+1. **Nothing.** `rust-analyzer` returns an empty list for references
+   until its index is built.
+2. **`ContentModified`** (-32801). The specification says to send the
+   request again; `rust-analyzer` returns it for much of the time it
+   spends loading.
+3. **A plausible wrong answer.** `tsserver` answers go-to-definition out
+   of a half-built program by pointing at the `import` line in the file
+   the question came from, rather than the file the symbol is defined
+   in. Not empty, not an error, and nothing in the answer itself gives
+   it away.
+
+The third is why an answer given while the server is still doing the work
+it began at launch is treated as provisional whatever it contains, and
+why the **first** question of a session waits out a short grace before it
+is believed. That grace is a clock rather than a signal on purpose: ending
+it as soon as the server reports it has finished something was measured
+and made the failure more frequent, because `tsserver` announces smaller
+pieces of work before it gets to the project.
+
+The cost is about a second, once per server per session, behind the
+spinner the status bar already shows. Every later question is unaffected.
+
+## Suggestions
+
+The completion popup opens on its own, so the decision about *when* is
+its own small piece of logic (`App::maybe_suggest`). Two things earn a
+request: a character the server named in
+`completionProvider.triggerCharacters`, or one word character with a name
+already behind it. Anything else — a space, a bracket — cancels whatever
+was pending.
+
+Loupe tells the server which of the two it was. `triggerKind: 2` with the
+character is what makes `object.` in TypeScript answer with the object's
+members; asked as though a human had invoked it, the same position
+answers with everything in scope.
+
+A popup that is already open is filtered locally rather than re-fetched:
+the list in hand is the server's answer for this word. Filtering keeps
+prefix matches above subsequence matches, so a typo narrows the list
+instead of emptying it and closing the popup.
+
+## Problems
+
+Diagnostics arrive from two places on two clocks — the language server
+pushes them, and the linter finishes a run — so `Editor` keeps the two
+lists apart and merges them into the one `problems()` reads. The merged
+list is private for that reason: its order (line, then column, then
+severity) is an invariant that four readers depend on, and they all have
+to agree on which problem a line's "worst" is.
+
+`linter.rs` runs a subprocess with the buffer on stdin rather than
+driving a second language server: no handshake, no workspace
+negotiation, nothing kept alive between keystrokes, and it lints what is
+on screen rather than what is on disk. It prefers the project's own copy
+in `node_modules/.bin`, because that is the version whose rules the
+repository agreed on.
+
+ESLint numbers its severities the other way round from LSP — its `2` is
+an error and its `1` a warning. That is turned round on the way in, and
+it is the one thing in the parser that must not be guessed: a warning
+painted red is a warning people stop believing.
 
 ## Copying, and why it needs code at all
 

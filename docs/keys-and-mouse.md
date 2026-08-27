@@ -11,7 +11,7 @@ for the built-in help overlay.
 | Key | Action |
 | --- | --- |
 | `q` | Quit |
-| `?` | Help overlay |
+| `?` or `F1` | Help overlay |
 | `Esc` | Clear the selection, then back / close overlay / close editor / cancel a load |
 | `r` or `⟳` | Refresh — re-scan the changed files and reload the open one, keeping your place |
 | `m` or `☰` | Open the menu (see [The top bar and the ☰ menu](#the-top-bar-and-the--menu)) |
@@ -152,10 +152,35 @@ it does not yet — and, deliberately, the files git is **ignoring**:
   folder until you open it, and only then does loupe read what is inside —
   one level, never a walk.
 
-A file the change touches keeps its marks here: its stage box, its viewed
-box, its conflict mark. Clicking it opens the diff, not the plain file.
-Clicking a file the change does not touch opens it in the editor, or
-renders it when it is markdown.
+**A row here is a file, and nothing else.** No stage box, no viewed box,
+no `+`/`−` counts, no `↺` — every one of those belongs to the change, and
+the `Change` panel one key away is where they live. A file the change
+touches is drawn the same as one it does not, and clicking it opens the
+file rather than its diff.
+
+**One click peeks at a file.** Walking a tree means opening a great many
+files to look at one of them, so a click puts the file in the **peek
+tab** and the next click puts the next file in the same tab. The peek tab
+is drawn in *italics* to say so, and there is only ever one of them.
+**Double-click the file, or double-click the tab, to keep it** — it stops
+being italic, and the next click peeks in a tab of its own beside it.
+
+A peek is not a preview. In loupe a *preview* is the rendered markdown
+document that `P` opens; a *peek* is a tab you have not committed to yet.
+
+**A pinned file is never peeked.** It already has a tab — its pin — so
+clicking it here opens it the way its own tab does, and the row gains
+nothing. One file never sits in the row twice.
+
+You never have to leave the editor, save, or close anything to do this.
+Clicking another file parks the buffer you were in: it keeps its tab, its
+cursor, its scroll and anything you had not saved, and a `●` on the tab
+says the file on disk is not what you are looking at. A buffer you have
+typed into is never the one a click replaces.
+
+Markdown opens as source, like every other file, so it gets a tab. `P`
+renders it and `P` puts the source back, and the tab stays put across
+both.
 
 Reading is refreshed when you come back to the panel after a minute, and
 whenever you press `r`. Not on a timer: `git ls-files` costs about 90
@@ -451,7 +476,7 @@ picks which. Open it with `Ctrl+P` or the `🔍 Find` button.
 | Key / mouse | Action |
 | --- | --- |
 | `/` | Search the open diff, incrementally — matches highlight as you type |
-| `n` / `N` | Next / previous match (wraps, and says when it wrapped) |
+| `n` / `N`, or `F3` / `Shift+F3` | Next / previous match (wraps, and says when it wrapped) |
 | `Esc` | Cancel the search (restoring your place), then clear the highlight |
 | `Ctrl+P` or `🔍 Find` | Fuzzy-match a file by path |
 | `#` | Find text in files — one `git grep`, definitions sorted first |
@@ -482,8 +507,8 @@ to see what it found.
 
 | Key | Action |
 | --- | --- |
-| `gd` | Go to the definition |
-| `gr` | Find every reference, in the finder's result list |
+| `gd`, or `F12` | Go to the definition |
+| `gr`, or `F10` (`Shift+F12`) | Find every reference, in the finder's result list |
 | `K` | What is this? — the type and its documentation |
 
 Which symbol on the line? Click one first and it is used; otherwise, if
@@ -513,6 +538,9 @@ Set `language_servers = false` in your config to switch all of this off.
 | Key / mouse | Action |
 | --- | --- |
 | Click | Place the cursor |
+| Double-click a word | Select the whole word — every other use of it lights up |
+| Triple-click | Select the whole line |
+| Right-click | The code menu for the word under the pointer |
 | Drag | Select text |
 | `Ctrl+S` | Save (the diff refreshes immediately) |
 | `Ctrl+C` | Copy the selection, or the cursor line, to the system clipboard |
@@ -528,18 +556,56 @@ Set `language_servers = false` in your config to switch all of this off.
 Every one of these is in the `☰` menu as well, which matters: some
 terminals never send Alt, and the menu is the way in when yours does not.
 
+**A double click selects the word, not the character you hit.** The
+selection covers the whole identifier, and every other place that word
+appears in the file is marked while it holds — the answer to "where else
+is this?" before you ask the language server. `F12` and `F10` right after
+a double click ask about the word that is lit up.
+
+**Right-click the text and the menu is about that word.** The click takes
+the word under the pointer first, so the title of the menu names what you
+are about to ask about; a click inside a selection you made on purpose
+keeps that selection instead. Every line of the menu is a key that works
+without it, and a line that needs a symbol is drawn dim rather than
+dropped when the pointer is on punctuation.
+
 ### More than one file open
 
-Opening a second file parks the first rather than closing it. Both show in
-the tab row under the top bar, after any pinned files, and a `●` marks one
-with unsaved work.
+Opening a second file parks the first rather than closing it. Every open
+file shows in the tab row under the top bar, after any pinned files.
+
+| Mark | What it says |
+| --- | --- |
+| `●` before the name | Unsaved work in it (a pinned file carries this on its pin tab) |
+| *Italic* name | The peek tab — one click opened it, so the next click replaces it |
+| **Bold** name | The file on screen |
 
 | Key / mouse | Action |
 | --- | --- |
 | `Alt+]` / `Alt+[` | Next / previous open file |
 | Click a tab | Go to that file |
+| Double-click the peek tab | Keep it, so the next click peeks in its own tab |
+| Drag a tab along the row | Put it where you want it |
+| Click its `✕`, or middle-click the tab | Close that file |
 | `Esc` | Close this one and go back to the last |
 | `q` | Quit — asks once, and says how many files are unsaved |
+
+A file you have pinned draws no tab here — its pin *is* its tab, and one
+file in the row twice is one file too many. Unpin it and the tab comes
+back.
+
+**The row keeps the order you opened them in.** Clicking a tab opens that
+file and moves nothing. A drag is the only thing that reorders the row,
+and it changes the order without changing which file is on screen.
+
+Closing a tab lands you on the tab beside it, not on the last file you
+happened to open. A tab with unsaved work asks once before it goes, and
+each tab asks for itself.
+
+The file panel keeps working while the editor is up. Clicking another
+file parks this one — you never have to save or close first, and nothing
+you have not saved is thrown away. See
+[Every file in the repository](#every-file-in-the-repository).
 
 Coming back to a file keeps the buffer: the cursor, the scroll and any
 unsaved edits are where you left them. Opening a file that is already open
@@ -569,19 +635,50 @@ all-lowercase query ignores case, and a capital means that capital.
 ### In the editor, with a language server
 
 The diff view's `gd` / `gr` / `K` can't work in here — plain letters are
-text — so these are on Ctrl keys that `tui-textarea` leaves free.
+text — so these are on function keys and on Ctrl keys that `tui-textarea`
+leaves free.
 
 | Key | Action |
 | --- | --- |
-| `Ctrl+Space` | Suggest completions (they also appear on their own after `.`, `:` or `>`) |
+| `F12` | Go to the definition |
+| `F10`, or `Shift+F12` | Find every use — the same list `gr` gives in the diff |
+| `F2` | Rename this symbol everywhere |
+| `F8` / `Shift+F8` | Next / previous problem in this file |
+| `F3` / `Shift+F3` | Next / previous match of the last find |
+| `F1` | The help card |
+| `Alt+E` | Every problem in this file, as a list |
+| `Ctrl+Space` | Suggest completions now |
 | `Tab` / `Enter` | Accept the highlighted suggestion · `↑` `↓` to move · `Esc` to dismiss |
+| `Alt+X` | Explain the problem the cursor is on |
 | `Ctrl+G` | What is this? — the type and docs for the symbol at the cursor |
 | `Ctrl+]` | Go to the definition (vi's jump-to-tag key) |
-| `Alt+R` | Find every use — the same list `gr` gives in the diff |
+| `Alt+R` | Find every use |
 | `Alt+S` | The signature of the call the cursor is inside |
 | `Alt+M` | Rename this symbol everywhere |
 | `Alt+.` | Fixes and refactors on offer here |
 | `Ctrl+T` | Format the file, or the `⇥ Format` button |
+
+`F12` and `F10` work in the diff view too, where they mean the same two
+things `gd` and `gr` mean. `F1` opens the help card from anywhere.
+
+**The function keys do not always reach the terminal.**
+
+- **On a Mac, `F10` and `F12` are the volume keys** unless you hold `fn`,
+  or turn on *Use F1, F2, etc. keys as standard function keys* in System
+  Settings → Keyboard. Until then the key never reaches loupe at all, and
+  nothing happens — no message, because nothing arrived.
+- **GNOME Terminal keeps `F10`** for its own menu bar.
+
+Every one of these has another way in that no terminal intercepts:
+`Ctrl+]` for the definition, `Alt+R` for every use, `Alt+M` to rename,
+and the right-click menu or `☰` for all of them with the mouse.
+
+**How to tell what happened.** Press the key and watch the status bar. A
+request that arrived says what it is waiting for — `Finding the
+definition of parse…` — and keeps saying it, with a spinner, until the
+answer lands. If the bar stays silent, the key never got here: use
+`Ctrl+]` or the right-click menu instead. If it names a problem
+("no language server for CHANGELOG.md"), that is your answer.
 
 **A rename does not save anything.** Every file it touches opens as an
 unsaved buffer with a `●` in the tab row, so you read what changed before
@@ -595,19 +692,149 @@ touches: "extract function" over one file and over nine are different
 decisions. An action a server wants to run itself rather than describe as
 edits is not offered, because there would be nothing to show you first.
 
+`format_on_save = true` in your config runs the formatter on every
+`Ctrl+S`. It's off by default: reformatting a file mid-review would put
+changes in the diff that nobody asked for. Either way `Ctrl+Z` undoes a
+format in one keystroke.
+
+### Suggestions as you type
+
+The popup opens on its own. One character of a name is enough, and so is
+a character the server asks to be told about — `.` in TypeScript, `.` and
+`:` in Rust. That last one is what makes `object.` list the object's
+fields rather than everything in scope: loupe tells the server *why* it
+is asking, and a server answers a dot differently from a question asked
+out of the blue.
+
+| Key | Action |
+| --- | --- |
+| *(just type)* | The list appears after a moment |
+| `Tab` or `Enter` | Take the highlighted one |
+| `↑` / `↓` | Move through the list |
+| `Ctrl+Space` | Ask now, without waiting |
+| `Esc` | Put it away |
+
+Typing narrows the list without asking the server again — it already
+sent everything for this word. A name that starts with what you typed
+sorts above one that merely contains those letters in order, so a typo
+still finds `firstName` instead of closing the list.
+
+Set `suggest_while_typing = false` in your config to go back to
+`Ctrl+Space` only.
+
+**TypeScript needs two packages, not one.** `typescript-language-server`
+speaks LSP; the `typescript` package is what it drives. With only the
+first one the server starts and then dies on every question. Loupe looks
+in the project's `node_modules` first, then at a global install, and
+`loupe --lsp` says which of the two is missing.
+
+### Problems
+
 **Diagnostics** appear as you type, without saving: a `●` (error) or `▲`
 (warning) in the gutter, the offending span colored, and the message in
 the status bar when the cursor is on that line. When it isn't, the status
 bar shows the count for the file, so a problem off screen isn't invisible.
 
+Four things say the same thing at once, so a problem is hard to miss and
+easy to read:
+
+| Where | What it shows |
+| --- | --- |
+| The gutter | `✗` error · `▲` warning · `ℹ` note, in that severity's color |
+| Under the code | The offending span, colored **and** underlined |
+| The margin | The message itself, past the end of the line |
+| The status bar | The message again for the line the cursor is on, with the names picked out |
+
+Errors are red and warnings are yellow, everywhere. The underline is
+there as well as the color, because color alone is the one thing a
+reader with a color-vision difference cannot use.
+
+| Key | Action |
+| --- | --- |
+| `Alt+X` | Explain this one — the whole message, laid out |
+| `F8` | The next problem — the cursor lands on it, and the status bar reads it out |
+| `Shift+F8` | The previous one |
+| `Alt+E` | All of them, as a list to pick from |
+
+**`Alt+X` is for the messages that do not fit on one line.** TypeScript
+folds its reasoning into a single sentence — *"Type 'A' is not assignable
+to type 'B'. Types of property 'a' are incompatible. Type 'number' is not
+assignable to type 'string'."* — and the answer is the last clause. The
+panel puts each reason under the one it explains, picks the names and
+types out of the prose, and breaks a wide object type over lines at its
+semicolons. Any key closes it.
+
+### Lint
+
+A language server knows whether the code compiles. A linter knows whether
+it is any good — an unused import, a `==` that should be `===`, a rule
+the project agreed on. Loupe runs both and draws what they say together,
+with the tool's name on every message: `eslint(no-undef)`,
+`typescript(2552)`.
+
+| Linter | Files | Loupe finds it |
+| --- | --- | --- |
+| `eslint` | `.js` `.jsx` `.mjs` `.cjs` `.ts` `.tsx` `.mts` `.cts` | The project's `node_modules/.bin` first, then your PATH |
+| `ruff` | `.py` `.pyi` | Your PATH |
+
+The project's own copy wins on purpose: a JavaScript project pins its
+linter and its plugins, and that is the version whose rules the
+repository agreed on.
+
+The buffer goes to the linter on standard input, so what you see is the
+lint for what is on screen — not for what is on disk. It runs when typing
+pauses, and never blocks the editor: a linter that hangs costs a missing
+underline, not a frozen window.
+
+ESLint counts its severities the other way round from everything else
+(its `2` is an error, its `1` a warning). Loupe turns them round, so an
+ESLint error is red and an ESLint warning is yellow, the same as the
+compiler's.
+
+Add another with a `[[linter]]` table — see
+[configuration](configuration.md) — or set `linters = false` to run none.
+A linter you do not have installed costs nothing and is not an error;
+`loupe --lsp` lists what it found.
+
+`F8` walks the file in line order and wraps at the end, so holding it
+takes you round every problem and back to the first. The list `Alt+E`
+opens is the same overlay references use: type to filter it, `Enter` goes
+to the line, `Esc` puts it away. Errors carry `✗` and warnings `▲`, and
+the server's code (`E0425`, `ts(2552)`) comes with the message so you can
+search for it.
+
+Both are in the `☰` menu and in the right-click menu, under `PROBLEMS`,
+and neither appears while the file is clean.
+
 The buffer is pushed to the server a fifth of a second after you stop
 typing, so what it's checking is what you're looking at — not the file on
 disk.
 
-`format_on_save = true` in your config runs the formatter on every
-`Ctrl+S`. It's off by default: reformatting a file mid-review would put
-changes in the diff that nobody asked for. Either way `Ctrl+Z` undoes a
-format in one keystroke.
+### The first question after launch
+
+Loupe starts a language server the first time you ask it something, and a
+cold server has a project to read before it can answer. rust-analyzer runs
+`cargo metadata` and builds proc macros first; on a real project that is
+tens of seconds.
+
+The wait is visible: the status bar names what it is waiting for and
+spins until the answer arrives. You can keep typing through it — a
+lookup never takes the keyboard.
+
+Loupe keeps re-asking for as long as the server reports progress, up to
+45 seconds. A server that answers "nothing" while it is still indexing is
+not telling you there is no definition, so that answer is not passed on.
+If the budget runs out you are told to ask again in a moment, rather than
+told there are no references.
+
+**The first question to a server takes about a second longer than the
+rest.** A server that is still loading a project does not always answer
+"nothing" — tsserver answers a `F12` out of a half-built program by
+pointing at the `import` line in the file you are already in. That is not
+an empty answer and not an error, so there is nothing in it to catch.
+Loupe waits out a short grace on the first question of the session and
+asks again, which is what makes go-to-definition reach the other file in
+a TypeScript project. It is paid once per language, behind the spinner.
 
 ## Markdown preview
 

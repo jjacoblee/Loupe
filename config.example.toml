@@ -54,6 +54,21 @@
 # formats on demand either way, and Ctrl+Z undoes it in one keystroke.
 #format_on_save = false
 
+# Suggestions as you type a name, rather than only on Ctrl+Space. The
+# popup opens after one character of a word, and after a character the
+# server itself asks to be told about — `.` in TypeScript, `.` and `:` in
+# Rust — which is what makes `object.` list the object's fields. Tab or
+# Enter takes the highlighted one, Esc dismisses it.
+#suggest_while_typing = true
+
+# Run a linter over the buffer as you edit, and draw what it says beside
+# what the language server says: errors red, warnings yellow. Loupe knows
+# `eslint` and `ruff`, prefers the project's own copy in
+# `node_modules/.bin`, and feeds it the buffer on standard input, so you
+# see the lint for what is on screen rather than for what is on disk. A
+# linter you do not have costs nothing. `loupe --lsp` lists them.
+#linters = true
+
 # Re-scan the working tree while local review sits idle, so edits made by
 # an agent (or a second terminal) appear without a key press. It waits for
 # input to stop, never runs with the editor, an overlay or a selection
@@ -104,3 +119,24 @@
 # extensions = ["rb", "rake"]
 # command = "ruby-lsp"
 # install = "gem install ruby-lsp"
+
+# ----------------------------------------------------------------------
+#
+# Extra linters. Loupe runs `eslint` and `ruff` out of the box; a
+# `[[linter]]` table adds another, or replaces one of those.
+#
+# `format` says which JSON shape the command prints:
+#   "eslint" — [{ "messages": [{ "ruleId", "severity", "message",
+#                                "line", "column", … }] }]
+#   "ruff"   — [{ "code", "message", "location": { "row", "column" }, … }]
+#
+# The buffer goes to the command on standard input, so the command has to
+# accept it there. `args` is everything before the file name; loupe adds
+# the stdin flags itself.
+
+# [[linter]]
+# name = "biome"
+# extensions = ["ts", "tsx", "js", "jsx"]
+# command = "biome"
+# args = ["lint", "--reporter=json"]
+# format = "eslint"

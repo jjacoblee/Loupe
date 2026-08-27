@@ -2,9 +2,9 @@
 
 Loupe is a mouse-first terminal UI for reviewing GitHub pull requests and
 local uncommitted changes, built in Rust on [ratatui](https://ratatui.rs).
-It brings the VS Code GitHub Pull Requests experience — clickable file
+It brings a full graphical review to any modern terminal: clickable file
 trees, syntax-highlighted diffs, inline comments, viewed checkboxes that
-sync to GitHub, and in-place editing — to any modern terminal.
+sync to GitHub, and in-place editing.
 
 It also does the things a review needs but a diff cannot: it submits a
 whole review with a verdict, resolves merge conflicts in the diff itself,
@@ -36,6 +36,9 @@ reference rather than in one mode's page:
 | [Find](keys-and-mouse.md#find) | One overlay for four questions: this file, a file by name, text in files, definitions |
 | [Language servers](keys-and-mouse.md#language-servers) | `gd`, `gr` and `K`, driven by whichever server is already on your PATH |
 | [The editor](keys-and-mouse.md#editor) | Edit the new side in place, with completion, formatting and diagnostics |
+| [Suggestions as you type](keys-and-mouse.md#suggestions-as-you-type) | The completion popup opens on its own; `object.` lists the object's fields |
+| [Problems](keys-and-mouse.md#problems) | Errors and warnings under the code, in the margin and in a list. `Alt+X` explains one |
+| [Lint](keys-and-mouse.md#lint) | `eslint` and `ruff` run beside the compiler, the project's own copy first |
 | [Copying](keys-and-mouse.md#copying) | Character-level selection out of either side of the diff, over SSH too |
 | [Swapping the two reviews](keys-and-mouse.md#swapping-between-the-two-reviews) | `` ` `` moves between the pull request and your working tree, keeping your place in both |
 | [Refreshing](keys-and-mouse.md#refreshing) | `r` on demand, and an idle re-scan that keeps local review current under an agent |

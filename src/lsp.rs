@@ -52,7 +52,37 @@ const STDERR_TAIL: usize = 10;
 /// rust-analyzer answers `documentSymbol` immediately but returns
 /// *nothing* for references until its index is built — without this, the
 /// first `gr` after launch would report "no references" and be wrong.
-const INDEXING_BUDGET: Duration = Duration::from_secs(12);
+///
+/// The clock only runs while the server is *reporting progress*, so a
+/// warm one never pays a millisecond of it. A cold rust-analyzer on a
+/// real project spends well over the twelve seconds this used to allow
+/// on `cargo metadata` and proc-macro builds alone, and the reader was
+/// told "no definition found" for a symbol that has one. The wait is
+/// visible now — the status bar names what it is waiting for — so the
+/// honest budget is the one that outlasts the index.
+const INDEXING_BUDGET: Duration = Duration::from_secs(45);
+
+/// How long a freshly started server gets to admit it is busy.
+///
+/// The progress notification for "loading the project" does not always
+/// beat the answer to the first question out of the pipe. tsserver can
+/// answer a definition, wrongly, *before* it says a word about the load
+/// it is about to do — leaving nothing on record to justify waiting for
+/// a better answer. So the first question to a server that has never
+/// reported anything is asked again for a moment, which is all it takes
+/// for the announcement to land and the rule below to take over.
+///
+/// Paid once per server per session, behind the spinner that already
+/// says what is being waited for.
+///
+/// It is a clock and not a signal on purpose. The obvious refinement —
+/// end the grace early once the server has announced some work and
+/// finished it — was tried and made the failure *more* frequent (6 runs
+/// in 20 against 0): tsserver announces small pieces of work before it
+/// gets to loading the project, so "it spoke and finished" is not the
+/// same thing as "it is ready". The elapsed time is the only part of
+/// this that a server cannot mislead us about.
+const SETTLE_GRACE: Duration = Duration::from_millis(1200);
 
 /// A language server loupe knows how to talk to.
 pub struct ServerSpec {
@@ -342,6 +372,18 @@ fn rustup_which(cmd: &str) -> Option<PathBuf> {
 
 /// What `loupe --lsp` reports: every supported server and where (or
 /// whether) it was found.
+/// Where a usable `tsserver.js` is, for the machine as a whole.
+///
+/// `typescript-language-server` is a wrapper: it speaks LSP and drives
+/// TypeScript's own `tsserver`, which ships in the separate `typescript`
+/// package. Having the wrapper and not the package is a working
+/// `which typescript-language-server` and a server that dies on
+/// `initialize` — which is exactly what a ✓ beside TypeScript used to
+/// promise and then not deliver.
+pub fn tsserver_here() -> Option<PathBuf> {
+    tsserver_path(Path::new("."))
+}
+
 pub fn doctor() -> Vec<(&'static ServerSpec, Option<PathBuf>)> {
     servers().iter().map(|s| (s, which(s.cmd))).collect()
 }
@@ -370,13 +412,22 @@ pub struct Diagnostic {
     /// 1 error, 2 warning, 3 information, 4 hint.
     pub severity: u8,
     pub message: String,
-    /// "ts(2552)", "unused_variables" — what to search for.
+    /// "2552", "unused_variables" — what to search for.
     pub code: Option<String>,
+    /// Who said so: "typescript", "eslint", "rustc". Kept apart from the
+    /// code because a file can have problems from more than one tool at
+    /// once, and "which tool" is the first thing you want to know when
+    /// two of them disagree.
+    pub source: Option<String>,
 }
 
 impl Diagnostic {
     pub fn is_error(&self) -> bool {
         self.severity <= 1
+    }
+
+    pub fn is_warning(&self) -> bool {
+        self.severity == 2
     }
 
     pub fn label(&self) -> &'static str {
@@ -385,6 +436,30 @@ impl Diagnostic {
             2 => "warning",
             3 => "info",
             _ => "hint",
+        }
+    }
+
+    /// Who reported this and what they called it — `typescript(2552)`,
+    /// `eslint(no-unused-vars)` — or nothing when the server said
+    /// neither.
+    pub fn code_label(&self) -> Option<String> {
+        match (&self.source, &self.code) {
+            (Some(s), Some(c)) => Some(format!("{s}({c})")),
+            (None, Some(c)) => Some(c.clone()),
+            (Some(s), None) => Some(s.clone()),
+            (None, None) => None,
+        }
+    }
+
+    /// The one-character mark for this severity, in the gutter and in the
+    /// margin beside the line. Four severities, four marks — a warning
+    /// that looks like an error is a warning you stop believing.
+    pub fn mark(&self) -> char {
+        match self.severity {
+            1 => '✗',
+            2 => '▲',
+            3 => 'ℹ',
+            _ => '·',
         }
     }
 }
@@ -560,6 +635,18 @@ struct Client {
     /// Work-done progress tokens the server has begun and not ended —
     /// i.e. whether it is still chewing on the project.
     progress: std::collections::HashSet<String>,
+    /// Whether the server has finished the work it began at launch.
+    ///
+    /// Until it has, its answers are about a half-built program. See
+    /// [`Client::request_when_ready`] — this is the difference between
+    /// "no definition" and "not yet", and between the *right* definition
+    /// and a plausible wrong one.
+    settled: bool,
+    /// Whether the one-off [`SETTLE_GRACE`] has been spent. It buys the
+    /// server time to say it is busy; a server that never does should
+    /// only be waited on once, not on every question.
+    graced: bool,
+
     /// What the server said it can do, from the initialize result. Asking
     /// for completion from a server that has none just wastes a round
     /// trip and an error message.
@@ -589,6 +676,49 @@ impl Drop for Client {
 
 /// Stack-frame lines from a panicking or erroring server: `   3: foo::bar`,
 /// `   at ./src/main.rs:1`, and the header above them.
+/// A JSON-RPC error answer, kept whole rather than flattened to a
+/// string: the retry loop has to tell "not ready yet" from "no".
+#[derive(Debug)]
+struct RpcError {
+    lang: &'static str,
+    code: i64,
+    message: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.lang, self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
+
+/// Whether an answer has to be asked for again, given what the server
+/// is doing.
+///
+/// The rule the three cases in [`Client::request_when_ready`] come down
+/// to. Its own function because it is the whole of the fix and the whole
+/// of what can go wrong: too eager and every request pays a round trip
+/// it does not need, too shy and `F12` in a TypeScript project lands in
+/// the wrong file.
+fn ask_again(result: &Value, indexing: bool, settled: bool) -> bool {
+    // Still doing the work it started at launch: the answer is about a
+    // program that is not finished being built, whatever it says.
+    if indexing && !settled {
+        return true;
+    }
+    // Settled, but busy again and answering with nothing.
+    is_empty_answer(result) && indexing
+}
+
+/// `ContentModified` (-32801) and `ServerCancelled` (-32802). The
+/// specification says the client may send both again, and a server that
+/// is loading a project answers with them until it is ready.
+fn is_not_ready(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RpcError>()
+        .is_some_and(|r| r.code == -32801 || r.code == -32802)
+}
+
 fn is_backtrace_noise(line: &str) -> bool {
     let t = line.trim_start();
     if t.starts_with("at ") || t.contains("backtrace") || t.contains("Backtrace") {
@@ -704,6 +834,8 @@ impl Client {
             next_id: 0,
             opened: HashMap::new(),
             progress: std::collections::HashSet::new(),
+            settled: false,
+            graced: false,
             caps: Value::Null,
             diagnostics: HashMap::new(),
             diag_version: 0,
@@ -860,13 +992,15 @@ impl Client {
                 continue; // an answer to something else
             }
             if let Some(err) = msg.get("error") {
-                bail!(
-                    "{}: {}",
-                    self.lang,
-                    err.get("message")
+                return Err(anyhow::Error::new(RpcError {
+                    lang: self.lang,
+                    code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
+                    message: err
+                        .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("error")
-                );
+                        .to_string(),
+                }));
             }
             return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
         }
@@ -950,6 +1084,11 @@ impl Client {
             }
             Some("end") => {
                 self.progress.remove(&token);
+                // Everything it started on launch has finished. From here
+                // on its answers are about the whole project.
+                if self.progress.is_empty() {
+                    self.settled = true;
+                }
             }
             _ => {}
         }
@@ -972,17 +1111,102 @@ impl Client {
         }
     }
 
-    /// A request whose empty answer might only mean "not ready yet".
-    /// Retried while the server reports work in progress, so the first
-    /// question after launch gets a real answer instead of a wrong one.
+    /// A request whose answer might only mean "not ready yet".
+    ///
+    /// There are three ways a server that is still loading a project
+    /// answers a question about it, and only one of them looks like a
+    /// failure:
+    ///
+    /// 1. **Nothing.** rust-analyzer returns an empty list for references
+    ///    until its index is built. Without the retry, the first `gr`
+    ///    after launch would report "no references" and be wrong.
+    /// 2. **`ContentModified`.** The specification says to send it again.
+    /// 3. **A plausible wrong answer.** This is the dangerous one.
+    ///    tsserver answers "go to definition" out of a half-built program
+    ///    by returning the `import` line in the file you are already in,
+    ///    rather than the file the symbol is actually defined in. It is
+    ///    not empty and it is not an error, so nothing above catches it —
+    ///    and it is *exactly* what a reader sees when they open a
+    ///    TypeScript repository and press `F12` on the first name they
+    ///    find. Half a second later the same request answers correctly.
+    ///
+    /// So an answer given while the server is still doing the work it
+    /// started at launch is treated as provisional, whatever it contains,
+    /// and asked again once that work ends. After it has settled once,
+    /// only cases 1 and 2 apply — a warm server's answers are not delayed
+    /// because some background check happens to be running.
     fn request_when_ready(&mut self, method: &str, params: Value) -> Result<Value> {
-        let mut result = self.request(method, params.clone(), REQUEST_TIMEOUT)?;
         let started = Instant::now();
-        while is_empty_answer(&result) && self.indexing() && started.elapsed() < INDEXING_BUDGET {
-            self.pump(Duration::from_millis(300));
-            result = self.request(method, params.clone(), REQUEST_TIMEOUT)?;
+        // A `ContentModified` with no indexing behind it is a plain race
+        // with an edit, and the next attempt wins it. Only a server that
+        // is reporting progress gets the whole budget.
+        let mut races = 0usize;
+        loop {
+            let in_budget = started.elapsed() < INDEXING_BUDGET;
+            match self.request(method, params.clone(), REQUEST_TIMEOUT) {
+                // An empty answer from a server that is still indexing is
+                // "not yet", not "nowhere".
+                Ok(result) => {
+                    if in_budget && ask_again(&result, self.indexing(), self.settled) {
+                        self.pump(Duration::from_millis(300));
+                        continue;
+                    }
+                    // The *first* question to a server is not answered
+                    // until it has had its moment to start — and finish —
+                    // whatever it is going to start.
+                    //
+                    // Not conditional on `settled`, deliberately. A server
+                    // can report some quick unrelated piece of work,
+                    // begin-to-end, before it gets to loading the
+                    // project; that would mark it settled and skip the
+                    // wait it actually needed. What is reliable is the
+                    // clock and the in-flight set: wait out the grace,
+                    // then wait for whatever is still running.
+                    if !self.graced && in_budget {
+                        if started.elapsed() < SETTLE_GRACE || self.indexing() {
+                            self.pump(Duration::from_millis(150));
+                            continue;
+                        }
+                        self.graced = true;
+                    }
+                    return Ok(result);
+                }
+                // And so is `ContentModified`. The specification says to
+                // send it again, and rust-analyzer returns it for most of
+                // the time it spends loading a workspace — which is
+                // exactly when somebody asks their first question. Losing
+                // that answer is why a cold `gr` used to fail outright.
+                Err(e) if is_not_ready(&e) && in_budget && (self.indexing() || races < 3) => {
+                    races += 1;
+                    self.pump(Duration::from_millis(300));
+                }
+                Err(e) if is_not_ready(&e) => {
+                    bail!(
+                        "{} is still working on this project — ask again in a moment.",
+                        self.lang
+                    );
+                }
+                Err(e) => return Err(e),
+            }
         }
-        Ok(result)
+    }
+
+    /// The completion trigger characters from the initialize result.
+    fn triggers(&self) -> Vec<char> {
+        self.caps
+            .pointer("/completionProvider/triggerCharacters")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(|s| s.chars().next())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn is_trigger(&self, ch: char) -> bool {
+        self.triggers().contains(&ch)
     }
 
     fn alive(&mut self) -> bool {
@@ -1336,6 +1560,7 @@ impl Lsp {
         path: &str,
         text: &str,
         (line, col): (usize, usize),
+        trigger: Option<char>,
     ) -> Result<Vec<Completion>> {
         let uri = uri_of(&root.join(path));
         let character = utf16_col(
@@ -1347,17 +1572,47 @@ impl Lsp {
                 return Ok(Vec::new());
             }
             c.sync(&uri, path, text)?;
+            // A server answers a `.` differently depending on why it was
+            // asked. Told the request was invoked by hand, tsserver
+            // offers what is in scope; told a `.` triggered it, it offers
+            // the members of the thing to the left — which is the whole
+            // point of typing the dot.
+            let context = match trigger.filter(|ch| c.is_trigger(*ch)) {
+                Some(ch) => json!({"triggerKind": 2, "triggerCharacter": ch.to_string()}),
+                None => json!({"triggerKind": 1}),
+            };
             let result = c.request(
                 "textDocument/completion",
                 json!({
                     "textDocument": {"uri": uri},
                     "position": {"line": line.saturating_sub(1), "character": character},
-                    "context": {"triggerKind": 1},
+                    "context": context,
                 }),
                 REQUEST_TIMEOUT,
             )?;
             Ok(parse_completions(&result))
         })
+    }
+
+    /// The characters this file's server wants to be told about, so the
+    /// editor can open the popup on the ones that mean something and
+    /// leave the rest alone.
+    ///
+    /// Empty when the server has not started yet: it is a hint for when
+    /// to ask, not a gate on asking, and starting a language server to
+    /// find out what to do about one keystroke would be the wrong trade.
+    pub fn trigger_characters(&self, path: &str) -> Vec<char> {
+        let Some(spec) = spec_for(path) else {
+            return Vec::new();
+        };
+        let slot = self.slot(spec);
+        let Ok(guard) = slot.try_lock() else {
+            return Vec::new();
+        };
+        match &*guard {
+            Slot::Ready(client) => client.triggers(),
+            _ => Vec::new(),
+        }
     }
 
     /// Format the whole document. `Ok(None)` means the server does not
@@ -1569,12 +1824,8 @@ fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
         end_col,
         severity: v.get("severity").and_then(Value::as_u64).unwrap_or(1) as u8,
         message,
-        code: match (source, code) {
-            (Some(s), Some(c)) => Some(format!("{s}({c})")),
-            (None, Some(c)) => Some(c),
-            (Some(s), None) => Some(s.to_string()),
-            (None, None) => None,
-        },
+        code,
+        source: source.map(str::to_string),
     })
 }
 
@@ -1980,6 +2231,8 @@ mod tests {
             next_id: 0,
             opened: HashMap::new(),
             progress: std::collections::HashSet::new(),
+            settled: false,
+            graced: false,
             caps: Value::Null,
             diagnostics: HashMap::new(),
             diag_version: 0,
@@ -2096,6 +2349,7 @@ mod tests {
                 severity: 1,
                 message: "something is wrong".into(),
                 code: None,
+                source: None,
             }],
         );
 
@@ -2512,6 +2766,123 @@ mod tests {
     /// The second server, for the same four questions — different
     /// implementation, different quirks (this one answers `documentSymbol`
     /// instantly but needs its index before it can find a reference).
+    /// A server that is not ready yet says so with a code, and the retry
+    /// loop has to read the code rather than the sentence. Getting this
+    /// wrong is what made the first question after launch fail outright
+    /// instead of waiting for the index.
+    #[test]
+    fn a_not_ready_answer_is_told_apart_from_a_real_failure() {
+        let err = |code: i64| {
+            anyhow::Error::new(RpcError {
+                lang: "Rust",
+                code,
+                message: "content modified".into(),
+            })
+        };
+        assert!(is_not_ready(&err(-32801)), "ContentModified is retried");
+        assert!(is_not_ready(&err(-32802)), "and so is ServerCancelled");
+        assert!(
+            !is_not_ready(&err(-32601)),
+            "MethodNotFound is a real answer — retrying it would hang"
+        );
+        assert!(
+            !is_not_ready(&anyhow!("Rust exited without answering")),
+            "and so is a dead process"
+        );
+        assert_eq!(format!("{}", err(-32801)), "Rust: content modified");
+    }
+
+    /// The flow a reader actually uses: double-click a name, then ask
+    /// about it. The double click leaves the cursor *past* the word, so
+    /// this is the check that the position the editor hands the server
+    /// still points at the symbol that is lit up on screen.
+    #[test]
+    fn a_double_clicked_word_is_what_the_server_is_asked_about() {
+        if which("rust-analyzer").is_none() {
+            eprintln!("skipping: rust-analyzer is not installed");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("loupe-dbl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let src = "fn handle_click(count: usize) -> usize {\n    count + 1\n}\n\nfn main() {\n    let a = handle_click(1);\n    let b = handle_click(2);\n    println!(\"{a} {b}\");\n}\n";
+        std::fs::write(root.join("src/main.rs"), src).unwrap();
+
+        let mut ed = crate::editor::Editor::new("src/main.rs", root.join("src/main.rs"), src);
+        // Row 5 is `    let a = handle_click(1);`; column 15 is inside
+        // the call, the way a click in the middle of a name would be.
+        let word = ed.select_word_at(5, 15).expect("the click lands on a name");
+        assert_eq!(word, "handle_click");
+        let at = ed.cursor_pos();
+        assert_eq!(at, (6, 25), "the cursor sits just past the word");
+
+        let lsp = Lsp::default();
+        let defs = lsp
+            .definition(&root, "src/main.rs", src, at)
+            .expect("definition");
+        assert_eq!(
+            defs.iter().map(|l| l.line).collect::<Vec<_>>(),
+            vec![1],
+            "the definition is the declaration on line 1"
+        );
+        let refs = lsp
+            .references(&root, "src/main.rs", src, at)
+            .expect("references");
+        let mut lines: Vec<usize> = refs.iter().map(|r| r.line).collect();
+        lines.sort_unstable();
+        assert_eq!(lines, vec![1, 6, 7], "the declaration and both calls");
+        lsp.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The bug this rule exists for: a server that is still loading a
+    /// project answers "go to definition" with something plausible and
+    /// wrong.
+    ///
+    /// tsserver, asked about an imported name before it has finished
+    /// building the program, points at the `import` line in the file you
+    /// are already in rather than the file the symbol lives in. It is not
+    /// empty and it is not an error, so the two older rules both let it
+    /// through — and `F12` on the first name in a TypeScript repository
+    /// landed one line up from where it started. Rust never showed it:
+    /// rust-analyzer returns *nothing* while it indexes, which the empty
+    /// rule already caught.
+    #[test]
+    fn an_answer_from_a_loading_server_is_asked_for_again() {
+        let real = json!([{ "uri": "file:///repo/src/util.ts", "range": {} }]);
+        let empty = json!([]);
+
+        // Still loading: ask again, however good the answer looks.
+        assert!(
+            ask_again(&real, true, false),
+            "a plausible answer from a half-built program is still wrong"
+        );
+        assert!(ask_again(&empty, true, false));
+
+        // Settled and idle: whatever it says is the answer.
+        assert!(!ask_again(&real, false, true));
+        assert!(
+            !ask_again(&empty, false, true),
+            "an empty answer from a server with nothing to do means no"
+        );
+
+        // Settled but busy again — a background check, not a project
+        // load. A real answer stands; an empty one is worth one more ask.
+        assert!(
+            !ask_again(&real, true, true),
+            "a warm server must not pay a round trip for every request"
+        );
+        assert!(ask_again(&empty, true, true));
+
+        // A server that never reports progress at all is never waited on.
+        assert!(!ask_again(&empty, false, false));
+    }
+
     #[test]
     fn talks_to_a_real_rust_server() {
         if which("rust-analyzer").is_none() {
@@ -2559,6 +2930,89 @@ mod tests {
     /// Diagnostics, completion and formatting against a real server —
     /// the three editor features, end to end. Skipped when no working
     /// typescript-language-server is installed.
+    /// Go to definition across two files, on a *cold* server.
+    ///
+    /// The cold part is the test. Asked while it is still loading the
+    /// project, tsserver answers with the `import` line in the file you
+    /// are already in — a plausible, non-empty, non-error answer that is
+    /// simply wrong, and the first thing anybody hits on opening a
+    /// TypeScript repository. See [`ask_again`].
+    ///
+    /// Skipped unless a `typescript` package can be found, because
+    /// `typescript-language-server` is only a wrapper around one.
+    #[test]
+    fn a_cold_typescript_server_finds_the_other_file() {
+        if which("typescript-language-server").is_none() {
+            eprintln!("skipping: typescript-language-server is not installed");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("loupe-x-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // The wrapper needs a `typescript` package to drive. Borrow the
+        // one an outer project has, rather than installing anything.
+        // Canonicalized: the path may be relative to the process's own
+        // directory, and a relative symlink written into another one
+        // points nowhere.
+        if let Some(ts) = tsserver_path(Path::new(".")).and_then(|p| std::fs::canonicalize(p).ok())
+        {
+            if let Some(pkg) = ts.ancestors().nth(2) {
+                let modules = root.join("node_modules");
+                std::fs::create_dir_all(&modules).unwrap();
+                #[cfg(unix)]
+                let _ = std::os::unix::fs::symlink(pkg, modules.join("typescript"));
+            }
+        }
+        if tsserver_path(&root).is_none() {
+            eprintln!("skipping: no `typescript` package to drive");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"strict":true},"include":["src"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/util.ts"),
+            "export function formatName(first: string, last: string): string {\n  return `${first} ${last}`;\n}\n",
+        )
+        .unwrap();
+        let main = "import { formatName } from \"./util\";\n\nconst who = formatName(\"Ada\", \"Lovelace\");\nconsole.log(who);\n";
+        std::fs::write(root.join("src/main.ts"), main).unwrap();
+
+        let lsp = Lsp::default();
+        // The very first question, with nothing warmed up.
+        let defs = match lsp.definition(&root, "src/main.ts", main, (3, 15)) {
+            Ok(d) => d,
+            Err(e) if server_unavailable(&e) => {
+                eprintln!("skipping: {e}");
+                let _ = std::fs::remove_dir_all(&root);
+                return;
+            }
+            Err(e) => panic!("definition: {e:#}"),
+        };
+        assert_eq!(
+            defs.iter().map(|l| l.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/util.ts"],
+            "the definition is in the other file, not the import line here"
+        );
+
+        let refs = lsp
+            .references(&root, "src/main.ts", main, (3, 15))
+            .expect("references");
+        let mut paths: Vec<&str> = refs.iter().map(|l| l.path.as_str()).collect();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(
+            paths,
+            vec!["src/main.ts", "src/util.ts"],
+            "and every use is found in both files"
+        );
+        lsp.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_editor_features_work_against_a_real_server() {
         if which("typescript-language-server").is_none() {
@@ -2621,7 +3075,7 @@ mod tests {
         // Completion after a dot, on text that only exists in the buffer.
         let typing = "export function add(count: number): number {\n  const total = count + 1;\n  return total.\n}\n";
         let items = lsp
-            .complete(&root, "a.ts", typing, (3, 16))
+            .complete(&root, "a.ts", typing, (3, 16), None)
             .expect("completion");
         assert!(
             items.iter().any(|c| c.label == "toFixed"),

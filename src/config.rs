@@ -64,6 +64,9 @@ pub struct Config {
     /// nobody asked for. `Ctrl+T` (or the ⇥ Format button) formats on
     /// demand either way.
     pub format_on_save: Option<bool>,
+    /// `suggest_while_typing` — open the completion popup as a name is
+    /// typed, rather than only on `Ctrl+Space`.
+    pub suggest_while_typing: Option<bool>,
     /// Re-scan the working tree while local review sits idle, so edits
     /// made by an agent (or a second terminal) show up without a key
     /// press. Default true. It only ever runs after input stops, never
@@ -89,6 +92,33 @@ pub struct Config {
     /// already claims goes to the one configured here.
     #[serde(default, rename = "server")]
     pub servers: Vec<ServerConfig>,
+    /// Run linters over the buffer as it is edited. Default true; a
+    /// linter that is not installed costs nothing, so this is only worth
+    /// setting to stop one you *do* have from running.
+    pub linters: Option<bool>,
+    /// Extra linters, as `[[linter]]` tables. Each needs a `name`, the
+    /// `extensions` it handles, the `command` to run and the `format`
+    /// its JSON comes in (`eslint` or `ruff`). A name a built-in linter
+    /// already uses is replaced by the one configured here.
+    #[serde(default, rename = "linter")]
+    pub configured_linters: Vec<LinterConfig>,
+}
+
+/// One `[[linter]]` table.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinterConfig {
+    /// What to call it, in messages and in the diagnostic's source.
+    pub name: String,
+    /// File extensions it handles, without the dot.
+    pub extensions: Vec<String>,
+    /// The program to run.
+    pub command: String,
+    /// Everything before the file name. The stdin flags are added after.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Which JSON shape it prints.
+    pub format: crate::linter::Format,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -151,6 +181,7 @@ impl Config {
             file_panel_width: over.file_panel_width.or(self.file_panel_width),
             language_servers: over.language_servers.or(self.language_servers),
             format_on_save: over.format_on_save.or(self.format_on_save),
+            suggest_while_typing: over.suggest_while_typing.or(self.suggest_while_typing),
             auto_refresh: over.auto_refresh.or(self.auto_refresh),
             blame: over.blame.or(self.blame),
             blame_width: over.blame_width.or(self.blame_width),
@@ -162,6 +193,15 @@ impl Config {
                 self.servers
             } else {
                 over.servers
+            },
+            linters: over.linters.or(self.linters),
+            // The nearer file replaces the list, for the same reason the
+            // servers do: two files each naming a linter for the same
+            // extension would otherwise both run.
+            configured_linters: if over.configured_linters.is_empty() {
+                self.configured_linters
+            } else {
+                over.configured_linters
             },
         }
     }
@@ -327,11 +367,14 @@ mod tests {
                 file_panel_width: Some(40),
                 language_servers: Some(false),
                 format_on_save: Some(true),
+                suggest_while_typing: None,
                 auto_refresh: Some(false),
                 blame: Some(true),
                 blame_width: Some(26),
                 blame_pr_lookup: Some(false),
                 servers: Vec::new(),
+                linters: None,
+                configured_linters: Vec::new(),
             }
         );
     }

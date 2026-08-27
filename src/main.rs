@@ -6,10 +6,12 @@ mod conflict;
 mod ctx;
 mod diff;
 mod editor;
+mod explain;
 mod github;
 mod gitops;
 mod highlight;
 mod hooks;
+mod linter;
 mod lsp;
 mod markdown;
 mod pins;
@@ -419,6 +421,19 @@ fn configure_servers(cfg: &config::Config) {
             })
             .collect(),
     );
+    linter::configure(
+        cfg.configured_linters
+            .iter()
+            .filter(|l| !l.name.is_empty() && !l.command.is_empty() && !l.extensions.is_empty())
+            .map(|l| linter::LinterSpec {
+                name: l.name.clone(),
+                cmd: l.command.clone(),
+                args: l.args.clone(),
+                exts: l.extensions.iter().map(|e| e.to_lowercase()).collect(),
+                format: l.format,
+            })
+            .collect(),
+    );
 }
 
 /// `loupe --lsp`: what is installed, what isn't, and what to run to fix
@@ -458,6 +473,40 @@ fn report_language_servers() {
             println!("  {:<12} {}", spec.lang, spec.install);
         }
     }
+    // A wrapper that is installed but cannot run is worse than one that
+    // is missing: the ✓ above says it works, and then every question
+    // fails. TypeScript is the case that bites — `typescript-language-
+    // server` is its own package and needs `typescript` beside it.
+    for (spec, found) in lsp::doctor() {
+        if found.is_some() && spec.lang == "TypeScript" && lsp::tsserver_here().is_none() {
+            println!(
+                "\n  ! TypeScript   the server is installed, but the `typescript` package it \
+                 drives is not.\n      Loupe looks in the project's node_modules first, then \
+                 at a global install.\n      npm install -g typescript   (or add it to the \
+                 project)"
+            );
+        }
+    }
+
+    println!("\nLinters loupe runs over the buffer as you edit:\n");
+    let mut no_linter = Vec::new();
+    for (spec, found) in linter::doctor() {
+        let exts: Vec<String> = spec.exts.iter().map(|e| format!(".{e}")).collect();
+        if found {
+            println!("  ✓ {:<12} {}", spec.name, exts.join(" "));
+        } else {
+            println!("  ✗ {:<12} not installed   {}", spec.name, exts.join(" "));
+            no_linter.push(spec);
+        }
+    }
+    if !no_linter.is_empty() {
+        println!(
+            "\nA linter that is not installed costs nothing and is not an error. \
+             Add one with a\n[[linter]] table in your config, or set `linters = false` \
+             to stop running them."
+        );
+    }
+
     println!(
         "\nInside loupe: gd goes to a definition, gr lists references, K shows a type.\n\
          Anything else falls back to pattern matching, which still finds most definitions.\n\
@@ -476,6 +525,10 @@ struct Startup {
     language_servers: bool,
     /// `format_on_save` — run the server's formatter on every save.
     format_on_save: bool,
+    /// `suggest_while_typing` — suggestions as a name is typed.
+    suggest_while_typing: bool,
+    /// `linters` — run a linter over the buffer as it is edited.
+    linters: bool,
     /// `auto_refresh` — re-scan local changes while the reader is idle.
     auto_refresh: bool,
     /// `blame` — show the blame pane from the start.
@@ -657,6 +710,8 @@ fn main() -> Result<()> {
         file_panel_width: cfg.file_panel_width,
         language_servers: cfg.language_servers.unwrap_or(true),
         format_on_save: cfg.format_on_save.unwrap_or(false),
+        suggest_while_typing: cfg.suggest_while_typing.unwrap_or(true),
+        linters: cfg.linters.unwrap_or(true),
         auto_refresh: cfg.auto_refresh.unwrap_or(true),
         blame: cfg.blame.unwrap_or(false),
         blame_width: cfg.blame_width,
@@ -719,6 +774,8 @@ fn run(terminal: &mut ratatui::DefaultTerminal, startup: Startup) -> Result<()> 
     let mut app = App::new(startup.mode, startup.org);
     app.lsp_enabled = startup.language_servers;
     app.format_on_save = startup.format_on_save;
+    app.suggest_while_typing = startup.suggest_while_typing;
+    app.lint_enabled = startup.linters;
     app.auto_refresh = startup.auto_refresh;
     app.blame_on = startup.blame;
     app.blame_pr_lookup = startup.blame_pr_lookup;
@@ -771,7 +828,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal, startup: Startup) -> Result<()> 
 
         // Short timeout while busy keeps the spinner animating and picks up
         // job results promptly; longer otherwise to stay idle-friendly.
-        let timeout = Duration::from_millis(if app.busy() || app.refreshing() || app.searching() {
+        //
+        // A file the reader has just clicked gets the shortest one of all.
+        // It is read in under two milliseconds, and the 80 below would
+        // leave them looking at the file they clicked away from for the
+        // rest of the tick — long enough to see, and on every file.
+        let timeout = Duration::from_millis(if app.opening() {
+            4
+        } else if app.busy() || app.refreshing() || app.searching() || app.settling() {
             80
         } else {
             250
@@ -840,6 +904,8 @@ mod tests {
             file_panel_width: None,
             language_servers: true,
             format_on_save: false,
+            suggest_while_typing: true,
+            linters: true,
             auto_refresh: true,
             blame: false,
             blame_width: None,

@@ -18,6 +18,7 @@ use crate::github::{
 };
 use crate::gitops::{self, MergeOp, StageState, Tracking};
 use crate::highlight::{self, HlLine};
+use crate::linter;
 use crate::lsp::{self, Lsp};
 use crate::markdown;
 use crate::pins::{self, Pin, Pins};
@@ -160,6 +161,9 @@ pub enum Overlay {
     VerdictMenu,
     /// The fixes and refactors a language server offers here.
     CodeActions(Box<CodeActionMenu>),
+    /// One problem, laid out: the claim, then each reason under the one
+    /// it explains. See [`crate::explain`].
+    Problem(Box<ProblemPanel>),
     /// "Open a file by path" (`Ctrl+O`) — one line to type or paste a path
     /// into. It is the way in for a terminal that cannot report a drop,
     /// and for a path an agent just printed.
@@ -326,6 +330,14 @@ pub struct Menu {
     pub scroll: usize,
     /// The cell the ☰ button occupies. The menu hangs below it.
     pub anchor: (u16, u16),
+    /// What the border says. The ☰ menu says `☰ Menu`; a right-click
+    /// menu names the word it is about, so the reader can see that the
+    /// click landed on the symbol they meant.
+    pub title: String,
+    /// Flip above the anchor when there is no room below it. False for
+    /// the ☰ menu, which has to leave its own button visible; true for a
+    /// menu opened at the pointer, which has nothing to keep in view.
+    pub flip: bool,
 }
 
 impl Menu {
@@ -485,6 +497,23 @@ pub struct HoverPanel {
     pub lines: Vec<String>,
 }
 
+/// One problem, opened to be read rather than glanced at.
+///
+/// The gutter mark says something is wrong, the margin says what, and
+/// the status bar says it again for the line the cursor is on. This is
+/// for the messages none of those can hold: a type mismatch whose real
+/// answer is three levels down inside the sentence.
+pub struct ProblemPanel {
+    pub rows: Vec<crate::explain::Row>,
+    /// `typescript(2322)` — who complained and what they call it.
+    pub code: Option<String>,
+    pub severity: u8,
+    pub line: usize,
+    /// How many problems the line has, so the panel can say when it is
+    /// showing the worst of several.
+    pub of: usize,
+}
+
 // ------------------------------------------------------------------ finder
 
 /// Which question the finder is answering. The mode is picked by a prefix
@@ -502,6 +531,9 @@ pub enum FinderMode {
     /// Everywhere a symbol is used, from the language server (`gr`).
     /// Not typed into — the list arrives, typing filters it.
     Refs,
+    /// Every problem the language server found in the open file.
+    /// Arrived at the same way `Refs` is.
+    Problems,
     /// "Which of these did you mean?" — the symbols on one line, when a
     /// keyboard request has to choose between them.
     Pick,
@@ -513,7 +545,7 @@ impl FinderMode {
             FinderMode::Files => "",
             FinderMode::Grep => "#",
             FinderMode::Symbols => "@",
-            FinderMode::Refs | FinderMode::Pick => "",
+            FinderMode::Refs | FinderMode::Pick | FinderMode::Problems => "",
         }
     }
 
@@ -523,6 +555,7 @@ impl FinderMode {
             FinderMode::Grep => "Find in files",
             FinderMode::Symbols => "Symbols in this file",
             FinderMode::Refs => "References",
+            FinderMode::Problems => "Problems",
             FinderMode::Pick => "Which symbol?",
         }
     }
@@ -637,6 +670,29 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(140);
 /// language server. Short enough that diagnostics feel live, long enough
 /// that a fast typist doesn't send a copy of the file per keystroke.
 const SYNC_DEBOUNCE: Duration = Duration::from_millis(220);
+
+/// How long typing has to pause before suggestions are fetched.
+///
+/// Shorter than the buffer sync above, because the popup is what the
+/// typist is waiting for rather than something happening behind them.
+/// Long enough that typing a ten-letter name costs one round trip and
+/// not ten.
+const SUGGEST_DEBOUNCE: Duration = Duration::from_millis(90);
+
+/// How many characters of a word to wait for before suggesting on the
+/// strength of the word alone.
+///
+/// One. A trigger character (`.`, `::`) suggests on its own with no
+/// prefix at all; this is the rule for an ordinary name being typed,
+/// where a popup on the empty string would just be the whole scope.
+const SUGGEST_AFTER: usize = 1;
+
+/// How long typing has to pause before the linter runs.
+///
+/// Longer than either of the above: this costs a process, not a pipe
+/// write, and a lint warning is worth having a moment later than a
+/// compiler error.
+const LINT_DEBOUNCE: Duration = Duration::from_millis(700);
 
 /// Rows the finder shows at once (the overlay is sized to match).
 pub const FINDER_ROWS: usize = 14;
@@ -852,7 +908,7 @@ impl Finder {
                 }
             }
             // A list that already exists: typing narrows it down.
-            FinderMode::Refs | FinderMode::Pick => {
+            FinderMode::Refs | FinderMode::Pick | FinderMode::Problems => {
                 let query = self.input.trim().to_lowercase();
                 let total = self.preset.len();
                 self.rows = self
@@ -973,6 +1029,16 @@ pub enum ButtonId {
     EditorRename,
     EditorActions,
     EditorSignature,
+    /// Copy the selection, or the cursor line — the right-click menu's
+    /// version of the editor's Ctrl+C.
+    EditorCopy,
+    /// Walk the problems the language server found in this file.
+    EditorNextProblem,
+    EditorPrevProblem,
+    /// All of them at once, as a list to pick from.
+    EditorProblems,
+    /// Lay one problem out and read it properly.
+    EditorExplain,
     BufferNext,
     BufferPrev,
     FoldToggle,
@@ -1050,6 +1116,8 @@ pub enum ButtonId {
     PinTab(usize),
     /// One of the open buffers, in the same row after the pins.
     BufferTab(usize),
+    /// The ✕ on one of those tabs.
+    BufferClose(usize),
     /// The ✕ on one tab, which unpins it.
     PinClose(usize),
     /// 📌 in the top bar, and the ☰ row beside it: pin the file in front
@@ -1637,6 +1705,16 @@ struct QuietJob {
     /// refresh that finds nothing says nothing — otherwise the status line
     /// repeats "up to date" every few seconds forever.
     auto: bool,
+    /// The reader is sitting and waiting for this one — it is the file
+    /// they just clicked, not a refresh going on behind them.
+    ///
+    /// The main loop waits on input for 80 ms at a time while a quiet job
+    /// runs, which is right for a refresh: it costs nothing and the
+    /// spinner still turns. It is wrong for a file read that finishes in
+    /// under two milliseconds, because the reader then sits looking at
+    /// the old file for the rest of the 80. This asks for the next frame
+    /// instead.
+    eager: bool,
 }
 
 pub struct PrRefreshData {
@@ -1653,6 +1731,10 @@ pub enum QuietOutcome {
     Local(Box<LocalOpenedData>),
     /// A file reloaded in place, keeping the scroll position.
     File(Box<FileLoadedData>),
+    /// A file the file tree named, read and ready for the editor. Quiet
+    /// rather than modal so a double click on the tree survives the read
+    /// — see [`App::spawn_open_tree_file`].
+    External(Box<ExternalFile>),
 }
 
 pub struct PrOpenedData {
@@ -1798,6 +1880,28 @@ pub struct ExternalFile {
     read_only: bool,
     /// Open it in the markdown preview rather than the editor.
     preview: bool,
+    /// This file is to become the peek tab. It rides with the file
+    /// rather than sitting in a field on `App`, because it describes
+    /// this read and nothing else — and because the tab it replaces must
+    /// not be touched until the read lands.
+    peek: bool,
+}
+
+/// One tab in the row, as the draw needs it.
+pub struct BufferTab {
+    /// The file the tab holds. The row is addressed by position and not
+    /// every open buffer is in it — a pinned file already has a tab of
+    /// its own — so the position alone no longer finds the buffer.
+    pub path: String,
+    /// The file name, or the parent and the name when two tabs share one.
+    pub label: String,
+    /// Unsaved work in it. The tab carries a dot while this is true.
+    pub dirty: bool,
+    /// The buffer on screen. There is at most one.
+    pub active: bool,
+    /// The peek tab: one click opened it and the next click replaces it.
+    /// The tab draws in italics to say so. See [`App::peek_path`].
+    pub peek: bool,
 }
 
 /// One place a symbol is used, with the source line to show for it.
@@ -1861,7 +1965,10 @@ fn read_source(root: &std::path::Path, rev: Option<&str>, path: &str) -> Option<
 /// What the editor is asking its language server for.
 #[derive(Clone, PartialEq, Eq)]
 enum EditorRequest {
-    Complete,
+    /// Suggestions here. Carries the character that asked for them, when
+    /// a character did — a server answers a `.` differently from a
+    /// request the reader made by hand.
+    Complete(Option<char>),
     Hover,
     Definition,
     /// Rename the symbol under the cursor everywhere, to this name.
@@ -1881,7 +1988,29 @@ impl EditorRequest {
     /// also fires on its own while typing, and an unavailable server
     /// must not shout about it once per character.
     fn is_explicit(&self) -> bool {
-        *self != EditorRequest::Complete
+        !matches!(self, EditorRequest::Complete(_))
+    }
+
+    /// What the status bar says while this request is in flight, or
+    /// `None` for one the reader did not ask for.
+    fn waiting_for(&self, word: &str) -> Option<String> {
+        let about = |verb: &str| {
+            Some(if word.is_empty() {
+                format!("{verb}…")
+            } else {
+                format!("{verb} {word}…")
+            })
+        };
+        match self {
+            EditorRequest::Complete(_) => None,
+            EditorRequest::Definition => about("Finding the definition of"),
+            EditorRequest::References => about("Finding every use of"),
+            EditorRequest::Hover => about("Asking what is"),
+            EditorRequest::SignatureHelp => Some("Asking for the signature…".into()),
+            EditorRequest::CodeActions => Some("Asking what is on offer here…".into()),
+            EditorRequest::Rename(to) => Some(format!("Renaming {word} to {to}…")),
+            EditorRequest::Format => Some("Formatting…".into()),
+        }
     }
 }
 
@@ -1891,9 +2020,24 @@ impl EditorRequest {
 /// input — you must be able to keep typing while a completion is in
 /// flight — and a result from a keystroke you have already typed past is
 /// dropped by generation number rather than applied late.
+/// A linter run over the open buffer.
+struct LintJob {
+    rx: Receiver<anyhow::Result<Option<Vec<lsp::Diagnostic>>>>,
+    gen: u64,
+    /// Which file it is about, so an answer for a buffer the reader has
+    /// clicked away from is dropped rather than painted over the new one.
+    path: String,
+}
+
 struct EditorJob {
     rx: Receiver<Result<EditorOutcome>>,
     gen: u64,
+    /// When it was asked, for the spinner frame.
+    started: Instant,
+    /// What to say while it runs. `None` for a request the reader did
+    /// not ask for — completion fires on its own while typing, and a
+    /// spinner per character would be noise.
+    label: Option<String>,
 }
 
 enum EditorOutcome {
@@ -2096,7 +2240,9 @@ pub struct App {
     pub view: ViewMode,
     pub selection: Option<Selection>,
     drag_select: bool,
-    last_click: Option<(Instant, u16, u16)>,
+    /// The last mouse press: when, where, and how many presses in a row
+    /// it made on that spot. The run drives double- and triple-click.
+    last_click: Option<(Instant, u16, u16, u8)>,
 
     pub editor: Option<Editor>,
     /// Set by a `q` that was refused for unsaved work; a second `q`
@@ -2112,6 +2258,38 @@ pub struct App {
     /// change. Opening another file parks this one here; coming back
     /// swaps them.
     pub parked: Vec<Editor>,
+    /// Where the buffer on screen sits in the tab row.
+    ///
+    /// `parked` holds every *other* open buffer, in the order the reader
+    /// opened them, and nothing ever reorders it. Putting the buffer on
+    /// screen back at this index is the whole of what keeps the row
+    /// standing still: without it, coming back to a file meant appending
+    /// it, so every click along the row threw the row into a new order
+    /// and the reader had to find each tab again.
+    ///
+    /// A drag is the only thing that reorders the row, and it does it by
+    /// permuting `parked` — see [`App::move_buffer`].
+    buffer_slot: usize,
+    /// The tab a drag picked up, by path. A path rather than an index
+    /// because the drag is what changes the indices.
+    tab_drag: Option<String>,
+    /// The **peek tab**: the file one click opened, which the next click
+    /// replaces. There is at most one.
+    ///
+    /// Walking a file tree means opening a great many files to look at
+    /// one of them, and a tab per look fills the row with files the
+    /// reader never wanted. So a click peeks: it puts the file in this
+    /// tab, the next click puts the next file in the same tab, and a
+    /// double click keeps it. The row draws a peek in italics, which is
+    /// the only warning the reader gets that it is about to go.
+    ///
+    /// "Peek" and not "preview": a preview in loupe is the rendered
+    /// markdown document behind `P`, and one word for two things in the
+    /// same tab row would be a word nobody could follow.
+    ///
+    /// Read it through [`App::peek_path`], never directly — a buffer the
+    /// reader has typed into is theirs, and that rule lives there.
+    peek: Option<String>,
     /// The markdown preview, when one is open. It shares the pane with
     /// the diff and the editor, and never coexists with the editor —
     /// `P` swaps one for the other on the same file.
@@ -2160,6 +2338,22 @@ pub struct App {
     click_word: Option<(usize, usize)>,
     /// In-flight editor request (see [`EditorJob`]).
     editor_job: Option<EditorJob>,
+    /// A suggestion request waiting out [`SUGGEST_DEBOUNCE`], and the
+    /// character that asked for it. See [`App::maybe_suggest`].
+    completion_due: Option<(Instant, Option<char>)>,
+    /// Run linters over the buffer as it is edited (`linters` in the
+    /// config).
+    pub lint_enabled: bool,
+    /// When the buffer last changed, for the lint debounce.
+    lint_touched: Option<Instant>,
+    /// Hash of the text last handed to the linter, so an unchanged
+    /// buffer costs no process.
+    linted: Option<u64>,
+    lint_job: Option<LintJob>,
+    lint_gen: u64,
+    /// Whether a linter that cannot run has already said so. It says it
+    /// once, not once per pause in typing.
+    lint_complained: bool,
     editor_gen: u64,
     /// When the buffer last changed, for the idle push to the server.
     editor_touched: Option<Instant>,
@@ -2168,6 +2362,10 @@ pub struct App {
     diag_seen: u64,
     /// Run the language server's formatter on save (`format_on_save`).
     pub format_on_save: bool,
+    /// Open the completion popup as a name is typed, not only on
+    /// `Ctrl+Space` (`suggest_while_typing`). On by default: an editor
+    /// that only suggests when asked is an editor you forget can.
+    pub suggest_while_typing: bool,
     /// True while a format is running as the first half of a save.
     format_then_save: bool,
     /// In-flight finder query (see [`SearchJob`]).
@@ -2345,6 +2543,9 @@ impl App {
             editor: None,
             quit_armed: false,
             parked: Vec::new(),
+            buffer_slot: 0,
+            tab_drag: None,
+            peek: None,
             preview: None,
             preview_only: false,
             pins: Pins::default(),
@@ -2364,10 +2565,18 @@ impl App {
             lsp_enabled: true,
             click_word: None,
             editor_job: None,
+            completion_due: None,
+            lint_enabled: true,
+            lint_touched: None,
+            linted: None,
+            lint_job: None,
+            lint_gen: 0,
+            lint_complained: false,
             editor_gen: 0,
             editor_touched: None,
             diag_seen: 0,
             format_on_save: false,
+            suggest_while_typing: true,
             format_then_save: false,
             search_job: None,
             search_gen: 0,
@@ -2431,10 +2640,115 @@ impl App {
             .map(|j| (spinner_frame(j.started), j.label.as_str(), j.cancellable))
     }
 
+    /// True while a debounce is armed — a suggestion to fetch, or a
+    /// buffer to push to the language server.
+    ///
+    /// The main loop sits on a 250 ms poll when nothing is happening,
+    /// which would be added to every debounce below it. A typist waiting
+    /// on a popup feels that. This shortens the tick until the pending
+    /// work has fired.
+    pub fn settling(&self) -> bool {
+        self.completion_due.is_some() || self.editor_touched.is_some()
+    }
+
     /// True while a silent background refresh is running (keeps the main
     /// loop ticking so its spinner animates and its result lands promptly).
     pub fn refreshing(&self) -> bool {
         self.quiet.is_some()
+    }
+
+    /// True while the reader is waiting on a file they clicked. The main
+    /// loop picks these up on the next frame rather than on the
+    /// spinner's tick — see [`QuietJob::eager`].
+    pub fn opening(&self) -> bool {
+        self.quiet.as_ref().is_some_and(|q| q.eager)
+    }
+
+    /// The buffer changed. Both clocks that watch it start again: the
+    /// one that pushes the text to the language server, and the one that
+    /// runs the linter over it.
+    ///
+    /// One helper rather than two assignments at every edit site,
+    /// because the two arming again together is the invariant — a
+    /// keystroke that reached one and not the other is a keystroke that
+    /// leaves the underlines and the message disagreeing.
+    fn buffer_changed(&mut self) {
+        let now = Instant::now();
+        self.editor_touched = Some(now);
+        self.lint_touched = Some(now);
+    }
+
+    /// Decide whether the character just typed is worth suggestions, and
+    /// arm the debounce when it is.
+    ///
+    /// Two ways a suggestion is worth asking for. A **trigger character**
+    /// is one the server itself named — `.` in TypeScript, `.` and `:` in
+    /// Rust — and means "the thing before me has members"; it suggests
+    /// with no prefix at all. Anything else has to be a word character
+    /// with at least [`SUGGEST_AFTER`] characters of a name behind it, or
+    /// the popup would open on every space.
+    ///
+    /// An open popup that still has matches is left alone: it already
+    /// holds the server's answer for this word, and narrowing it locally
+    /// is instant where a round trip is not. An open popup that has just
+    /// been filtered down to nothing asks again — the longer word may
+    /// have suggestions the shorter one did not.
+    fn maybe_suggest(&mut self, typed: char) {
+        if !self.suggest_while_typing {
+            return;
+        }
+        let Some(editor) = &self.editor else { return };
+        if editor.read_only || editor.find.typing.is_some() {
+            return;
+        }
+        // Still filtering the list we have. Nothing to ask.
+        if editor.completion.is_some() {
+            return;
+        }
+        let triggers = self.lsp.trigger_characters(&editor.path);
+        // Before the server has started there is nothing to ask it about
+        // yet, so fall back to the punctuation that means "members" in
+        // every language loupe drives.
+        let is_trigger = if triggers.is_empty() {
+            matches!(typed, '.' | ':' | '>')
+        } else {
+            triggers.contains(&typed)
+        };
+        let armed = if is_trigger {
+            Some(typed)
+        } else if crate::editor::is_word(typed)
+            && self
+                .editor
+                .as_ref()
+                .is_some_and(|e| e.word_prefix().chars().count() >= SUGGEST_AFTER)
+        {
+            None
+        } else {
+            // A space, a bracket, a newline: whatever was being typed is
+            // finished, and a pending request about it is stale.
+            self.completion_due = None;
+            return;
+        };
+        self.completion_due = Some((Instant::now(), armed));
+    }
+
+    /// Fire an armed suggestion request once typing pauses. Returns true
+    /// when it did, so the caller knows the frame changed.
+    fn maybe_spawn_suggestion(&mut self) -> bool {
+        let Some((armed, trigger)) = self.completion_due else {
+            return false;
+        };
+        if armed.elapsed() < SUGGEST_DEBOUNCE {
+            return false;
+        }
+        self.completion_due = None;
+        // Typed on past it, or left the buffer: the answer would be
+        // about a word that is no longer being written.
+        if self.editor.is_none() {
+            return false;
+        }
+        self.spawn_editor_request(EditorRequest::Complete(trigger));
+        true
     }
 
     /// Push the editor buffer to its language server once typing pauses.
@@ -2496,13 +2810,100 @@ impl App {
             return false;
         };
         let list = self.lsp.diagnostics(&root, &path);
-        if let Some(editor) = &mut self.editor {
-            if editor.diagnostics == list {
+        match &mut self.editor {
+            Some(editor) => editor.set_server_diagnostics(list),
+            None => false,
+        }
+    }
+
+    /// Run the linter over the buffer once typing settles.
+    ///
+    /// A subprocess per run, so the debounce is longer than the language
+    /// server's: a server takes a `didChange` down a pipe it is already
+    /// holding open, where this pays for a process every time. One run
+    /// at a time, and a run whose text is already what was last linted
+    /// is skipped entirely.
+    fn maybe_spawn_lint(&mut self) -> bool {
+        if !self.lint_enabled || self.lint_job.is_some() {
+            return false;
+        }
+        let Some(touched) = self.lint_touched else {
+            return false;
+        };
+        if touched.elapsed() < LINT_DEBOUNCE {
+            return false;
+        }
+        self.lint_touched = None;
+        let Some(editor) = &self.editor else {
+            return false;
+        };
+        if linter::spec_for(&editor.path).is_none() {
+            return false;
+        }
+        let text = editor.content();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&text, &mut hasher);
+        let hash = std::hash::Hasher::finish(&hasher);
+        if self.linted == Some(hash) {
+            return false;
+        }
+        self.linted = Some(hash);
+        let path = editor.path.clone();
+        let root = self.repo_root.clone();
+        self.lint_gen += 1;
+        let gen = self.lint_gen;
+        let (tx, rx) = mpsc::channel();
+        let for_thread = path.clone();
+        thread::spawn(move || {
+            let _ = tx.send(linter::lint(&root, &for_thread, &text));
+        });
+        self.lint_job = Some(LintJob { rx, gen, path });
+        false
+    }
+
+    /// Pick up a finished lint run.
+    ///
+    /// A linter that could not run says so once and is then left alone:
+    /// a broken `.eslintrc` must not put an error in the status bar every
+    /// time typing pauses.
+    fn poll_lint(&mut self) -> bool {
+        let Some(job) = &self.lint_job else {
+            return false;
+        };
+        let result = match job.rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => {
+                self.lint_job = None;
                 return false;
             }
-            editor.diagnostics = list;
+        };
+        let (gen, path) = (job.gen, job.path.clone());
+        self.lint_job = None;
+        if gen != self.lint_gen {
+            return false;
         }
-        true
+        // The buffer moved on, or a different file is on screen.
+        if self.editor.as_ref().map(|e| e.path.as_str()) != Some(path.as_str()) {
+            return false;
+        }
+        match result {
+            Ok(Some(list)) => match &mut self.editor {
+                Some(editor) => editor.set_lint_diagnostics(list),
+                None => false,
+            },
+            // No linter for this file, or it is not installed. Silence is
+            // the right answer: a reviewer without eslint on their
+            // machine still wants to read the diff.
+            Ok(None) => false,
+            Err(e) => {
+                if !self.lint_complained {
+                    self.lint_complained = true;
+                    self.err(format!("{e:#}"));
+                }
+                false
+            }
+        }
     }
 
     /// True while a finder query is running or waiting out its debounce.
@@ -2511,6 +2912,22 @@ impl App {
     pub fn searching(&self) -> bool {
         self.search_job.is_some()
             || matches!(&self.overlay, Overlay::Finder(f) if f.pending.is_some())
+            // An editor lookup animates a spinner of its own, so the main
+            // loop has to keep ticking while one is in flight.
+            || self.editor_job.as_ref().is_some_and(|j| j.label.is_some())
+    }
+
+    /// The language-server request the editor is waiting on, if the
+    /// reader asked for one: a spinner frame and what it is waiting for.
+    ///
+    /// Deliberately not a [`ForegroundJob`]: those are modal, and you
+    /// must be able to keep typing while a lookup is in flight. This is
+    /// the visible half of that promise — the work shows, the keyboard
+    /// stays yours.
+    pub fn editor_waiting(&self) -> Option<(char, &str)> {
+        let job = self.editor_job.as_ref()?;
+        let label = job.label.as_deref()?;
+        Some((spinner_frame(job.started), label))
     }
 
     /// Spinner frame for a running query — a whole-repo grep on a large
@@ -2625,6 +3042,13 @@ impl App {
         // Keep the language server's copy of the buffer current, and pick
         // up whatever it has pushed back.
         if self.sync_editor_buffer() {
+            changed = true;
+        }
+        if self.maybe_spawn_suggestion() {
+            changed = true;
+        }
+        self.maybe_spawn_lint();
+        if self.poll_lint() {
             changed = true;
         }
         if self.poll_diagnostics() {
@@ -3160,7 +3584,21 @@ impl App {
         if let Some(line) = d.line {
             editor.jump_to_line(line);
         }
+        // The file is in hand, so this is the frame the pane changes on.
+        // A document holds nothing unsaved, so it simply gives way.
+        self.preview = None;
         self.open_buffer(editor);
+        if d.peek {
+            // The peek tab this file takes over. Closed now rather than
+            // when the click happened: `peek` still names the old tab
+            // here, and closing it before the read is what left the pane
+            // empty — and so showing the diff — for every frame in
+            // between. The order matters too. The new file has the
+            // screen already, so the close shuts the old tab's gap and
+            // the new one lands in its place in the row.
+            self.drop_peek(&d.path);
+            self.peek = Some(d.path.clone());
+        }
         // The pane follows the editor: a file outside the changeset has
         // no old side, so only the one blame is read.
         self.spawn_blame_external(d.path.clone(), d.read_only);
@@ -3171,6 +3609,14 @@ impl App {
         if d.read_only {
             self.ok(format!(
                 "👁 {}{where_} — not in this change, and the branch isn't checked out, so it's read-only. Esc goes back.",
+                d.path
+            ));
+        } else if self.peek_path() == Some(d.path.as_str()) {
+            // Say what the next click does. A reader who does not know
+            // the rule loses the file they were reading and never learns
+            // why.
+            self.ok(format!(
+                "{}{where_} — peeking, so the next click replaces it. Double-click to keep it.",
                 d.path
             ));
         } else {
@@ -4888,11 +5334,44 @@ impl App {
         }
     }
 
+    /// The change behind a row, when the row is one that shows a change.
+    ///
+    /// The Files panel lists the repository, not the change under review.
+    /// A row there is a file and nothing else, so it carries no staging
+    /// box, no +/- counts and no revert mark, and clicking it opens the
+    /// file rather than its diff. Every one of those belongs to the
+    /// change, and the Changes panel one key away is where they live.
+    ///
+    /// The two panels share their rows, so the gate has to be here
+    /// rather than at each of the six places that read one.
+    pub fn diff_row(&self, src: RowSrc) -> Option<&ChangedFile> {
+        if self.panel == PanelMode::Files {
+            return None;
+        }
+        self.changed_of(src)
+    }
+
+    /// The same gate, for the callers that want the index.
+    pub fn diff_row_idx(&self, src: RowSrc) -> Option<usize> {
+        if self.panel == PanelMode::Files {
+            return None;
+        }
+        self.changed_idx(src)
+    }
+
     /// The collapse set for whichever list the panel is showing.
-    fn collapsed(&mut self) -> &mut HashSet<String> {
+    pub(crate) fn collapsed(&mut self) -> &mut HashSet<String> {
         match self.panel {
             PanelMode::Changes => &mut self.collapsed_dirs,
             PanelMode::Files => &mut self.collapsed_files,
+        }
+    }
+
+    /// The same set, for the renderer, which only reads it.
+    pub fn collapsed_set(&self) -> &HashSet<String> {
+        match self.panel {
+            PanelMode::Changes => &self.collapsed_dirs,
+            PanelMode::Files => &self.collapsed_files,
         }
     }
 
@@ -4971,7 +5450,7 @@ impl App {
     /// Collapsed is not a nicety. Emitting a fully expanded 400,000-path
     /// tree costs 2.1 ms and a 400,000-entry `Vec` on every toggle;
     /// collapsed it costs about 2 µs and seven entries.
-    fn apply_repo_listing(&mut self, listing: search::RepoListing) {
+    pub(crate) fn apply_repo_listing(&mut self, listing: search::RepoListing) {
         // What the reader had opened, before the tree is replaced. A
         // refresh that collapsed the folder somebody was reading would be
         // worse than not refreshing at all.
@@ -5288,6 +5767,12 @@ impl App {
         // Overlays capture keys first.
         match &mut self.overlay {
             Overlay::Help => {
+                self.overlay = Overlay::None;
+                return;
+            }
+            // Read, then dismissed with any key, the way the help card
+            // is. There is nothing to choose in it.
+            Overlay::Problem(_) => {
                 self.overlay = Overlay::None;
                 return;
             }
@@ -5745,16 +6230,7 @@ impl App {
                         self.spawn_save_editor();
                     }
                 }
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    let target = editor.copy_target();
-                    match target {
-                        Some((text, what)) => match clipboard::copy(&text) {
-                            Ok(via) => self.ok(format!("⧉ Copied {what} via {via}.")),
-                            Err(e) => self.err(format!("Couldn't copy: {e:#}")),
-                        },
-                        None => self.err("Nothing to copy."),
-                    }
-                }
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.copy_from_editor(),
                 // Language-server keys. These are Ctrl-based because the
                 // editor takes plain characters as text — `K` and `gd`
                 // from the diff view would just type letters here — and
@@ -5766,12 +6242,33 @@ impl App {
                     self.spawn_editor_request(EditorRequest::Definition);
                 }
                 (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                    self.ok("Formatting…");
                     self.spawn_editor_request(EditorRequest::Format);
                 }
                 (KeyCode::Char(' '), KeyModifiers::CONTROL) => {
-                    self.spawn_editor_request(EditorRequest::Complete);
+                    self.completion_due = None;
+                    self.spawn_editor_request(EditorRequest::Complete(None));
                 }
+                // The function keys, where an editor puts them. They cost
+                // no modifier and collide with nothing the buffer types,
+                // so they are the shortest way to the two questions a
+                // reader asks most.
+                (KeyCode::F(12), m) if m.contains(KeyModifiers::SHIFT) => {
+                    self.spawn_editor_request(EditorRequest::References);
+                }
+                (KeyCode::F(12), _) => {
+                    self.spawn_editor_request(EditorRequest::Definition);
+                }
+                (KeyCode::F(10), _) => {
+                    self.spawn_editor_request(EditorRequest::References);
+                }
+                (KeyCode::F(2), _) => {
+                    self.activate(ButtonId::EditorRename);
+                }
+                (KeyCode::F(8), m) if m.contains(KeyModifiers::SHIFT) => self.step_problem(-1),
+                (KeyCode::F(8), _) => self.step_problem(1),
+                (KeyCode::F(3), m) if m.contains(KeyModifiers::SHIFT) => editor.step_match(-1),
+                (KeyCode::F(3), _) => editor.step_match(1),
+                (KeyCode::F(1), _) => self.overlay = Overlay::Help,
                 // Back to the rendered document. Alt rather than Ctrl:
                 // Ctrl+P is tui-textarea's cursor-up, and taking it away
                 // would break moving around the buffer.
@@ -5781,6 +6278,14 @@ impl App {
                 }
                 // The find prompt, when it has the keyboard.
                 _ if editor.find.typing.is_some() && editor.find_key(key) => {}
+                // Every problem in the file, as a list. After the find
+                // prompt, like the other Alt keys: while the prompt has
+                // the keyboard, it gets first refusal.
+                (KeyCode::Char('e'), KeyModifiers::ALT)
+                | (KeyCode::Char('E'), KeyModifiers::ALT) => self.open_problems(),
+                // And the one under the cursor, laid out to be read.
+                (KeyCode::Char('x'), KeyModifiers::ALT)
+                | (KeyCode::Char('X'), KeyModifiers::ALT) => self.explain_problem(),
                 // Comment or uncomment the line, or the selection.
                 (KeyCode::Char('c'), KeyModifiers::ALT)
                 | (KeyCode::Char('C'), KeyModifiers::ALT) => {
@@ -5794,7 +6299,7 @@ impl App {
                     editor.dirty = true;
                     editor.discard_armed = false;
                     editor.touched();
-                    self.editor_touched = Some(Instant::now());
+                    self.buffer_changed();
                 }
                 // Rename the symbol under the cursor, everywhere.
                 (KeyCode::Char('m'), KeyModifiers::ALT)
@@ -5808,7 +6313,6 @@ impl App {
                 }
                 // What the server offers here: quick fixes, refactors.
                 (KeyCode::Char('.'), KeyModifiers::ALT) => {
-                    self.ok("Asking what is on offer here…");
                     self.spawn_editor_request(EditorRequest::CodeActions);
                 }
                 // The signature of the call the cursor is inside.
@@ -5847,7 +6351,7 @@ impl App {
                     if let Some(e) = &mut self.editor {
                         e.dirty = true;
                     }
-                    self.editor_touched = Some(Instant::now());
+                    self.buffer_changed();
                 }
                 // Paging must bypass tui-textarea's handler: its internal
                 // PageUp/PageDown call TextArea::scroll, which would desync
@@ -5887,10 +6391,11 @@ impl App {
                     if modified {
                         // The server's copy is now stale; the idle tick
                         // will push the new text.
-                        self.editor_touched = Some(Instant::now());
+                        self.buffer_changed();
                     }
                     // Narrow an open popup to what has been typed since,
-                    // or open one when a word (or a `.`) starts.
+                    // then decide whether this keystroke is worth asking
+                    // the server about.
                     let open = self.editor.as_ref().is_some_and(|e| e.completion.is_some());
                     if open {
                         if let Some(e) = &mut self.editor {
@@ -5898,11 +6403,7 @@ impl App {
                         }
                     }
                     if let Some(c) = typed {
-                        let still_open =
-                            self.editor.as_ref().is_some_and(|e| e.completion.is_some());
-                        if !still_open && (c == '.' || c == ':' || c == '>') {
-                            self.spawn_editor_request(EditorRequest::Complete);
-                        }
+                        self.maybe_suggest(c);
                     }
                 }
             }
@@ -5917,7 +6418,7 @@ impl App {
                 KeyCode::Char('`') => self.toggle_workspace(),
                 KeyCode::Char('m') => self.open_menu_from_key(),
                 KeyCode::Char('t') => self.open_theme_picker(),
-                KeyCode::Char('?') => self.overlay = Overlay::Help,
+                KeyCode::Char('?') | KeyCode::F(1) => self.overlay = Overlay::Help,
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.pr_cursor = self.pr_cursor.saturating_sub(1);
                     self.ensure_pr_visible();
@@ -5996,6 +6497,18 @@ impl App {
                     KeyCode::Char('/') => self.start_find(),
                     // vim's "what is this?" key.
                     KeyCode::Char('K') => self.lsp_action(LspAction::Hover),
+                    // The same function keys the editor uses, so one set
+                    // of habits works on both sides of `e`.
+                    KeyCode::F(12) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        self.lsp_action(LspAction::References)
+                    }
+                    KeyCode::F(12) => self.lsp_action(LspAction::Definition),
+                    KeyCode::F(10) => self.lsp_action(LspAction::References),
+                    KeyCode::F(3) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        self.goto_match(false)
+                    }
+                    KeyCode::F(3) => self.goto_match(true),
+                    KeyCode::F(1) => self.overlay = Overlay::Help,
                     KeyCode::Char('n') => self.goto_match(true),
                     KeyCode::Char('N') => self.goto_match(false),
                     KeyCode::Char('p') if ctrl => self.open_finder(FinderMode::Files),
@@ -6106,7 +6619,7 @@ impl App {
 
         // Overlays.
         match &mut self.overlay {
-            Overlay::Help | Overlay::CodeActions(_) => {
+            Overlay::Help | Overlay::CodeActions(_) | Overlay::Problem(_) => {
                 if matches!(m.kind, MouseEventKind::Down(_)) {
                     self.overlay = Overlay::None;
                 }
@@ -6294,12 +6807,43 @@ impl App {
         if contains(self.layout.pin_row, x, y) {
             match (m.kind, self.layout.button_at(x, y)) {
                 (MouseEventKind::Down(MouseButton::Left), Some(id)) => {
+                    // A double click on the peek tab keeps it, the way
+                    // it does in the file tree. Asked before
+                    // the tab is activated, because activating it is
+                    // what makes it the buffer on screen.
+                    let twice = self.double_click(x, y);
+                    // A press on a tab may turn out to be a drag. The
+                    // path is what is remembered, not the index, because
+                    // dragging is the thing that changes the indices.
+                    if let ButtonId::BufferTab(i) = id {
+                        let held = self.buffer_tabs().get(i).map(|t| t.path.clone());
+                        self.tab_drag = held;
+                    }
                     self.activate(id);
+                    if twice && matches!(id, ButtonId::BufferTab(_)) {
+                        self.keep_peek();
+                    }
                 }
+                // Drag a tab along the row to put it where you want it.
+                // The row is the reader's own order, and this is the only
+                // thing that changes it.
+                (MouseEventKind::Drag(MouseButton::Left), Some(ButtonId::BufferTab(to))) => {
+                    if let Some(path) = self.tab_drag.clone() {
+                        let from = self.buffer_tabs().iter().position(|t| t.path == path);
+                        if let Some(from) = from {
+                            self.move_buffer(from, to);
+                        }
+                    }
+                }
+                (MouseEventKind::Up(MouseButton::Left), _) => self.tab_drag = None,
                 // Middle-click closes a tab, as it does in a browser.
                 (MouseEventKind::Down(MouseButton::Middle), Some(ButtonId::PinTab(i)))
                 | (MouseEventKind::Down(MouseButton::Middle), Some(ButtonId::PinClose(i))) => {
                     self.close_pin(i);
+                }
+                (MouseEventKind::Down(MouseButton::Middle), Some(ButtonId::BufferTab(i)))
+                | (MouseEventKind::Down(MouseButton::Middle), Some(ButtonId::BufferClose(i))) => {
+                    self.close_buffer_at(i);
                 }
                 // The wheel walks the row, which is the only way to reach
                 // a tab that has scrolled off a narrow window.
@@ -6380,19 +6924,49 @@ impl App {
                         Some(id) if self.activate(id) => return,
                         _ => {}
                     }
+                    // The file panel keeps working with the editor
+                    // open. Switching files parks this buffer rather
+                    // than closing it, so there is nothing to save
+                    // first and nothing to lose by clicking away.
                     if contains(self.layout.file_list, x, y) {
-                        self.err("Close the editor first (Ctrl+S to save, Esc to close) before switching files.");
+                        self.file_list_click(x, y);
                         return;
                     }
-                    if let Some(ed) = &mut self.editor {
-                        ed.on_click(x, y);
+                    // One click places the cursor, two take the word,
+                    // three take the line — what every other editor does,
+                    // and the reason a double click is how you pick a
+                    // name to ask about.
+                    let run = self.click_run(x, y);
+                    let word = match (run, &mut self.editor) {
+                        (2, Some(ed)) => ed.on_double_click(x, y),
+                        (3, Some(ed)) => {
+                            ed.on_triple_click(x, y);
+                            None
+                        }
+                        (_, Some(ed)) => {
+                            ed.on_click(x, y);
+                            None
+                        }
+                        (_, None) => None,
+                    };
+                    if let Some(word) = word {
+                        self.ok(format!(
+                            "{word} — F12 definition · F10 every use · right-click for more"
+                        ));
                     }
                 }
                 // Copying a path does not switch files, so the menu still
-                // works while the editor holds the file panel.
+                // works while the editor holds the file panel. Over the
+                // text itself, the right button is the code menu.
                 MouseEventKind::Down(MouseButton::Right) => {
                     if contains(self.layout.file_list, x, y) {
                         self.open_path_menu(x, y);
+                    } else if self
+                        .editor
+                        .as_mut()
+                        .is_some_and(|ed| ed.on_right_click(x, y))
+                    {
+                        self.open_editor_menu(x, y);
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
@@ -6723,16 +7297,35 @@ impl App {
         }
     }
 
+    /// How many presses in a row this one makes on the same spot: 1 for a
+    /// fresh click, 2 for a double, 3 for a triple. A fourth press starts
+    /// the count again, so clicking on and on cycles rather than sticking
+    /// on "triple" forever.
+    ///
+    /// Call it once per press. It records this press as the one the next
+    /// press is measured against, so asking twice makes every second
+    /// click a first one again.
+    fn click_run(&mut self, x: u16, y: u16) -> u8 {
+        let now = Instant::now();
+        let n = match self.last_click {
+            Some((t, lx, ly, n))
+                if now.duration_since(t).as_millis() < 400 && lx.abs_diff(x) <= 1 && ly == y =>
+            {
+                if n >= 3 {
+                    1
+                } else {
+                    n + 1
+                }
+            }
+            _ => 1,
+        };
+        self.last_click = Some((now, x, y, n));
+        n
+    }
+
     /// True when this press lands on the same spot as the last one, quickly.
     fn double_click(&mut self, x: u16, y: u16) -> bool {
-        let now = Instant::now();
-        let double = matches!(
-            self.last_click,
-            Some((t, lx, ly))
-                if now.duration_since(t).as_millis() < 400 && lx.abs_diff(x) <= 1 && ly == y
-        );
-        self.last_click = Some((now, x, y));
-        double
+        self.click_run(x, y) >= 2
     }
 
     /// A click inside the file panel: checkbox toggles viewed, a directory
@@ -6743,6 +7336,11 @@ impl App {
         let Some(entry) = self.entries.get(vis).cloned() else {
             return;
         };
+        // Asked before anything is opened, and asked once: the helper
+        // remembers this click as the one the next click is measured
+        // against, so calling it twice would make every second click a
+        // single one again.
+        let double = self.double_click(x, y);
         match entry {
             FileEntry::Dir { path, .. } => {
                 let set = self.collapsed();
@@ -6758,12 +7356,13 @@ impl App {
                 self.rebuild_entries();
             }
             FileEntry::File { src, depth } => {
-                // A row the change does not touch has no diff, nothing to
-                // stage and nothing to put back, so none of the targets
-                // below mean anything. It still opens.
-                let Some(idx) = self.changed_idx(src) else {
+                // A row with no diff behind it — one the change does not
+                // touch, or any row at all in the Files panel — has
+                // nothing to stage and nothing to put back, so none of
+                // the targets below mean anything. It still opens.
+                let Some(idx) = self.diff_row_idx(src) else {
                     if let Some(path) = self.row_path(src).map(str::to_string) {
-                        self.spawn_open_external(path, None);
+                        self.open_from_tree(path, double);
                     }
                     return;
                 };
@@ -6789,6 +7388,51 @@ impl App {
             // The heading is a label, not a target.
             FileEntry::ConflictHeading { .. } => {}
         }
+    }
+
+    /// A click on a file row that has no diff behind it: open the file.
+    ///
+    /// One click opens it as the tab the next click replaces, so walking
+    /// a tree of files leaves one tab behind rather than forty. A double
+    /// click keeps it. Neither asks the reader to save first, and neither
+    /// closes what is already open: an unsaved buffer is parked, keeps
+    /// its tab, and keeps the dot that says it is unsaved.
+    fn open_from_tree(&mut self, path: String, double: bool) {
+        // Already in front of the reader, as source or as a document. A
+        // second click on it is the double click that keeps it; a first
+        // click has nothing to do.
+        if self.buffer_showing(&path) {
+            if double {
+                self.keep_peek();
+            }
+            return;
+        }
+        // Pinned already: the reader chose that tab, and it is the tab
+        // this file has. A peek beside it would name one file twice, and
+        // a double click would leave two tabs on the same file with no
+        // way to tell which one an edit went into. The pin's own door
+        // decides what opening it means.
+        if let Some(i) = self.pinned_at(&path) {
+            self.open_pin(i);
+            return;
+        }
+        // Open already: no read, so the swap happens inside this one
+        // event and the reader never sees a frame without it. The cursor,
+        // the scroll and any unsaved edits all come back with it.
+        if self.switch_buffer(&path) {
+            self.preview = None;
+            self.drop_peek(&path);
+            if double {
+                self.keep_peek();
+            } else {
+                self.ok(format!("{path} — already open."));
+            }
+            self.spawn_blame_external(path, false);
+            return;
+        }
+        // Not open: it has to be read. Nothing on screen changes until it
+        // lands — see `spawn_open_tree_file`.
+        self.spawn_open_tree_file(path, double);
     }
 
     /// The resolve menu for a file in the panel. When it is not the open
@@ -7228,12 +7872,12 @@ impl App {
                 rows.push(MenuRow::Heading("CODE"));
                 rows.push(item(
                     "⇢  Go to the definition".into(),
-                    "Ctrl+]",
+                    "F12",
                     ButtonId::EditorDefinition,
                 ));
                 rows.push(item(
                     "≡  Find every use".into(),
-                    "Alt+R",
+                    "F10",
                     ButtonId::EditorReferences,
                 ));
                 rows.push(item(
@@ -7249,7 +7893,7 @@ impl App {
                 if !read_only {
                     rows.push(item(
                         "✎  Rename it everywhere".into(),
-                        "Alt+M",
+                        "F2",
                         ButtonId::EditorRename,
                     ));
                     rows.push(item(
@@ -7258,6 +7902,40 @@ impl App {
                         ButtonId::EditorActions,
                     ));
                 }
+            }
+
+            // Only when there is something wrong: three lines about
+            // problems on a clean file is three lines that do nothing.
+            let problems = self
+                .editor
+                .as_ref()
+                .map(|e| e.problems().len())
+                .unwrap_or(0);
+            if problems > 0 {
+                rows.push(MenuRow::Heading("PROBLEMS"));
+                rows.push(item(
+                    format!(
+                        "✗  {problems} {} in this file",
+                        if problems == 1 { "problem" } else { "problems" }
+                    ),
+                    "Alt+E",
+                    ButtonId::EditorProblems,
+                ));
+                rows.push(item(
+                    "✎  Explain the one here".into(),
+                    "Alt+X",
+                    ButtonId::EditorExplain,
+                ));
+                rows.push(item(
+                    "▾  Next problem".into(),
+                    "F8",
+                    ButtonId::EditorNextProblem,
+                ));
+                rows.push(item(
+                    "▴  Previous problem".into(),
+                    "Shift+F8",
+                    ButtonId::EditorPrevProblem,
+                ));
             }
 
             // Only worth a line when there is somewhere else to go.
@@ -7465,6 +8143,163 @@ impl App {
     }
 
     /// Open the ☰ menu under the button at (`x`, `y`).
+    /// The lines of the editor's right-click menu, for the word the click
+    /// landed on.
+    ///
+    /// Every line is a [`ButtonId`] that already exists, so the menu can
+    /// never do something the key for it does not. A line that needs a
+    /// symbol and has none is drawn dim rather than dropped: a menu that
+    /// changes length depending on where you clicked is a menu you have
+    /// to read every time.
+    fn editor_menu_rows(&self, word: &str) -> Vec<MenuRow> {
+        let item = |label: String, hint: &'static str, id: ButtonId, enabled: bool| {
+            MenuRow::Item(MenuItem {
+                label,
+                hint,
+                id,
+                enabled,
+                checked: None,
+            })
+        };
+        let read_only = self.editor.as_ref().is_some_and(|e| e.read_only);
+        let path = self
+            .editor
+            .as_ref()
+            .map(|e| e.path.clone())
+            .unwrap_or_default();
+        let has_server = lsp::Lsp::supports(&path).is_some();
+        let on_word = !word.is_empty();
+        let problems = self
+            .editor
+            .as_ref()
+            .map(|e| e.problems().len())
+            .unwrap_or(0);
+
+        let mut rows = Vec::new();
+        if has_server {
+            rows.push(MenuRow::Heading("CODE"));
+            rows.push(item(
+                "⇢  Go to the definition".into(),
+                "F12",
+                ButtonId::EditorDefinition,
+                on_word,
+            ));
+            rows.push(item(
+                "≡  Find every use".into(),
+                "F10",
+                ButtonId::EditorReferences,
+                on_word,
+            ));
+            rows.push(item(
+                "ℹ  What is this?".into(),
+                "Ctrl+G",
+                ButtonId::EditorHover,
+                on_word,
+            ));
+            rows.push(item(
+                "ƒ  Signature of this call".into(),
+                "Alt+S",
+                ButtonId::EditorSignature,
+                true,
+            ));
+            if !read_only {
+                rows.push(item(
+                    "✎  Rename it everywhere".into(),
+                    "F2",
+                    ButtonId::EditorRename,
+                    on_word,
+                ));
+                rows.push(item(
+                    "🔧 Fixes and refactors".into(),
+                    "Alt+.",
+                    ButtonId::EditorActions,
+                    true,
+                ));
+            }
+        }
+        if problems > 0 {
+            rows.push(MenuRow::Heading("PROBLEMS"));
+            rows.push(item(
+                format!(
+                    "✗  {problems} {} in this file",
+                    if problems == 1 { "problem" } else { "problems" }
+                ),
+                "Alt+E",
+                ButtonId::EditorProblems,
+                true,
+            ));
+            rows.push(item(
+                "✎  Explain the one here".into(),
+                "Alt+X",
+                ButtonId::EditorExplain,
+                true,
+            ));
+            rows.push(item(
+                "▾  Next problem".into(),
+                "F8",
+                ButtonId::EditorNextProblem,
+                true,
+            ));
+            rows.push(item(
+                "▴  Previous problem".into(),
+                "Shift+F8",
+                ButtonId::EditorPrevProblem,
+                true,
+            ));
+        }
+        rows.push(MenuRow::Heading("EDIT"));
+        rows.push(item("⧉  Copy".into(), "Ctrl+C", ButtonId::EditorCopy, true));
+        if !read_only {
+            rows.push(item(
+                "💬 Comment or uncomment".into(),
+                "Alt+C",
+                ButtonId::EditorComment,
+                true,
+            ));
+            rows.push(item(
+                "⇥  Format the file".into(),
+                "Ctrl+T",
+                ButtonId::EditorFormat,
+                true,
+            ));
+        }
+        rows.push(item(
+            "🔍 Find and replace".into(),
+            "Alt+F",
+            ButtonId::EditorFind,
+            true,
+        ));
+        rows
+    }
+
+    /// Open the editor's right-click menu at the pointer.
+    ///
+    /// The click has already taken the word under it (see
+    /// [`Editor::on_right_click`]), so the title names what the menu is
+    /// about and every question below it asks about the same symbol.
+    pub fn open_editor_menu(&mut self, x: u16, y: u16) {
+        let word = self
+            .editor
+            .as_ref()
+            .map(|e| e.word_at_cursor())
+            .unwrap_or_default();
+        let rows = self.editor_menu_rows(&word);
+        let mut menu = Menu {
+            rows,
+            sel: 0,
+            scroll: 0,
+            anchor: (x, y),
+            title: if word.is_empty() {
+                " ⌁ Editor ".to_string()
+            } else {
+                format!(" ⌁ {word} ")
+            },
+            flip: true,
+        };
+        menu.sel = menu.first_selectable();
+        self.overlay = Overlay::Menu(Box::new(menu));
+    }
+
     pub fn open_menu(&mut self, x: u16, y: u16) {
         let rows = self.build_menu();
         let mut menu = Menu {
@@ -7472,6 +8307,8 @@ impl App {
             sel: 0,
             scroll: 0,
             anchor: (x, y),
+            title: " ☰ Menu ".into(),
+            flip: false,
         };
         menu.sel = menu.first_selectable();
         self.overlay = Overlay::Menu(Box::new(menu));
@@ -7544,11 +8381,13 @@ impl App {
                     self.open_path_box(PathBoxKind::RenameSymbol { word });
                 }
             }
-            ButtonId::EditorActions => {
-                self.ok("Asking what is on offer here…");
-                self.spawn_editor_request(EditorRequest::CodeActions);
-            }
+            ButtonId::EditorActions => self.spawn_editor_request(EditorRequest::CodeActions),
             ButtonId::EditorSignature => self.spawn_editor_request(EditorRequest::SignatureHelp),
+            ButtonId::EditorCopy => self.copy_from_editor(),
+            ButtonId::EditorNextProblem => self.step_problem(1),
+            ButtonId::EditorPrevProblem => self.step_problem(-1),
+            ButtonId::EditorProblems => self.open_problems(),
+            ButtonId::EditorExplain => self.explain_problem(),
             ButtonId::BufferNext => self.step_buffer(1),
             ButtonId::BufferPrev => self.step_buffer(-1),
             ButtonId::PanelChanges => self.set_panel(PanelMode::Changes),
@@ -7567,6 +8406,7 @@ impl App {
             ButtonId::PreviewClose => self.close_preview(),
             ButtonId::PinTab(i) => self.open_pin(i),
             ButtonId::BufferTab(i) => self.open_buffer_at(i),
+            ButtonId::BufferClose(i) => self.close_buffer_at(i),
             ButtonId::PinClose(i) => self.close_pin(i),
             ButtonId::PinToggle => self.toggle_pin_current(),
             ButtonId::PinOpenPath => self.open_path_box(PathBoxKind::Open),
@@ -7622,10 +8462,7 @@ impl App {
             ButtonId::Quit => self.request_quit(),
             ButtonId::EditorSave => self.spawn_save_editor(),
             ButtonId::EditorClose => self.request_close_editor(),
-            ButtonId::EditorFormat => {
-                self.ok("Formatting…");
-                self.spawn_editor_request(EditorRequest::Format);
-            }
+            ButtonId::EditorFormat => self.spawn_editor_request(EditorRequest::Format),
             _ => return false,
         }
         true
@@ -8282,7 +9119,9 @@ impl App {
             FinderMode::Files => "Type to filter files · # searches inside them · @ lists symbols",
             FinderMode::Grep => "Type to search inside every changed file · Tab widens to the repo",
             FinderMode::Symbols => "Type to jump to a definition in this file",
-            FinderMode::Refs | FinderMode::Pick => "Type to filter · Enter chooses",
+            FinderMode::Refs | FinderMode::Pick | FinderMode::Problems => {
+                "Type to filter · Enter chooses"
+            }
         });
     }
 
@@ -8664,6 +9503,49 @@ impl App {
     /// would change. When the branch under review isn't checked out the
     /// tree belongs to some other branch, so the commit's text is shown
     /// instead and the editor refuses to write it back.
+    /// Read a file the file tree named, on a worker, and open it.
+    ///
+    /// **Nothing on screen changes until the file is in hand.** The pane
+    /// keeps the file it is showing, the tab row keeps its tabs, and the
+    /// blame column keeps its column, right up to the frame the new file
+    /// lands on. Tearing any of it down first is what made clicking
+    /// through a tree flash back to the diff between every pair of
+    /// files: the read takes a frame or two, and every frame in between
+    /// drew a pane with nothing in it.
+    ///
+    /// A *quiet* job rather than a foreground one, for the same reason.
+    /// A foreground job swallows every mouse event until it lands
+    /// (`handle_mouse` returns on `self.job.is_some()`), which ate the
+    /// second half of every double click on the tree. Quiet keeps input
+    /// live, and the one quiet slot gives the behaviour a reader walking
+    /// a list wants for free: a click that lands while the last one is
+    /// still reading replaces it, so the newest file wins.
+    ///
+    /// Always the editor, never the rendered document. The document has
+    /// no buffer behind it and so no tab, and a click on the tree is
+    /// promised a tab. `P` renders it from there.
+    fn spawn_open_tree_file(&mut self, path: String, double: bool) {
+        let root = self.repo_root.clone();
+        let rev = self.search_rev();
+        let tree_is_review = self.local || self.checked_out;
+        let label = format!("Opening {path}");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let read = read_external(&root, &path, rev.as_deref(), tree_is_review).map(|mut d| {
+                d.peek = !double;
+                QuietOutcome::External(Box::new(d))
+            });
+            let _ = tx.send(read);
+        });
+        self.quiet = Some(QuietJob {
+            rx,
+            label,
+            started: Instant::now(),
+            auto: false,
+            eager: true,
+        });
+    }
+
     fn spawn_open_external(&mut self, path: String, line: Option<usize>) {
         // Already open: come back to it, unsaved edits and all, rather
         // than reading the file again over the top of them.
@@ -8674,46 +9556,19 @@ impl App {
             self.ok(format!("{path} — already open."));
             return;
         }
-        // A preview holds nothing unsaved, so it simply gives way.
-        self.preview = None;
         let root = self.repo_root.clone();
         let rev = self.search_rev();
         // In local review the working tree *is* what is under review.
         let tree_is_review = self.local || self.checked_out;
         let label = format!("Opening {path}");
         self.spawn(label, true, false, move || {
-            let Some(abs_path) = gitops::safe_repo_path(&root, &path) else {
-                anyhow::bail!("Refusing to open “{path}” — unsafe path.");
-            };
-            // Same rule as the diff editor: never open (and so never save)
-            // through a symlink, which a PR could have planted.
-            if is_symlink(&abs_path) {
-                anyhow::bail!("“{path}” is a symlink — refusing to open through it.");
-            }
-            let on_disk = tree_is_review
-                .then(|| std::fs::read_to_string(&abs_path).ok())
-                .flatten();
-            let (content, read_only) = match on_disk {
-                Some(text) => (text, false),
-                None => {
-                    let from_commit = match &rev {
-                        Some(rev) => gitops::show_file(rev, &path),
-                        None => gitops::head_oid().and_then(|oid| gitops::show_file(&oid, &path)),
-                    };
-                    match from_commit {
-                        Some(text) => (text, true),
-                        None => anyhow::bail!("Cannot read {path}."),
-                    }
-                }
-            };
-            Ok(Outcome::ExternalOpened(Box::new(ExternalFile {
-                preview: markdown::is_markdown(&path),
-                path,
-                abs_path,
-                content,
-                line,
-                read_only,
-            })))
+            let mut d = read_external(&root, &path, rev.as_deref(), tree_is_review)?;
+            // A search result or a jump lands on a document when the file
+            // is one; the file tree always wants the source, and asks for
+            // it through its own door.
+            d.preview = markdown::is_markdown(&d.path);
+            d.line = line;
+            Ok(Outcome::ExternalOpened(Box::new(d)))
         });
     }
 
@@ -8743,7 +9598,13 @@ impl App {
         let path = editor.path.clone();
         let at = editor.cursor_pos();
         let word = editor.word_at_cursor();
-        let diagnostics = editor.diagnostics.clone();
+        // A cold language server can take half a minute to answer the
+        // first question: the handshake, then the request, then the wait
+        // for indexing to settle. Silence for that long reads as a key
+        // that did nothing, so every request the reader asked for says
+        // what it is waiting on until the answer lands.
+        let label = what.waiting_for(&word);
+        let diagnostics = editor.problems().to_vec();
         let lsp = self.lsp.clone();
         let root = self.repo_root.clone();
         self.editor_gen += 1;
@@ -8767,8 +9628,8 @@ impl App {
                         word,
                     }))
                 }),
-                EditorRequest::Complete => lsp
-                    .complete(&root, &path, &text, at)
+                EditorRequest::Complete(trigger) => lsp
+                    .complete(&root, &path, &text, at, trigger)
                     .map(EditorOutcome::Completions),
                 EditorRequest::Hover => lsp
                     .hover(&root, &path, &text, at)
@@ -8782,7 +9643,12 @@ impl App {
             };
             let _ = tx.send(result);
         });
-        self.editor_job = Some(EditorJob { rx, gen });
+        self.editor_job = Some(EditorJob {
+            rx,
+            gen,
+            started: Instant::now(),
+            label,
+        });
     }
 
     fn apply_editor_outcome(&mut self, gen: u64, outcome: EditorOutcome) {
@@ -9233,6 +10099,131 @@ impl App {
         });
     }
 
+    /// Copy what the editor's `Ctrl+C` would copy: the selection, or the
+    /// cursor line when there is none. One helper behind the key, the
+    /// right-click menu and the ☰ line, so all three copy the same thing.
+    fn copy_from_editor(&mut self) {
+        let target = self.editor.as_mut().and_then(|e| e.copy_target());
+        match target {
+            Some((text, what)) => match clipboard::copy(&text) {
+                Ok(via) => self.ok(format!("⧉ Copied {what} via {via}.")),
+                Err(e) => self.err(format!("Couldn't copy: {e:#}")),
+            },
+            None => self.err("Nothing to copy."),
+        }
+    }
+
+    /// Put the cursor on the next problem in the open file, wrapping at
+    /// the ends, and say what it is. The status bar shows the message on
+    /// its own once the cursor is on the line, so this only has to say
+    /// where the reader has landed.
+    fn step_problem(&mut self, delta: i32) {
+        let Some(ed) = &mut self.editor else { return };
+        let total = ed.problems().len();
+        match ed.step_problem(delta) {
+            Some(d) => {
+                let at = ed
+                    .problems()
+                    .iter()
+                    .position(|p| p.line == d.line && p.col == d.col)
+                    .map(|i| i + 1)
+                    .unwrap_or(1);
+                self.ok(format!(
+                    "{} {at} of {total} — line {}: {}",
+                    if d.is_error() { "✗" } else { "▲" },
+                    d.line,
+                    d.message
+                ));
+            }
+            None => {
+                let name = self
+                    .editor
+                    .as_ref()
+                    .map(|e| e.path.clone())
+                    .unwrap_or_default();
+                self.err(format!("Nothing wrong in {name}."));
+            }
+        }
+    }
+
+    /// Lay out the problem the cursor is on, so a message too long for
+    /// one line can actually be read.
+    ///
+    /// The worst one on the line, when there is more than one — the same
+    /// rule the gutter mark and the margin already follow, so the panel
+    /// is about the problem the reader can see.
+    fn explain_problem(&mut self) {
+        let Some(ed) = &self.editor else { return };
+        let here = ed.diagnostics_here();
+        let of = here.len();
+        let Some(d) = here.first().copied().cloned() else {
+            let line = ed.cursor_pos().0;
+            self.err(format!("Nothing wrong on line {line}."));
+            return;
+        };
+        let panel = ProblemPanel {
+            rows: crate::explain::rows(&d.message),
+            code: d.code_label(),
+            severity: d.severity,
+            line: d.line,
+            of,
+        };
+        self.overlay = Overlay::Problem(Box::new(panel));
+    }
+
+    /// Every problem in the open file, as a list to pick from.
+    ///
+    /// The same overlay references use, for the same reason: a list of
+    /// places in a file is a list of places in a file, and typing filters
+    /// it. Enter goes to the line.
+    fn open_problems(&mut self) {
+        let Some(ed) = &self.editor else { return };
+        let path = ed.path.clone();
+        let problems: Vec<lsp::Diagnostic> = ed.problems().to_vec();
+        if problems.is_empty() {
+            self.err(format!("Nothing wrong in {path}."));
+            return;
+        }
+        let n = problems.len();
+        let errors = problems.iter().filter(|d| d.is_error()).count();
+        let warnings = problems.iter().filter(|d| d.is_warning()).count();
+        let changeset = self.changeset_paths();
+        let in_changeset = changeset.contains(&path);
+        let (symbols, symbol_path) = self.current_symbols();
+        let mut finder = Finder::new(FinderMode::Problems, changeset, symbols, symbol_path);
+        finder.preset = problems
+            .iter()
+            .map(|d| FinderRow {
+                path: path.clone(),
+                line: Some(d.line),
+                text: match &d.code {
+                    Some(c) => format!(
+                        "{} {}  {c}",
+                        if d.is_error() { "✗" } else { "▲" },
+                        d.message
+                    ),
+                    None => format!("{} {}", if d.is_error() { "✗" } else { "▲" }, d.message),
+                },
+                matched: Vec::new(),
+                range: None,
+                tag: d.label(),
+                in_changeset,
+                pick: None,
+            })
+            .collect();
+        self.overlay = Overlay::Finder(Box::new(finder));
+        self.refresh_finder();
+        // rebuild() only rewrites the note once a filter is typed.
+        if let Overlay::Finder(f) = &mut self.overlay {
+            f.note = format!(
+                "{path} · {errors} {} · {warnings} {} · Enter goes to the line · type to filter",
+                if errors == 1 { "error" } else { "errors" },
+                if warnings == 1 { "warning" } else { "warnings" }
+            );
+        }
+        self.ok(format!("{n} problems in {path}."));
+    }
+
     /// Show the answer to `gd` / `gr`.
     fn apply_locations(&mut self, d: LocationsData) {
         let n = d.places.len();
@@ -9644,7 +10635,11 @@ impl App {
         } else {
             self.ok(format!("📖 {path} — P goes back to the source."));
         }
-        self.editor = None;
+        // Parked, not dropped. The tab row is the reader's list of open
+        // files, and a document is a rendering of an open file, not a
+        // different thing — a tab that vanished on P and came back on the
+        // next P would be lying about what is open.
+        self.park_active();
         let mut pv = Preview::new(&path, abs_path.clone(), &content);
         pv.standalone = standalone;
         pv.from_editor = true;
@@ -9676,11 +10671,20 @@ impl App {
             }
             return;
         }
-        let mut ed = Editor::new(&pv.path, pv.abs_path.clone(), &pv.src);
-        ed.standalone = true;
-        ed.dirty = pv.from_buffer;
-        ed.jump_to_line(line);
-        self.editor = Some(ed);
+        // The buffer P parked. Coming back to it keeps its undo history
+        // and its unsaved edits; a fresh one built from the rendered text
+        // would keep neither.
+        if self.switch_buffer(&pv.path) {
+            if let Some(ed) = &mut self.editor {
+                ed.jump_to_line(line);
+            }
+        } else {
+            let mut ed = Editor::new(&pv.path, pv.abs_path.clone(), &pv.src);
+            ed.standalone = true;
+            ed.dirty = pv.from_buffer;
+            ed.jump_to_line(line);
+            self.open_buffer(ed);
+        }
         if !self.preview_only {
             self.spawn_blame_external(pv.path.clone(), false);
         }
@@ -9717,12 +10721,19 @@ impl App {
             self.should_quit = true;
             return;
         }
-        let was = self.preview.take();
-        if was.is_some() {
-            // The blame pane goes back to the file under review.
-            self.spawn_blame(self.file_cursor);
-            self.ok("Back to the diff.");
+        let Some(was) = self.preview.take() else {
+            return;
+        };
+        // A document P opened has a buffer parked behind it. Leaving the
+        // document leaves the file, so the buffer goes with it and the
+        // tab row stops listing a file nobody has open.
+        if was.from_editor && self.switch_buffer(&was.path) {
+            self.close_editor();
+            return;
         }
+        // The blame pane goes back to the file under review.
+        self.spawn_blame(self.file_cursor);
+        self.ok("Back to the diff.");
     }
 
     /// True when the pane is showing a rendered document.
@@ -9957,12 +10968,6 @@ impl App {
         if self.job.is_some() {
             return;
         }
-        // Unsaved editor text is the reader's own work. A tab does not
-        // get to throw it away.
-        if self.editor.as_ref().is_some_and(|e| e.dirty) {
-            self.err("Unsaved changes — Ctrl+S saves them, Esc throws them away.");
-            return;
-        }
         if !pin.abs_path.is_file() {
             self.err(format!(
                 "{} is not there any more — “-” unpins it.",
@@ -9991,7 +10996,12 @@ impl App {
             // pinned file's document, and leaving it there is what made a
             // tab for a changed file look like it did nothing at all.
             if i == self.file_cursor && self.diff.is_some() {
-                self.editor = None;
+                // Parked, not closed. Unsaved editor text is the
+                // reader's own work; a tab does not get to throw it
+                // away, and parking means it does not have to — the
+                // buffer keeps its text, its place in the row and the
+                // dot that says it is unsaved.
+                self.park_active();
                 let showing_it = self
                     .preview
                     .as_ref()
@@ -10013,6 +11023,9 @@ impl App {
                 // The document, not the diff — that is what the tab is
                 // for. The flag is read when the file lands.
                 self.pin_wants_preview = md;
+                // Parked before the load, which closes the editor when
+                // it lands. Same reason as above.
+                self.park_active();
                 self.spawn_load_file(i);
             }
             return;
@@ -10028,8 +11041,8 @@ impl App {
                 return;
             }
         };
-        self.editor = None;
         if markdown::is_markdown(&pin.path) {
+            self.park_active();
             let mut pv = Preview::new(&pin.path, pin.abs_path.clone(), &content);
             pv.standalone = true;
             pv.mtime = preview::mtime_of(&pin.abs_path);
@@ -10044,7 +11057,7 @@ impl App {
         self.preview = None;
         let mut ed = Editor::new(&pin.path, pin.abs_path.clone(), &content);
         ed.standalone = true;
-        self.editor = Some(ed);
+        self.open_buffer(ed);
         // git blame only knows files in this repository; an outside file
         // has no history here to draw.
         if pin.outside {
@@ -10162,7 +11175,7 @@ impl App {
                     }
                     ed.textarea.insert_str(&text);
                     ed.dirty = true;
-                    self.editor_touched = Some(Instant::now());
+                    self.buffer_changed();
                 } else {
                     self.err(
                         "Pasted text has nowhere to go here — drop a file to pin it, or Ctrl+O opens one by path.",
@@ -10586,25 +11599,37 @@ impl App {
         ));
     }
 
-    /// What the tab row says about the open buffers: label, whether it
-    /// holds unsaved work, and whether it is the one on screen.
+    /// What the tab row says about the open buffers.
     ///
     /// The label rule is the pins' rule (`pins::Pins::labels`): the file
     /// name alone, unless two buffers share one, in which case both get
     /// their parent directory. Two tabs both reading `mod.rs` name
     /// nothing.
-    pub fn buffer_tabs(&self) -> Vec<(String, bool, bool)> {
-        let paths: Vec<&str> = self.buffers().map(|e| e.path.as_str()).collect();
+    pub fn buffer_tabs(&self) -> Vec<BufferTab> {
+        // A pinned file already has a tab, so it gets no second one. The
+        // row would otherwise name one file twice — once under the pin
+        // the reader chose and once under the buffer that happens to hold
+        // it — and closing either would leave the other looking wrong.
+        let mine: Vec<&Editor> = self
+            .buffers()
+            .filter(|e| !self.is_pinned(&e.path))
+            .collect();
         let name = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-        let active = self.editor.as_ref().map(|e| e.path.as_str());
-        self.buffers()
+        // The document P opens is a rendering of a parked buffer, so the
+        // tab it belongs to is still the one on screen.
+        let active = match &self.editor {
+            Some(e) => Some(e.path.as_str()),
+            None => self.preview.as_ref().map(|pv| pv.path.as_str()),
+        };
+        let peek = self.peek_path();
+        mine.iter()
             .enumerate()
             .map(|(i, e)| {
-                let mine = name(&e.path);
-                let shared = paths
+                let own = name(&e.path);
+                let shared = mine
                     .iter()
                     .enumerate()
-                    .any(|(j, other)| j != i && name(other) == mine);
+                    .any(|(j, other)| j != i && name(&other.path) == own);
                 let label = if shared {
                     let mut parts = e.path.rsplitn(3, '/');
                     let base = parts.next().unwrap_or("");
@@ -10613,21 +11638,100 @@ impl App {
                         None => base.to_string(),
                     }
                 } else {
-                    mine
+                    own
                 };
-                (label, e.dirty, active == Some(e.path.as_str()))
+                BufferTab {
+                    path: e.path.clone(),
+                    label,
+                    dirty: e.dirty,
+                    active: active == Some(e.path.as_str()),
+                    peek: peek == Some(e.path.as_str()),
+                }
             })
             .collect()
     }
 
+    /// The tab holding `path`, when the reader has pinned it.
+    ///
+    /// Resolved the way `Pin::new` resolves, so a pin made from a dropped
+    /// path and a path built from the file tree compare equal. On macOS
+    /// `/tmp` alone is a symlink, and one symlink between them is enough
+    /// to make one file look like two.
+    pub fn pinned_at(&self, path: &str) -> Option<usize> {
+        if self.pins.is_empty() {
+            return None;
+        }
+        let abs = self.abs_path(path)?;
+        let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
+        self.pins.find(&abs)
+    }
+
+    fn is_pinned(&self, path: &str) -> bool {
+        self.pinned_at(path).is_some()
+    }
+
+    /// Unsaved work in the buffer behind pin `idx`, if one is open.
+    ///
+    /// A pinned file's tab is its *pin* tab, so that is where the mark
+    /// saying "this is not on disk yet" has to go. Without this the mark
+    /// simply disappeared the moment a file was pinned.
+    pub fn pin_dirty(&self, idx: usize) -> bool {
+        let Some(pin) = self.pins.items.get(idx) else {
+            return false;
+        };
+        self.buffers().any(|e| e.dirty && e.path == pin.path)
+    }
+
     /// Bring the nth open buffer forward, counting the way the row reads.
     pub fn open_buffer_at(&mut self, i: usize) {
-        let Some(path) = self.buffers().nth(i).map(|e| e.path.clone()) else {
+        let Some(path) = self.buffer_tabs().get(i).map(|t| t.path.clone()) else {
             return;
         };
         if self.switch_buffer(&path) {
             self.ok(format!("{path} — {} open.", self.buffers().count()));
         }
+    }
+
+    /// The ✕ on a tab, and a middle click on one: close that file.
+    ///
+    /// Unsaved work is asked about, once, per tab. The buffer on screen
+    /// goes through the same door `Esc` uses, so one rule covers both.
+    /// A parked buffer arms its own `discard_armed`, so arming one tab
+    /// never arms another.
+    pub fn close_buffer_at(&mut self, i: usize) {
+        let Some(path) = self.buffer_tabs().get(i).map(|t| t.path.clone()) else {
+            return;
+        };
+        if self.editor.as_ref().is_some_and(|e| e.path == path) {
+            self.request_close_editor();
+            return;
+        }
+        let Some(at) = self.parked.iter().position(|e| e.path == path) else {
+            return;
+        };
+        if self.parked[at].dirty && !self.parked[at].discard_armed {
+            self.parked[at].discard_armed = true;
+            self.err(format!(
+                "{path} has unsaved changes — click its ✕ again to throw them away."
+            ));
+            return;
+        }
+        self.parked.remove(at);
+        // Everything after it moved up one, the buffer on screen
+        // included.
+        if at < self.buffer_slot {
+            self.buffer_slot -= 1;
+        }
+        // Fire and forget, on a worker: the registry blocks, and the
+        // reader is already looking at something else.
+        let lsp = self.lsp.clone();
+        let root = self.repo_root.clone();
+        let closing = path.clone();
+        thread::spawn(move || lsp.close(&root, &closing));
+        self.ok(format!(
+            "{path} closed — {} still open.",
+            self.buffers().count()
+        ));
     }
 
     /// Step to the next or previous buffer, wrapping at each end.
@@ -10640,15 +11744,183 @@ impl App {
         let at = self
             .buffer_tabs()
             .iter()
-            .position(|(_, _, active)| *active)
+            .position(|t| t.active)
             .unwrap_or(0) as i32;
         let next = (at + delta).rem_euclid(n as i32) as usize;
         self.open_buffer_at(next);
     }
 
-    /// Every open buffer, the one on screen last.
+    /// Every open buffer, in the order the tab row draws them.
+    ///
+    /// The buffer on screen sits where it was opened rather than at the
+    /// end. It used to be last, because it lived in its own field and the
+    /// field came last — which meant clicking a tab moved that tab to the
+    /// right, and a reader clicking along the row watched it reshuffle
+    /// under the pointer.
     pub fn buffers(&self) -> impl Iterator<Item = &Editor> {
-        self.parked.iter().chain(self.editor.iter())
+        let at = self.buffer_slot.min(self.parked.len());
+        self.parked[..at]
+            .iter()
+            .chain(self.editor.iter())
+            .chain(self.parked[at..].iter())
+    }
+
+    /// Put the buffer on screen back among the others, where it belongs
+    /// in the row. `parked` is then the whole row, in order.
+    fn park_active(&mut self) {
+        if let Some(cur) = self.editor.take() {
+            let at = self.buffer_slot.min(self.parked.len());
+            self.parked.insert(at, cur);
+            // That slot is taken now. A file arriving later with nothing
+            // on screen goes after it rather than on top of it — only
+            // `drop_peek`, which really does free a slot, leaves one for
+            // the next file to land in.
+            self.buffer_slot = at + 1;
+        }
+    }
+
+    /// Drag a tab to a new place in the row.
+    ///
+    /// Both indices count tabs as the row draws them. The buffer on
+    /// screen goes back among the others first, so the permutation is one
+    /// `remove` and one `insert` on a single list — doing it with the
+    /// active buffer held out to the side is where the off-by-ones live.
+    pub fn move_buffer(&mut self, from: usize, to: usize) {
+        let row = self.buffer_tabs();
+        if from == to || from >= row.len() || to >= row.len() {
+            return;
+        }
+        // Both ends by path, not by index. The row is a subsequence of
+        // the open buffers — a pinned file has a tab elsewhere and none
+        // here — so a position in the row is not a position in the list.
+        let moved = row[from].path.clone();
+        let onto = row[to].path.clone();
+        let active = self.editor.as_ref().map(|e| e.path.clone());
+        self.park_active();
+        let Some(i) = self.parked.iter().position(|e| e.path == moved) else {
+            return;
+        };
+        let held = self.parked.remove(i);
+        // Dropped on a tab to the right means after it, and to the left
+        // means before it. Anything else moves the tab past the one the
+        // reader aimed at.
+        let at = self
+            .parked
+            .iter()
+            .position(|e| e.path == onto)
+            .map(|at| at + usize::from(from < to))
+            .unwrap_or(self.parked.len());
+        self.parked.insert(at.min(self.parked.len()), held);
+        // Back in front of the reader, at whatever index the move left
+        // it: a drag reorders the row, it does not change which file is
+        // on screen.
+        if let Some(path) = active {
+            if let Some(at) = self.parked.iter().position(|e| e.path == path) {
+                self.editor = Some(self.parked.remove(at));
+                self.buffer_slot = at;
+            }
+        }
+    }
+
+    /// True when `path` is the file in front of the reader — the buffer
+    /// the editor holds, or the document the preview is rendering. The
+    /// file tree marks that row, because with no diff behind these rows
+    /// there is no file cursor for the panel to follow.
+    pub fn buffer_showing(&self, path: &str) -> bool {
+        if let Some(ed) = &self.editor {
+            return ed.path == path;
+        }
+        self.preview.as_ref().is_some_and(|pv| pv.path == path)
+    }
+
+    /// The peek tab, or `None` when there is not one.
+    ///
+    /// Derived rather than stored, for the reason `active_pin` is: a
+    /// buffer stops being this one through a dozen different doors, and
+    /// a stored flag would have to be cleared in every one of them. Two
+    /// rules do all of it here.
+    ///
+    /// The first: a buffer with unsaved work in it is never this tab.
+    /// The reader typed into it, so it is theirs, and the next click on
+    /// the file tree must not throw it away. `dirty` is set at fourteen
+    /// sites in the editor; asking here means none of them had to know.
+    ///
+    /// The second: a buffer that is closed is not open, so it cannot be
+    /// this tab either. `find` answers that without a second field.
+    pub fn peek_path(&self) -> Option<&str> {
+        let path = self.peek.as_deref()?;
+        let held = self.buffers().find(|e| e.path == path)?;
+        (!held.dirty).then_some(path)
+    }
+
+    /// Park a language-server request in flight, for the render test,
+    /// which must not start a real server to see what the wait looks
+    /// like. The channel is never written to, so the job stays pending.
+    #[cfg(test)]
+    pub fn set_editor_waiting_for_test(&mut self, label: &str) {
+        let (tx, rx) = mpsc::channel();
+        std::mem::forget(tx);
+        self.editor_job = Some(EditorJob {
+            rx,
+            gen: self.editor_gen,
+            started: Instant::now(),
+            label: Some(label.to_string()),
+        });
+    }
+
+    /// Set the peek tab directly, for the render tests, which build
+    /// their buffers rather than clicking a tree to get them.
+    #[cfg(test)]
+    pub fn set_peek_for_test(&mut self, path: &str) {
+        self.peek = Some(path.to_string());
+    }
+
+    /// Make the peek tab a tab like any other. The double click that
+    /// says so lands on either the tab or the file row.
+    pub fn keep_peek(&mut self) {
+        let Some(path) = self.peek_path().map(str::to_string) else {
+            return;
+        };
+        self.peek = None;
+        self.ok(format!("{path} — kept. Esc closes it."));
+    }
+
+    /// Close the peek tab, to make room for the next one.
+    ///
+    /// Called once the file that replaces it is in hand, so the row
+    /// gains no tab for a file the reader only looked at — and so the
+    /// pane never stands empty waiting for a read. It answers the same
+    /// two rules as `peek_path`, so a buffer the reader typed into
+    /// survives this untouched.
+    fn drop_peek(&mut self, keep: &str) {
+        let Some(path) = self.peek_path().map(str::to_string) else {
+            return;
+        };
+        if path == keep {
+            return;
+        }
+        self.peek = None;
+        // The language server is holding this file open. Telling it on a
+        // worker: the registry blocks, and the reader is already looking
+        // at the next file.
+        let lsp = self.lsp.clone();
+        let root = self.repo_root.clone();
+        let closing = path.clone();
+        thread::spawn(move || lsp.close(&root, &closing));
+        if let Some(i) = self.parked.iter().position(|e| e.path == path) {
+            self.parked.remove(i);
+            // Everything after it moved up one, the buffer on screen
+            // included.
+            if i < self.buffer_slot {
+                self.buffer_slot -= 1;
+            }
+            return;
+        }
+        // Left as it is: `buffer_slot` now names the place this tab had,
+        // and the file that replaces it goes there.
+        if self.editor.as_ref().is_some_and(|e| e.path == path) {
+            self.editor = None;
+        }
     }
 
     /// How many open buffers hold unsaved work. Every "are you sure"
@@ -10661,38 +11933,52 @@ impl App {
     /// Park the buffer on screen and put `next` in front of the reader.
     ///
     /// A file already open is switched to rather than read again, so its
-    /// cursor, its scroll and its unsaved edits all survive.
+    /// cursor, its scroll and its unsaved edits all survive — and it
+    /// keeps its place in the row rather than jumping to the end.
     pub fn open_buffer(&mut self, next: Editor) {
-        if let Some(i) = self.parked.iter().position(|e| e.path == next.path) {
-            let existing = self.parked.remove(i);
-            if let Some(cur) = self.editor.take() {
-                self.parked.push(cur);
-            }
-            self.editor = Some(existing);
+        // Re-opening what is already in front: keep the buffer, unsaved
+        // edits and all.
+        if self.switch_buffer(&next.path) {
             return;
         }
-        if let Some(cur) = self.editor.take() {
-            if cur.path == next.path {
-                // Re-opening what is already in front: keep the buffer,
-                // unsaved edits and all.
-                self.editor = Some(cur);
-                return;
-            }
-            self.parked.push(cur);
+        if self.editor.is_some() {
+            // A file nobody has open yet joins the end of the row, which
+            // is where a reader looks for the file they just opened.
+            self.park_active();
+            self.buffer_slot = self.parked.len();
+        } else {
+            // Nothing on screen: the new buffer takes the slot the last
+            // one left. That is what puts a file that replaces a
+            // peek tab in the tab it replaced, rather than at the
+            // end of the row.
+            self.buffer_slot = self.buffer_slot.min(self.parked.len());
         }
         self.editor = Some(next);
+        // A file that has just opened has never been linted. Arm the
+        // clock so the first pause runs it, rather than waiting for an
+        // edit that may never come — a reviewer reads far more files
+        // than they type into.
+        self.lint_touched = Some(Instant::now());
+        self.linted = None;
     }
 
-    /// Bring a parked buffer forward by path.
+    /// Bring an open buffer forward by path, leaving the row in the order
+    /// the reader put it.
     pub fn switch_buffer(&mut self, path: &str) -> bool {
-        let Some(i) = self.parked.iter().position(|e| e.path == path) else {
-            return self.editor.as_ref().is_some_and(|e| e.path == path);
-        };
-        let next = self.parked.remove(i);
-        if let Some(cur) = self.editor.take() {
-            self.parked.push(cur);
+        if self.editor.as_ref().is_some_and(|e| e.path == path) {
+            return true;
         }
-        self.editor = Some(next);
+        if !self.parked.iter().any(|e| e.path == path) {
+            return false;
+        }
+        self.park_active();
+        // Found again after the park: the buffer that was on screen went
+        // back into the list, and it may have gone in ahead of this one.
+        let Some(i) = self.parked.iter().position(|e| e.path == path) else {
+            return false;
+        };
+        self.editor = Some(self.parked.remove(i));
+        self.buffer_slot = i;
         true
     }
 
@@ -10721,7 +12007,14 @@ impl App {
         self.editor = None;
         // Another buffer waiting is what the reader goes back to, not the
         // diff. Closing one file of several should not close them all.
-        if let Some(prev) = self.parked.pop() {
+        //
+        // The neighbour in the row, not the last file opened: the row is
+        // what the reader is looking at, so the tab that takes the closed
+        // one's place should be the tab that was beside it.
+        if !self.parked.is_empty() {
+            let at = self.buffer_slot.min(self.parked.len() - 1);
+            let prev = self.parked.remove(at);
+            self.buffer_slot = at;
             let path = prev.path.clone();
             let read_only = prev.read_only;
             self.editor = Some(prev);
@@ -10924,6 +12217,7 @@ impl App {
             label: format!("Refreshing PR #{number}"),
             started: Instant::now(),
             auto,
+            eager: false,
         });
     }
 
@@ -10949,6 +12243,7 @@ impl App {
             label: "Rescanning local changes".into(),
             started: Instant::now(),
             auto,
+            eager: false,
         });
     }
 
@@ -10970,6 +12265,7 @@ impl App {
             label,
             started: Instant::now(),
             auto,
+            eager: false,
         });
     }
 
@@ -10987,6 +12283,9 @@ impl App {
     /// since it started just drops the result.
     fn apply_quiet(&mut self, outcome: QuietOutcome, auto: bool) {
         match outcome {
+            // No staleness check: there is one quiet slot, so a newer
+            // click has already replaced any result that went stale.
+            QuietOutcome::External(data) => self.apply_external(*data),
             QuietOutcome::Pr(data) => {
                 let d = *data;
                 if self.local || self.pr.as_ref().map(|p| p.number) != Some(d.detail.number) {
@@ -11128,6 +12427,52 @@ impl App {
     }
 }
 
+/// Read one file for the editor, off the UI thread.
+///
+/// The working tree first when it is what is under review, and the
+/// commit under review when it is not — in which case the text must
+/// never be written back, and `read_only` says so.
+fn read_external(
+    root: &Path,
+    path: &str,
+    rev: Option<&str>,
+    tree_is_review: bool,
+) -> Result<ExternalFile> {
+    let Some(abs_path) = gitops::safe_repo_path(root, path) else {
+        anyhow::bail!("Refusing to open “{path}” — unsafe path.");
+    };
+    // Same rule as the diff editor: never open (and so never save)
+    // through a symlink, which a PR could have planted.
+    if is_symlink(&abs_path) {
+        anyhow::bail!("“{path}” is a symlink — refusing to open through it.");
+    }
+    let on_disk = tree_is_review
+        .then(|| std::fs::read_to_string(&abs_path).ok())
+        .flatten();
+    let (content, read_only) = match on_disk {
+        Some(text) => (text, false),
+        None => {
+            let from_commit = match rev {
+                Some(rev) => gitops::show_file(rev, path),
+                None => gitops::head_oid().and_then(|oid| gitops::show_file(&oid, path)),
+            };
+            match from_commit {
+                Some(text) => (text, true),
+                None => anyhow::bail!("Cannot read {path}."),
+            }
+        }
+    };
+    Ok(ExternalFile {
+        preview: false,
+        peek: false,
+        path: path.to_string(),
+        abs_path,
+        content,
+        line: None,
+        read_only,
+    })
+}
+
 /// Load everything the diff view needs for one file: both sides' content,
 /// the computed diff, and syntax highlighting. Runs on a worker thread for
 /// both the modal load and the silent refresh.
@@ -11244,7 +12589,7 @@ fn load_conflict_data(idx: usize, file: &ChangedFile, root: &Path) -> Option<Fil
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     fn cf(path: &str) -> ChangedFile {
@@ -12550,9 +13895,14 @@ b2
         std::fs::remove_dir_all(&away).ok();
     }
 
-    /// A tab does not get to throw away work the reader has not saved.
+    /// A tab does not get to throw away work the reader has not saved —
+    /// and it does not have to refuse the switch to manage it. It used
+    /// to: every tab said "save or discard first", which made moving
+    /// between files a chore. The buffer is parked instead, so it keeps
+    /// its text, its place in the row and the dot that says it is
+    /// unsaved, and the reader goes where they were going.
     #[test]
-    fn an_unsaved_editor_blocks_a_tab_switch() {
+    fn a_tab_switch_parks_unsaved_work_rather_than_refusing() {
         let dir = TempDir::new("pin-dirty");
         let mut app = md_review_app(&dir.0, "# Plan\n");
         let away = std::env::temp_dir().join("loupe-pins-dirty");
@@ -12565,11 +13915,15 @@ b2
         app.handle_key(key(KeyCode::Char('P')));
         app.handle_key(key(KeyCode::Char('P')));
         app.editor.as_mut().expect("the editor").dirty = true;
+        let held = app.editor.as_ref().unwrap().path.clone();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT));
 
-        assert!(app.status_err, "it refuses and says why: {}", app.status);
-        assert!(app.editor.is_some(), "the unsaved text is still there");
+        assert!(!app.status_err, "it went through: {}", app.status);
+        assert!(
+            app.buffers().any(|e| e.path == held && e.dirty),
+            "and the unsaved text is still open, in its own tab"
+        );
         std::fs::remove_dir_all(&away).ok();
     }
 
@@ -12682,6 +14036,7 @@ b2
     fn a_markdown_file_from_the_finder_opens_as_a_document() {
         let mut app = folded_app();
         app.apply_external(ExternalFile {
+            peek: false,
             path: "docs/notes.md".into(),
             abs_path: "/repo/docs/notes.md".into(),
             content: "# Notes\n".into(),
@@ -12959,6 +14314,364 @@ b2
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A repository on disk with three files in it, opened in the Files
+    /// panel with every folder expanded and the file list where a click
+    /// can reach it.
+    pub fn tree_app(dir: &std::path::Path) -> App {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("src/one.rs"), "fn one() {}\n").unwrap();
+        std::fs::write(dir.join("src/two.rs"), "fn two() {}\n").unwrap();
+        std::fs::write(dir.join("docs/plan.md"), "# Plan\n").unwrap();
+
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.repo_root = dir.to_path_buf();
+        app.apply_repo_listing(search::RepoListing {
+            paths: vec![
+                "src/one.rs".into(),
+                "src/two.rs".into(),
+                "docs/plan.md".into(),
+            ],
+            ignored_from: 3,
+            stubs: Vec::new(),
+        });
+        app.set_panel(PanelMode::Files);
+        app.collapsed().remove("src");
+        app.collapsed().remove("docs");
+        app.rebuild_entries();
+        app.layout.file_list = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        app
+    }
+
+    /// The row `path` is drawn on, so a click can be aimed at it.
+    fn row_of(app: &App, path: &str) -> u16 {
+        app.entries
+            .iter()
+            .position(|e| match e {
+                FileEntry::File { src, .. } => app.row_path(*src) == Some(path),
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("no row for {path}")) as u16
+    }
+
+    /// Click the file tree row for `path` and wait for the read to land.
+    pub fn click_file(app: &mut App, path: &str) {
+        let y = row_of(app, path);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, y));
+        for _ in 0..300 {
+            if app.quiet.is_none() && app.job.is_none() {
+                break;
+            }
+            app.poll_jobs();
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// How long a click on the tree actually costs, so the budget in the
+    /// plan has a number to check against rather than a feeling.
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn measure_the_cost_of_a_tree_click() {
+        let dir = std::env::temp_dir().join(format!("loupe-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = tree_app(&dir);
+        for (n, path) in ["src/one.rs", "src/two.rs", "src/one.rs", "src/two.rs"]
+            .iter()
+            .enumerate()
+        {
+            let t = Instant::now();
+            let y = row_of(&app, path);
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, y));
+            let click = t.elapsed();
+            let mut frames = 0;
+            while app.quiet.is_some() {
+                app.poll_jobs();
+                frames += 1;
+            }
+            println!(
+                "{n} {path}: click {click:?}, landed after {frames} polls, {:?} total",
+                t.elapsed()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pinned file already has a tab. Clicking it in the tree opened a
+    /// second one beside it — a peek on a single click, a kept tab on a
+    /// double — so one file sat in the row twice and an edit went into
+    /// whichever of them the reader happened to be looking at.
+    #[test]
+    fn a_pinned_file_opens_its_pin_and_never_a_second_tab() {
+        let dir = std::env::temp_dir().join(format!("loupe-pinned-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = tree_app(&dir);
+        let abs = std::fs::canonicalize(dir.join("src/one.rs")).unwrap();
+        app.pins
+            .add(crate::pins::Pin::new(&app.repo_root, abs))
+            .expect("room for one pin");
+        assert_eq!(app.pins.len(), 1);
+
+        // One click: the pin opens, and the row gains nothing.
+        click_file(&mut app, "src/one.rs");
+        assert_eq!(
+            app.editor.as_ref().map(|e| e.path.as_str()),
+            Some("src/one.rs"),
+            "the file is on screen"
+        );
+        assert_eq!(app.active_pin(), Some(0), "under its own pin tab");
+        assert!(
+            app.buffer_tabs().is_empty(),
+            "and no second tab beside it: {:?}",
+            labels_of(&app.buffer_tabs())
+        );
+        assert_eq!(app.peek_path(), None, "a pinned file is never a peek");
+
+        // A double click has nothing to keep — it is already permanent.
+        let y = row_of(&app, "src/one.rs");
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, y));
+        assert!(
+            app.buffer_tabs().is_empty(),
+            "still one tab for one file: {:?}",
+            labels_of(&app.buffer_tabs())
+        );
+        assert_eq!(app.pins.len(), 1);
+
+        // Unpinning gives the file back its buffer tab rather than
+        // leaving it open with no tab at all.
+        app.pins.remove(0);
+        assert_eq!(labels_of(&app.buffer_tabs()), vec!["one.rs"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The unsaved mark follows the tab the file actually has. Pinning a
+    /// file moves its tab from the buffer row to the pin row, and the
+    /// mark has to move with it or it simply disappears.
+    #[test]
+    fn a_pinned_file_carries_its_unsaved_mark_on_its_pin() {
+        let dir = std::env::temp_dir().join(format!("loupe-pinned-dot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = tree_app(&dir);
+
+        click_file(&mut app, "src/one.rs");
+        app.editor.as_mut().unwrap().dirty = true;
+        assert!(app.buffer_tabs()[0].dirty, "unpinned: the mark is here");
+        assert!(!app.pin_dirty(0), "and there is no pin to carry it");
+
+        let abs = std::fs::canonicalize(dir.join("src/one.rs")).unwrap();
+        app.pins
+            .add(crate::pins::Pin::new(&app.repo_root, abs))
+            .expect("room for one pin");
+        assert!(
+            app.buffer_tabs().is_empty(),
+            "pinned: the buffer tab gives way to the pin"
+        );
+        assert!(app.pin_dirty(0), "and the mark went with it");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ask this whole thing exists for. Walking a tree means opening a
+    /// great many files to look at one of them, so one click opens a tab
+    /// the next click replaces, and a double click keeps it. The reader
+    /// never saves, never closes, and never leaves the editor to do it.
+    #[test]
+    fn one_click_reuses_a_tab_and_a_double_click_keeps_it() {
+        let dir = std::env::temp_dir().join(format!("loupe-tree-tab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = tree_app(&dir);
+
+        click_file(&mut app, "src/one.rs");
+        assert_eq!(
+            app.editor.as_ref().map(|e| e.path.as_str()),
+            Some("src/one.rs"),
+            "one click opened the file"
+        );
+        assert_eq!(app.buffer_tabs().len(), 1, "and made one tab for it");
+        assert_eq!(app.peek_path(), Some("src/one.rs"), "the peek tab");
+
+        // A second file takes that tab over rather than adding to the row.
+        click_file(&mut app, "src/two.rs");
+        assert_eq!(
+            app.editor.as_ref().map(|e| e.path.as_str()),
+            Some("src/two.rs")
+        );
+        let tabs = app.buffer_tabs();
+        assert_eq!(tabs.len(), 1, "still one tab: {:?}", labels_of(&tabs));
+        assert_eq!(tabs[0].label, "two.rs");
+        assert!(tabs[0].peek, "and it is still the peek tab");
+
+        // Double-click keeps it, so the next file gets a tab of its own.
+        let y = row_of(&app, "src/two.rs");
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, y));
+        assert_eq!(app.peek_path(), None, "the double click kept it");
+
+        click_file(&mut app, "docs/plan.md");
+        let tabs = app.buffer_tabs();
+        assert_eq!(
+            labels_of(&tabs),
+            vec!["two.rs", "plan.md"],
+            "the kept tab stayed and the new file got its own"
+        );
+        assert!(!tabs[0].peek, "two.rs is the reader's now");
+        assert!(tabs[1].peek, "plan.md is the one a click replaces");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn labels_of(tabs: &[BufferTab]) -> Vec<String> {
+        tabs.iter().map(|t| t.label.clone()).collect()
+    }
+
+    /// A buffer the reader typed into is theirs. The next click on the
+    /// tree parks it and leaves its tab alone, so unsaved work cannot be
+    /// lost by clicking somewhere else — and the reader never has to save
+    /// to move on.
+    #[test]
+    fn an_edited_tab_is_never_replaced() {
+        let dir = std::env::temp_dir().join(format!("loupe-tree-dirty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = tree_app(&dir);
+
+        click_file(&mut app, "src/one.rs");
+        app.editor.as_mut().unwrap().dirty = true;
+        assert_eq!(
+            app.peek_path(),
+            None,
+            "typing into it kept it, with no second flag to clear"
+        );
+
+        click_file(&mut app, "src/two.rs");
+        let tabs = app.buffer_tabs();
+        assert_eq!(
+            labels_of(&tabs),
+            vec!["one.rs", "two.rs"],
+            "the unsaved file kept its tab"
+        );
+        assert!(tabs[0].dirty, "and the dot that says it is unsaved");
+        assert!(
+            app.buffers().any(|e| e.path == "src/one.rs" && e.dirty),
+            "with the unsaved text still in it"
+        );
+        assert!(
+            !app.status_err,
+            "and nothing asked the reader to save first: {}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file the change touches is still only a file in the Files panel.
+    /// Clicking it opens the file, not its diff — the diff has a panel of
+    /// its own one key away, and a row that means two things depending on
+    /// which panel drew it is a row nobody can predict.
+    #[test]
+    fn a_changed_file_opens_as_a_file_from_the_tree() {
+        let dir = std::env::temp_dir().join(format!("loupe-tree-changed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = tree_app(&dir);
+        app.files = vec![ChangedFile {
+            path: "src/one.rs".into(),
+            status: "modified".into(),
+            additions: 10,
+            deletions: 2,
+            previous: None,
+            conflicted: false,
+        }];
+
+        click_file(&mut app, "src/one.rs");
+        assert_eq!(
+            app.editor.as_ref().map(|e| e.path.as_str()),
+            Some("src/one.rs"),
+            "the file opened"
+        );
+        assert!(app.diff.is_none(), "and no diff was loaded for it");
+        assert_eq!(
+            app.editor.as_ref().unwrap().content(),
+            "fn one() {}\n",
+            "with what is on disk in it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The editor does not lock the file panel. Clicking another file
+    /// parks the buffer on screen and opens the next one, so a reader can
+    /// walk a tree of files without saving, closing, or pressing Esc.
+    #[test]
+    fn the_tree_still_opens_files_with_the_editor_up() {
+        let dir = std::env::temp_dir().join(format!("loupe-tree-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = tree_app(&dir);
+
+        click_file(&mut app, "src/one.rs");
+        app.keep_peek();
+        assert!(app.editor.is_some(), "the editor is up");
+
+        click_file(&mut app, "src/two.rs");
+        assert_eq!(
+            app.editor.as_ref().map(|e| e.path.as_str()),
+            Some("src/two.rs"),
+            "and the panel still switched files under it"
+        );
+        assert!(
+            !app.status_err,
+            "with no “close the editor first”: {}",
+            app.status
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Markdown opens as source from the tree, so it gets a tab like any
+    /// other file. `P` renders it and `P` puts the source back, and the
+    /// tab has to survive the round trip: a document is a rendering of an
+    /// open file, not a different thing, and a tab that came and went
+    /// would be lying about what is open.
+    #[test]
+    fn the_preview_toggle_keeps_the_tab_and_the_buffer() {
+        let dir = std::env::temp_dir().join(format!("loupe-tree-md-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = tree_app(&dir);
+
+        click_file(&mut app, "docs/plan.md");
+        assert_eq!(
+            app.editor.as_ref().map(|e| e.path.as_str()),
+            Some("docs/plan.md"),
+            "the source opened, not the document"
+        );
+        app.editor.as_mut().unwrap().dirty = true;
+
+        app.toggle_preview();
+        assert!(app.previewing(), "P rendered it");
+        let tabs = app.buffer_tabs();
+        assert_eq!(labels_of(&tabs), vec!["plan.md"], "the tab stayed");
+        assert!(tabs[0].active, "and is still the one on screen");
+        assert!(tabs[0].dirty, "still carrying its unsaved mark");
+
+        app.toggle_preview();
+        assert!(!app.previewing(), "P put the source back");
+        assert_eq!(
+            app.editor.as_ref().map(|e| e.path.as_str()),
+            Some("docs/plan.md")
+        );
+        assert!(
+            app.editor.as_ref().unwrap().dirty,
+            "with the unsaved text still in it"
+        );
+        assert_eq!(app.buffer_tabs().len(), 1, "and no second tab for it");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn buf(path: &str) -> Editor {
         Editor::new(path, std::path::PathBuf::from(path), "one\ntwo\n")
     }
@@ -13224,11 +14937,291 @@ b2
             .collect();
 
         for want in [
-            "Ctrl+S", "Ctrl+T", "Alt+F", "Alt+C", "Ctrl+]", "Alt+R", "Ctrl+G", "Alt+S", "Alt+M",
-            "Alt+.", "Alt+]", "Alt+[",
+            "Ctrl+S", "Ctrl+T", "Alt+F", "Alt+C", "F12", "F10", "Ctrl+G", "Alt+S", "F2", "Alt+.",
+            "Alt+]", "Alt+[",
         ] {
             assert!(hints.contains(&want), "☰ has no line for {want}: {hints:?}");
         }
+    }
+
+    /// Typing a name has to offer suggestions on its own. This is the
+    /// whole of "tab completion" from the reader's side: they type, the
+    /// list appears, `Tab` takes one.
+    #[test]
+    fn typing_a_name_asks_for_suggestions_and_a_space_does_not() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.open_buffer(Editor::new(
+            "src/a.rs",
+            "src/a.rs".into(),
+            "let total = cou",
+        ));
+        app.editor.as_mut().unwrap().jump_to_line(1);
+        for _ in 0..15 {
+            app.editor
+                .as_mut()
+                .unwrap()
+                .textarea
+                .move_cursor(tui_textarea::CursorMove::Forward);
+        }
+
+        app.maybe_suggest('u');
+        assert!(
+            app.completion_due.is_some(),
+            "a word character with a name behind it asks"
+        );
+        assert_eq!(
+            app.completion_due.unwrap().1,
+            None,
+            "and it is not a trigger character, so the server is told it was invoked"
+        );
+
+        // A space finishes the word: whatever was pending is stale.
+        app.maybe_suggest(' ');
+        assert!(app.completion_due.is_none(), "a space asks for nothing");
+
+        // A trigger character asks even with no prefix at all — that is
+        // what `object.` is for.
+        app.maybe_suggest('.');
+        assert_eq!(
+            app.completion_due.map(|(_, c)| c),
+            Some(Some('.')),
+            "the dot travels with the request"
+        );
+
+        // Turned off, nothing is ever armed.
+        app.completion_due = None;
+        app.suggest_while_typing = false;
+        app.maybe_suggest('u');
+        assert!(app.completion_due.is_none());
+    }
+
+    /// A popup that is already open is filtered, not re-fetched: the
+    /// list in hand is the server's answer for this word, and narrowing
+    /// it is instant where a round trip is not.
+    #[test]
+    fn an_open_popup_is_not_asked_for_again() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.open_buffer(Editor::new("src/a.rs", "src/a.rs".into(), "cou"));
+        let item = lsp::Completion {
+            label: "count".into(),
+            insert: "count".into(),
+            detail: None,
+            kind: "fn",
+            sort: "count".into(),
+            replace: None,
+        };
+        assert!(app.editor.as_mut().unwrap().open_completion(vec![item]));
+
+        app.maybe_suggest('u');
+        assert!(
+            app.completion_due.is_none(),
+            "the list is already here — filter it"
+        );
+    }
+
+    /// A request the reader asked for says what it is waiting on; one
+    /// that fires on its own while typing says nothing.
+    #[test]
+    fn only_the_requests_you_asked_for_announce_themselves() {
+        assert_eq!(
+            EditorRequest::Definition.waiting_for("parse"),
+            Some("Finding the definition of parse…".into())
+        );
+        assert_eq!(
+            EditorRequest::References.waiting_for("parse"),
+            Some("Finding every use of parse…".into())
+        );
+        assert_eq!(
+            EditorRequest::Complete(None).waiting_for("par"),
+            None,
+            "completion fires while typing — a spinner per character is noise"
+        );
+        assert_eq!(
+            EditorRequest::Definition.waiting_for(""),
+            Some("Finding the definition of…".into()),
+            "no word under the cursor still names the question"
+        );
+    }
+
+    /// The function keys have to reach the language-server calls, in the
+    /// editor and in the diff view. `lsp_enabled = false` makes the call
+    /// answer instantly and say so, which is proof the key arrived
+    /// without starting a real server.
+    #[test]
+    fn the_function_keys_reach_the_language_server_calls() {
+        for code in [KeyCode::F(12), KeyCode::F(10)] {
+            let mut app = App::new(LaunchMode::Local, None);
+            app.screen = Screen::Review;
+            app.lsp_enabled = false;
+            app.open_buffer(buf("src/a.rs"));
+            app.handle_key(key(code));
+            assert!(
+                app.status.contains("Language servers are off"),
+                "{code:?} in the editor went nowhere: {:?}",
+                app.status
+            );
+        }
+        // Shift+F12 is the other way to say F10.
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.lsp_enabled = false;
+        app.open_buffer(buf("src/a.rs"));
+        app.handle_key(KeyEvent::new(KeyCode::F(12), KeyModifiers::SHIFT));
+        assert!(app.status.contains("Language servers are off"));
+    }
+
+    /// A click, then a second on the same cell, then a third: one press
+    /// places the cursor, two take the word, three take the line. A
+    /// fourth starts the count again rather than sticking on three.
+    #[test]
+    fn clicks_on_one_spot_count_up_and_start_again() {
+        let mut app = App::new(LaunchMode::Local, None);
+        assert_eq!(app.click_run(5, 5), 1);
+        assert_eq!(app.click_run(5, 5), 2);
+        assert_eq!(app.click_run(5, 5), 3);
+        assert_eq!(app.click_run(5, 5), 1, "a fourth press starts again");
+        assert_eq!(app.click_run(40, 9), 1, "and so does one somewhere else");
+    }
+
+    /// The right-click menu is about the word under the pointer: the
+    /// lines that need a symbol are live when there is one, and dim
+    /// rather than missing when there is not.
+    #[test]
+    fn the_code_menu_needs_a_word_under_the_pointer() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.open_buffer(buf("src/a.rs"));
+
+        let live = |rows: &[MenuRow], id: ButtonId| {
+            rows.iter()
+                .any(|r| matches!(r, MenuRow::Item(i) if i.id == id && i.enabled))
+        };
+        let on_word = app.editor_menu_rows("count");
+        assert!(live(&on_word, ButtonId::EditorDefinition));
+        assert!(live(&on_word, ButtonId::EditorReferences));
+        assert!(live(&on_word, ButtonId::EditorCopy));
+
+        let on_nothing = app.editor_menu_rows("");
+        assert!(
+            !live(&on_nothing, ButtonId::EditorDefinition),
+            "no symbol, nothing to look up"
+        );
+        assert!(
+            on_nothing
+                .iter()
+                .any(|r| matches!(r, MenuRow::Item(i) if i.id == ButtonId::EditorDefinition)),
+            "the line is still there, so the menu keeps its shape"
+        );
+        assert!(
+            live(&on_nothing, ButtonId::EditorCopy),
+            "copying does not need a symbol"
+        );
+    }
+
+    /// A file with problems lists them, worst line order, and the list is
+    /// the same overlay references use — so Enter goes to the line.
+    #[test]
+    fn the_problem_list_names_every_problem_in_the_file() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        let mut ed = buf("src/a.rs");
+        ed.set_server_diagnostics(vec![
+            lsp::Diagnostic {
+                line: 2,
+                col: 1,
+                end_col: 4,
+                severity: 2,
+                message: "unused".into(),
+                code: None,
+                source: None,
+            },
+            lsp::Diagnostic {
+                line: 1,
+                col: 1,
+                end_col: 4,
+                severity: 1,
+                message: "no such name".into(),
+                code: Some("E0425".into()),
+                source: None,
+            },
+        ]);
+        app.open_buffer(ed);
+        app.open_problems();
+
+        let Overlay::Finder(f) = &app.overlay else {
+            panic!("the problems open the finder");
+        };
+        assert_eq!(f.mode, FinderMode::Problems);
+        assert_eq!(f.rows.len(), 2);
+        assert_eq!(f.rows[0].line, Some(1), "line order, not arrival order");
+        assert!(f.rows[0].text.contains("no such name"));
+        assert!(f.rows[0].text.contains("E0425"), "the code comes too");
+        assert_eq!(f.rows[0].tag, "error");
+        assert_eq!(f.rows[1].tag, "warning");
+        assert!(f.note.contains("1 error"), "{}", f.note);
+    }
+
+    /// The compiler and the linter run on different clocks. One
+    /// answering must never blank the other's underlines, and the merged
+    /// list has to stay in line order whichever lands first.
+    #[test]
+    fn lint_and_compiler_problems_live_side_by_side() {
+        let d = |line, severity, source: &str, message: &str| lsp::Diagnostic {
+            line,
+            col: 1,
+            end_col: 4,
+            severity,
+            message: message.into(),
+            code: None,
+            source: Some(source.into()),
+        };
+        let mut ed = buf("src/a.ts");
+        ed.set_server_diagnostics(vec![d(5, 1, "typescript", "type error")]);
+        ed.set_lint_diagnostics(vec![
+            d(9, 2, "eslint", "unused"),
+            d(2, 2, "eslint", "prefer const"),
+        ]);
+
+        let lines: Vec<usize> = ed.problems().iter().map(|p| p.line).collect();
+        assert_eq!(lines, vec![2, 5, 9], "one list, in line order");
+        assert_eq!(
+            ed.problems().iter().filter(|p| p.is_error()).count(),
+            1,
+            "the compiler's error is still an error"
+        );
+        assert_eq!(
+            ed.problems().iter().filter(|p| p.is_warning()).count(),
+            2,
+            "and the linter's are warnings"
+        );
+
+        // A second lint result replaces only the lint half.
+        ed.set_lint_diagnostics(vec![d(3, 2, "eslint", "something else")]);
+        let lines: Vec<usize> = ed.problems().iter().map(|p| p.line).collect();
+        assert_eq!(
+            lines,
+            vec![3, 5],
+            "the compiler's error survives the linter running again"
+        );
+
+        // And a clean lint run leaves the compiler alone.
+        ed.set_lint_diagnostics(Vec::new());
+        assert_eq!(ed.problems().len(), 1);
+        assert_eq!(ed.problems()[0].source.as_deref(), Some("typescript"));
+    }
+
+    /// Nothing wrong means nothing to list, and the finder does not open
+    /// on an empty list.
+    #[test]
+    fn a_clean_file_opens_no_problem_list() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.open_buffer(buf("src/a.rs"));
+        app.open_problems();
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status_err, "it says so instead: {}", app.status);
     }
 
     /// A read-only buffer came from a commit, not the working tree, so the
@@ -13255,14 +15248,11 @@ b2
             !hints.contains(&"Alt+C"),
             "no commenting a file it cannot write"
         );
-        assert!(!hints.contains(&"Alt+M"), "and no renaming through it");
-        assert!(
-            hints.contains(&"Alt+R"),
-            "but finding every use still works"
-        );
+        assert!(!hints.contains(&"F2"), "and no renaming through it");
+        assert!(hints.contains(&"F10"), "but finding every use still works");
     }
 
-    /// Two buffers both called `mod.rs` name nothing    /// Two buffers both called `mod.rs` name nothing    /// Two buffers both called `mod.rs` name nothing, so a shared name
+    /// Two buffers both called `mod.rs` name nothing, so a shared name
     /// costs both of them their parent directory — the rule the pins
     /// already use.
     #[test]
@@ -13272,7 +15262,7 @@ b2
         app.open_buffer(buf("src/lexer/mod.rs"));
         app.open_buffer(buf("src/main.rs"));
 
-        let labels: Vec<String> = app.buffer_tabs().into_iter().map(|(l, ..)| l).collect();
+        let labels: Vec<String> = app.buffer_tabs().into_iter().map(|t| t.label).collect();
         assert!(labels.iter().any(|l| l == "parser/mod.rs"), "{labels:?}");
         assert!(labels.iter().any(|l| l == "lexer/mod.rs"), "{labels:?}");
         assert!(
@@ -13283,10 +15273,111 @@ b2
         let active: Vec<String> = app
             .buffer_tabs()
             .into_iter()
-            .filter(|(_, _, a)| *a)
-            .map(|(l, ..)| l)
+            .filter(|t| t.active)
+            .map(|t| t.label)
             .collect();
         assert_eq!(active, vec!["main.rs"], "exactly one tab is the open one");
+    }
+
+    /// The row stands still. Clicking along a row of tabs used to move
+    /// each one to the far right as it was opened, because the buffer on
+    /// screen lived in its own field and that field was drawn last — so
+    /// the row reshuffled under the pointer and no tab was ever twice in
+    /// the same place.
+    #[test]
+    fn the_tab_row_keeps_the_order_the_files_were_opened_in() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.open_buffer(buf("a.rs"));
+        app.open_buffer(buf("b.rs"));
+        app.open_buffer(buf("c.rs"));
+        assert_eq!(labels_of(&app.buffer_tabs()), vec!["a.rs", "b.rs", "c.rs"]);
+
+        // Click along the row in every direction. None of it reorders.
+        for path in ["a.rs", "c.rs", "b.rs", "a.rs"] {
+            app.switch_buffer(path);
+            assert_eq!(
+                labels_of(&app.buffer_tabs()),
+                vec!["a.rs", "b.rs", "c.rs"],
+                "opening {path} left the row alone"
+            );
+            let tabs = app.buffer_tabs();
+            let on_screen: Vec<&str> = tabs
+                .iter()
+                .filter(|t| t.active)
+                .map(|t| t.label.as_str())
+                .collect();
+            assert_eq!(on_screen.len(), 1, "exactly one tab is the open one");
+            assert!(
+                path.ends_with(on_screen[0]),
+                "and it is {path}: {on_screen:?}"
+            );
+        }
+
+        // A fourth file joins the end, where a reader looks for the file
+        // they just opened.
+        app.open_buffer(buf("d.rs"));
+        assert_eq!(
+            labels_of(&app.buffer_tabs()),
+            vec!["a.rs", "b.rs", "c.rs", "d.rs"]
+        );
+    }
+
+    /// A drag is the one thing that reorders the row, and it moves the
+    /// tab without changing which file is on screen.
+    #[test]
+    fn dragging_a_tab_moves_it_along_the_row() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.open_buffer(buf("a.rs"));
+        app.open_buffer(buf("b.rs"));
+        app.open_buffer(buf("c.rs"));
+        app.switch_buffer("b.rs");
+
+        // The file on screen, dragged to the front.
+        app.move_buffer(1, 0);
+        assert_eq!(labels_of(&app.buffer_tabs()), vec!["b.rs", "a.rs", "c.rs"]);
+        assert_eq!(
+            app.editor.as_ref().unwrap().path,
+            "b.rs",
+            "a drag reorders the row, it does not change the file"
+        );
+
+        // And a tab that is not on screen, dragged to the end.
+        app.move_buffer(1, 2);
+        assert_eq!(labels_of(&app.buffer_tabs()), vec!["b.rs", "c.rs", "a.rs"]);
+        assert_eq!(app.editor.as_ref().unwrap().path, "b.rs");
+
+        // Out of range does nothing rather than panicking.
+        app.move_buffer(0, 9);
+        assert_eq!(labels_of(&app.buffer_tabs()), vec!["b.rs", "c.rs", "a.rs"]);
+    }
+
+    /// The ✕ shuts one tab. The rest keep their places, and unsaved work
+    /// is asked about once — per tab, so arming one never arms another.
+    #[test]
+    fn the_close_mark_shuts_one_tab_and_asks_about_unsaved_work() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.open_buffer(buf("a.rs"));
+        app.open_buffer(buf("b.rs"));
+        app.open_buffer(buf("c.rs"));
+        app.switch_buffer("c.rs");
+
+        // The middle tab, which nobody is looking at.
+        app.close_buffer_at(1);
+        assert_eq!(labels_of(&app.buffer_tabs()), vec!["a.rs", "c.rs"]);
+        assert_eq!(
+            app.editor.as_ref().unwrap().path,
+            "c.rs",
+            "closing another tab did not change the file on screen"
+        );
+
+        // An unsaved one asks first, then goes on the second press.
+        app.switch_buffer("c.rs");
+        app.parked[0].dirty = true;
+        app.close_buffer_at(0);
+        assert!(app.status_err, "it asked: {}", app.status);
+        assert_eq!(app.buffer_tabs().len(), 2, "and kept the file");
+        app.close_buffer_at(0);
+        assert_eq!(labels_of(&app.buffer_tabs()), vec!["c.rs"], "then took it");
     }
 
     /// Stepping wraps, and lands on the buffer the tab row shows in that
@@ -13297,7 +15388,7 @@ b2
         app.open_buffer(buf("a.rs"));
         app.open_buffer(buf("b.rs"));
         app.open_buffer(buf("c.rs"));
-        let order: Vec<String> = app.buffer_tabs().iter().map(|(l, ..)| l.clone()).collect();
+        let order: Vec<String> = app.buffer_tabs().iter().map(|t| t.label.clone()).collect();
 
         let active = |app: &App| app.editor.as_ref().unwrap().path.clone();
         assert_eq!(active(&app), "c.rs");
@@ -13312,7 +15403,7 @@ b2
         assert_eq!(active(&app), "c.rs", "and back again");
     }
 
-    /// `q` used to be one keypress from gone.    /// `q` used to be one keypress from gone. One buffer guarded itself
+    /// `q` used to be one keypress from gone. One buffer guarded itself
     /// with Esc-then-Esc, but `q` reaches past that, and with several
     /// buffers open it could take unsaved work in files that were not even
     /// on screen.
@@ -15131,7 +17222,7 @@ b2
         app
     }
 
-    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    pub fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind,
             column,
@@ -15511,6 +17602,7 @@ b2
         let diff_before = app.display.len();
 
         app.apply_external(ExternalFile {
+            peek: false,
             path: "vendor/untouched.ts".into(),
             abs_path: "/repo/vendor/untouched.ts".into(),
             content: "one\ntwo\nthree\nfour\n".into(),
@@ -15543,6 +17635,7 @@ b2
     fn a_file_from_a_commit_opens_read_only() {
         let mut app = folded_app();
         app.apply_external(ExternalFile {
+            peek: false,
             path: "vendor/x.ts".into(),
             abs_path: "/repo/vendor/x.ts".into(),
             content: "one\n".into(),

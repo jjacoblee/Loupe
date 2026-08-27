@@ -13,11 +13,10 @@
 //! until the running state converges with the cached suffix — one or two
 //! lines for typical typing.
 //!
-//! Syntaxes and theme come from `two-face` (the extended set that `bat`
-//! ships): unlike syntect's stock set it covers TypeScript/TSX, TOML,
-//! Dockerfile, and friends, and its One Half Dark theme matches the vivid
-//! Atom/VS Code-style editor colors — stock syntect only has muted base16
-//! themes, which read as near-white in a terminal.
+//! Syntaxes and theme come from `two-face`: unlike syntect's stock set it
+//! covers TypeScript/TSX, TOML, Dockerfile, and friends, and its One Half
+//! Dark theme is vivid enough to read on a terminal — stock syntect only
+//! has muted base16 themes, which come out near-white.
 
 use crate::theme::Appearance;
 use ratatui::style::Color;

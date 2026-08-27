@@ -116,6 +116,18 @@ pub struct Palette {
     /// …and one that did not.
     pub err: Color,
 
+    /// A language server's or linter's warning: the gutter mark, the
+    /// underline, and the message.
+    ///
+    /// Its own color rather than a borrowed one. `stage_partial` is the
+    /// same amber and was doing this job, but it means "staged, then
+    /// edited again" — and a reader who has learned that mark should not
+    /// have to unlearn it to read a warning.
+    pub warn: Color,
+    /// A hint or an informational note — the third and fourth severities,
+    /// which are advice rather than a problem.
+    pub hint: Color,
+
     /// Merge conflicts: the warning icon and the file name in the panel,
     /// the ⚑ in the change bar, and the panel border while any file is
     /// conflicted. One strong color, used nowhere else, so a conflict is
@@ -137,6 +149,16 @@ pub struct Palette {
     pub btn_fg: Color,
     pub btn_active_bg: Color,
     pub btn_active_fg: Color,
+    /// The ● on a tab holding unsaved work.
+    ///
+    /// Two colors because the tab has two backgrounds, and one color
+    /// cannot read on both: the row's own grey and the selected tab's
+    /// saturated blue are at opposite ends of the scale. One color made
+    /// the mark vanish on whichever tab the reader had selected — which
+    /// is the tab they are typing into, and so the one the mark is most
+    /// needed on.
+    pub tab_dirty: Color,
+    pub tab_dirty_active: Color,
     /// The "PR #N" badge in the review top bar.
     pub badge_pr: Color,
     /// …and the "⎇ LOCAL" one.
@@ -200,6 +222,8 @@ pub const DARK: Palette = Palette {
     key: Color::Rgb(150, 200, 255),
     ok: Color::Rgb(140, 200, 140),
     err: Color::Rgb(255, 140, 140),
+    warn: Color::Rgb(240, 200, 110),
+    hint: Color::Rgb(140, 180, 210),
 
     conflict: Color::Rgb(255, 150, 90),
     badge_conflict: Color::Rgb(150, 60, 20),
@@ -215,6 +239,8 @@ pub const DARK: Palette = Palette {
     btn_fg: Color::Gray,
     btn_active_bg: Color::Rgb(30, 90, 160),
     btn_active_fg: Color::White,
+    tab_dirty: Color::Rgb(230, 190, 100),
+    tab_dirty_active: Color::Rgb(255, 214, 120),
     badge_pr: Color::Rgb(90, 50, 140),
     badge_local: Color::Rgb(20, 95, 55),
     badge_fg: Color::White,
@@ -238,8 +264,8 @@ pub const DARK: Palette = Palette {
     blame_mine: Color::Rgb(190, 210, 255),
 };
 
-/// For a light terminal background. The diff tints are close to what GitHub
-/// and VS Code use on white — light enough that dark syntax colors stay
+/// For a light terminal background. The diff tints are picked against two
+/// constraints at once: light enough that dark syntax colors stay
 /// readable on top of them, saturated enough to tell added from removed at
 /// a glance.
 pub const LIGHT: Palette = Palette {
@@ -267,6 +293,8 @@ pub const LIGHT: Palette = Palette {
     key: Color::Rgb(30, 88, 170),
     ok: Color::Rgb(22, 106, 58),
     err: Color::Rgb(176, 32, 42),
+    warn: Color::Rgb(146, 94, 6),
+    hint: Color::Rgb(38, 92, 140),
 
     conflict: Color::Rgb(190, 74, 10),
     badge_conflict: Color::Rgb(168, 68, 12),
@@ -282,6 +310,8 @@ pub const LIGHT: Palette = Palette {
     btn_fg: Color::Rgb(58, 63, 72),
     btn_active_bg: Color::Rgb(28, 100, 188),
     btn_active_fg: Color::Rgb(255, 255, 255),
+    tab_dirty: Color::Rgb(150, 100, 8),
+    tab_dirty_active: Color::Rgb(255, 205, 90),
     badge_pr: Color::Rgb(106, 66, 162),
     badge_local: Color::Rgb(24, 116, 68),
     badge_fg: Color::Rgb(255, 255, 255),
@@ -735,6 +765,7 @@ mod tests {
             ("checkbox", p.checkbox),
             ("accent", p.accent),
             ("btn_fg", p.btn_fg),
+            ("tab_dirty", p.tab_dirty),
         ] {
             match c {
                 Color::Rgb(r, g, b) => assert!(

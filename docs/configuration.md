@@ -246,6 +246,82 @@ a file in the middle of a review would add changes to the diff that
 nobody asked for. `Ctrl+T` (or the `⇥ Format` button) formats on demand
 whatever this is set to, and `Ctrl+Z` undoes a format in one keystroke.
 
+### `suggest_while_typing` — the completion popup opens on its own
+
+```toml
+suggest_while_typing = true   # the default
+```
+
+With this on, the popup appears as you type a name — after one character
+of a word, and after a character the language server itself asks to be
+told about. That second rule is what makes `object.` in TypeScript list
+the object's fields rather than everything in scope: Loupe reads the
+trigger characters from the server and tells it which one asked.
+
+`Tab` or `Enter` takes the highlighted suggestion, `↑` and `↓` move, and
+`Esc` puts it away. Typing narrows the list without another round trip.
+
+Set it to `false` and suggestions only appear on `Ctrl+Space`.
+
+### `linters` — lint errors and warnings beside the compiler's
+
+```toml
+linters = true   # the default
+```
+
+A language server knows whether the code compiles. A linter knows whether
+it is any good — an unused import, a `==` that should be `===`, a rule
+the project agreed on. With this on, Loupe runs one over the buffer as
+you edit and draws what it says alongside the language server's
+diagnostics: errors red, warnings yellow, with the tool named on each
+message (`eslint(no-undef)`, `typescript(2552)`).
+
+| Linter | Files |
+| --- | --- |
+| `eslint` | `.js` `.jsx` `.mjs` `.cjs` `.ts` `.tsx` `.mts` `.cts` |
+| `ruff` | `.py` `.pyi` |
+
+The project's own copy in `node_modules/.bin` is preferred over anything
+on your `PATH`, because a JavaScript project pins its linter and its
+plugins and that is the version whose rules the repository agreed on.
+
+The buffer goes to the linter on standard input, so what you see is the
+lint for what is on screen rather than for what is on disk. It runs when
+typing pauses and never blocks the editor: a linter that hangs costs a
+missing underline, not a frozen window.
+
+A linter you do not have installed costs nothing and is not an error.
+`loupe --lsp` lists what it found.
+
+### `[[linter]]` — a linter Loupe does not know
+
+```toml
+[[linter]]
+name = "biome"
+extensions = ["ts", "tsx", "js", "jsx"]
+command = "biome"
+args = ["lint", "--reporter=json"]
+format = "eslint"
+```
+
+| Key | Meaning |
+| --- | --- |
+| `name` | What to call it, in messages and in each diagnostic's source |
+| `extensions` | File extensions it handles, without the dot |
+| `command` | The program to run |
+| `args` | Everything before the file name; Loupe adds the stdin flags itself |
+| `format` | Which JSON shape it prints: `"eslint"` or `"ruff"` |
+
+The command has to accept the file on standard input. `format` says how
+to read what it prints back:
+
+- `"eslint"` — `[{ "messages": [{ "ruleId", "severity", "message", "line", "column", … }] }]`
+- `"ruff"` — `[{ "code", "message", "location": { "row", "column" }, … }]`
+
+A `name` a built-in linter already uses is replaced by the one configured
+here. As with `[[server]]`, the nearer config file replaces the whole
+list rather than adding to it.
+
 ### `auto_refresh` — re-scan local changes while you sit idle
 
 ```toml

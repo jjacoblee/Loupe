@@ -42,9 +42,24 @@ pub struct Editor {
     dragging: bool,
     /// Incremental syntax highlighting for the buffer.
     hl: EditorHighlight,
-    /// What the language server says is wrong with the buffer, refreshed
-    /// as its notifications arrive.
-    pub diagnostics: Vec<Diagnostic>,
+    /// Everything wrong with the buffer, from every tool that has an
+    /// opinion, in line order and worst-first on each line.
+    ///
+    /// Private, and read through [`Editor::problems`]. It is a merge of
+    /// the two sources below and its *order* is an invariant four
+    /// readers depend on — the gutter mark, the margin note, the status
+    /// bar and `F8` all ask for "the worst one here" and have to get the
+    /// same answer. A field anyone could assign to is a field where that
+    /// order quietly stops holding.
+    diagnostics: Vec<Diagnostic>,
+    /// What the language server says, refreshed as its notifications
+    /// arrive.
+    server_diagnostics: Vec<Diagnostic>,
+    /// What the linter says, refreshed when it finishes a run. Kept
+    /// apart from the server's so that one arriving never wipes the
+    /// other: they run on different clocks, and a lint result landing
+    /// must not blank the compiler's errors for a frame.
+    lint_diagnostics: Vec<Diagnostic>,
     /// The completion popup, when one is open.
     pub completion: Option<CompletionState>,
     /// Hash of the text last handed to the language server, so an idle
@@ -200,13 +215,29 @@ impl CompletionState {
     /// nothing matches any more, which is the popup's cue to close.
     fn refilter(&mut self, prefix: &str) -> bool {
         let needle = prefix.to_lowercase();
-        self.shown = self
-            .all
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| needle.is_empty() || c.label.to_lowercase().starts_with(&needle))
-            .map(|(i, _)| i)
-            .collect();
+        if needle.is_empty() {
+            self.shown = (0..self.all.len()).collect();
+            self.sel = 0;
+            self.scroll = 0;
+            return !self.shown.is_empty();
+        }
+        // Two passes, and the order between them is the point: a label
+        // that *starts* with what has been typed is what was meant, and
+        // has to sit above one that merely contains those letters in
+        // order. Within each pass the server's own ranking is kept —
+        // it knows which member you probably wanted.
+        let mut starts = Vec::new();
+        let mut loose = Vec::new();
+        for (i, c) in self.all.iter().enumerate() {
+            let label = c.label.to_lowercase();
+            if label.starts_with(&needle) {
+                starts.push(i);
+            } else if subsequence(&label, &needle) {
+                loose.push(i);
+            }
+        }
+        starts.append(&mut loose);
+        self.shown = starts;
         self.sel = 0;
         self.scroll = 0;
         !self.shown.is_empty()
@@ -248,9 +279,118 @@ pub fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
     lines.join("\n")
 }
 
+/// Blank columns between the end of the code and the message in the
+/// margin, so the two never read as one line of text.
+const MARGIN_GAP: usize = 4;
+/// The narrowest margin note worth drawing. Below this the reader gets a
+/// truncated word and no information.
+const MARGIN_MIN: usize = 24;
+
+/// A diagnostic message flattened to one line, for the margin and the
+/// status bar. Servers send newlines and runs of spaces inside a single
+/// message; both would break the row.
+pub fn one_line(message: &str) -> String {
+    let mut out = String::new();
+    let mut gap = false;
+    for ch in message.chars() {
+        if ch.is_whitespace() {
+            gap = !out.is_empty();
+            continue;
+        }
+        if gap {
+            out.push(' ');
+            gap = false;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// The color for one problem's severity: red for an error, yellow for a
+/// warning, blue for a note. One place, so the gutter mark, the
+/// underline, the margin and the message can never disagree about how
+/// bad something is.
+pub fn diagnostic_color(d: &Diagnostic) -> Color {
+    let p = palette();
+    match d.severity {
+        1 => p.err,
+        2 => p.warn,
+        _ => p.hint,
+    }
+}
+
+/// Whether every character of `needle` appears in `hay`, in order.
+///
+/// The forgiving half of matching a suggestion list: `frstnm` should
+/// still find `firstName` after a typo, rather than closing the popup
+/// and taking the server's answer with it.
+fn subsequence(hay: &str, needle: &str) -> bool {
+    let mut chars = hay.chars();
+    needle.chars().all(|n| chars.any(|h| h == n))
+}
+
 /// Characters that are part of an identifier being completed.
-fn is_word(c: char) -> bool {
+pub fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// The char range of the identifier at `col` on `line`, if there is one.
+///
+/// One rule, in one place: the cursor, a double click and the
+/// other-uses highlight all have to agree on where a word starts and
+/// stops, or the thing that gets selected is not the thing that gets
+/// looked up.
+fn word_range(line: &str, col: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    // Sitting just past the end of a word counts as being in it.
+    let at = col.min(chars.len().saturating_sub(1));
+    let at = if !is_word(chars[at]) && at > 0 && is_word(chars[at - 1]) {
+        at - 1
+    } else {
+        at
+    };
+    if !is_word(chars[at]) {
+        return None;
+    }
+    let start = chars[..at]
+        .iter()
+        .rposition(|c| !is_word(*c))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let end = chars[at..]
+        .iter()
+        .position(|c| !is_word(*c))
+        .map(|i| at + i)
+        .unwrap_or(chars.len());
+    Some((start, end))
+}
+
+/// Every whole-word occurrence of `word` in `line`, as char ranges.
+///
+/// Whole-word: `set` must not light up the middle of `offset`. The
+/// scan is by character rather than by byte, because the ranges are
+/// compared against character columns when the row is drawn.
+fn word_occurrences(line: &str, word: &str) -> Vec<(usize, usize)> {
+    let hay: Vec<char> = line.chars().collect();
+    let needle: Vec<char> = word.chars().collect();
+    if needle.is_empty() || hay.len() < needle.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for i in 0..=hay.len() - needle.len() {
+        if hay[i..i + needle.len()] != needle[..] {
+            continue;
+        }
+        let before_ok = i == 0 || !is_word(hay[i - 1]);
+        let after_ok = i + needle.len() == hay.len() || !is_word(hay[i + needle.len()]);
+        if before_ok && after_ok {
+            out.push((i, i + needle.len()));
+        }
+    }
+    out
 }
 
 /// Clip to `width` columns and pad out to it.
@@ -311,6 +451,8 @@ impl Editor {
             dragging: false,
             hl,
             diagnostics: Vec::new(),
+            server_diagnostics: Vec::new(),
+            lint_diagnostics: Vec::new(),
             completion: None,
             synced: 0,
             pre_format: None,
@@ -330,34 +472,108 @@ impl Editor {
     /// a definition lookup is about, and what the message names.
     pub fn word_at_cursor(&self) -> String {
         let (row, col) = self.textarea.cursor();
+        self.word_at(row, col)
+    }
+
+    /// The identifier at a buffer position, or an empty string.
+    pub fn word_at(&self, row: usize, col: usize) -> String {
         let Some(line) = self.textarea.lines().get(row) else {
             return String::new();
         };
-        let chars: Vec<char> = line.chars().collect();
-        if chars.is_empty() {
-            return String::new();
+        match word_range(line, col) {
+            Some((a, b)) => line.chars().skip(a).take(b - a).collect(),
+            None => String::new(),
         }
-        // Sitting just past the end of a word counts as being in it.
-        let at = col.min(chars.len().saturating_sub(1));
-        let at = if !is_word(chars[at]) && at > 0 && is_word(chars[at - 1]) {
-            at - 1
-        } else {
-            at
-        };
-        if !is_word(chars[at]) {
-            return String::new();
-        }
-        let start = chars[..at]
-            .iter()
-            .rposition(|c| !is_word(*c))
-            .map(|i| i + 1)
+    }
+
+    /// Select the whole identifier at a buffer position and leave the
+    /// cursor on its end. Returns the word, or `None` when nothing but
+    /// punctuation is there.
+    ///
+    /// The cursor lands *after* the last character rather than inside
+    /// the word, because that is where a drag would leave it. Sitting
+    /// just past a word still counts as being in it, so `F12` right
+    /// after a double click asks about the word that is lit up.
+    pub fn select_word_at(&mut self, row: usize, col: usize) -> Option<String> {
+        let line = self.textarea.lines().get(row)?.clone();
+        let (start, end) = word_range(&line, col)?;
+        self.textarea.cancel_selection();
+        self.jump(row, start);
+        self.textarea.start_selection();
+        self.jump(row, end);
+        Some(line.chars().skip(start).take(end - start).collect())
+    }
+
+    /// Select one whole line, the way a third click does.
+    pub fn select_line_at(&mut self, row: usize) {
+        let len = self
+            .textarea
+            .lines()
+            .get(row)
+            .map(|l| l.chars().count())
             .unwrap_or(0);
-        let end = chars[at..]
-            .iter()
-            .position(|c| !is_word(*c))
-            .map(|i| at + i)
-            .unwrap_or(chars.len());
-        chars[start..end].iter().collect()
+        self.textarea.cancel_selection();
+        self.jump(row, 0);
+        self.textarea.start_selection();
+        self.jump(row, len);
+    }
+
+    /// Drop any selection and put the cursor at a buffer position.
+    /// `CursorMove::Jump` counts in `u16`, so a line longer than 65535
+    /// characters is clamped rather than wrapped.
+    fn jump(&mut self, row: usize, col: usize) {
+        self.textarea.move_cursor(CursorMove::Jump(
+            row.min(u16::MAX as usize) as u16,
+            col.min(u16::MAX as usize) as u16,
+        ));
+    }
+
+    /// The word the selection covers, when the selection is exactly one
+    /// identifier on one line. Every other place that word appears is
+    /// marked while it holds — the reason a double click is how you ask
+    /// "where else is this?" before you ask the language server.
+    pub fn selected_word(&self) -> Option<String> {
+        let ((sr, sc), (er, ec)) = self.textarea.selection_range()?;
+        if sr != er || ec <= sc {
+            return None;
+        }
+        let line = self.textarea.lines().get(sr)?;
+        let (a, b) = word_range(line, sc)?;
+        if (a, b) != (sc, ec) {
+            return None;
+        }
+        Some(line.chars().skip(a).take(b - a).collect())
+    }
+
+    /// Problems in the file, worst-first on each line and in line order —
+    /// the order the problem list shows them in, and the order `F8` walks.
+    pub fn problems(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    /// Put the cursor on the next problem in `delta` direction, wrapping
+    /// at the ends. Returns the problem it landed on, or `None` when the
+    /// file is clean.
+    pub fn step_problem(&mut self, delta: i32) -> Option<Diagnostic> {
+        let (line, col) = self.cursor_pos();
+        let all: Vec<Diagnostic> = self.problems().to_vec();
+        if all.is_empty() {
+            return None;
+        }
+        let next = if delta >= 0 {
+            all.iter()
+                .find(|d| (d.line, d.col) > (line, col))
+                .or_else(|| all.first())
+        } else {
+            all.iter()
+                .rev()
+                .find(|d| (d.line, d.col) < (line, col))
+                .or_else(|| all.last())
+        }?
+        .clone();
+        self.textarea.cancel_selection();
+        self.jump(next.line.saturating_sub(1), next.col.saturating_sub(1));
+        Some(next)
     }
 
     /// The identifier being typed, immediately before the cursor.
@@ -373,6 +589,48 @@ impl Editor {
             .map(|i| i + 1)
             .unwrap_or(0);
         chars[start..].iter().collect()
+    }
+
+    /// Take the language server's answer. Returns true when it changed
+    /// anything, so a caller can skip a redraw.
+    pub fn set_server_diagnostics(&mut self, list: Vec<Diagnostic>) -> bool {
+        if self.server_diagnostics == list {
+            return false;
+        }
+        self.server_diagnostics = list;
+        self.remerge();
+        true
+    }
+
+    /// Take the linter's answer.
+    pub fn set_lint_diagnostics(&mut self, list: Vec<Diagnostic>) -> bool {
+        if self.lint_diagnostics == list {
+            return false;
+        }
+        self.lint_diagnostics = list;
+        self.remerge();
+        true
+    }
+
+    /// Rebuild the merged list: both sources, in line order, worst first
+    /// on each line.
+    ///
+    /// Sorted here rather than at every reader, because four of them —
+    /// the gutter, the margin, the status bar and `F8` — all have to
+    /// agree on which problem a line's "worst" is.
+    fn remerge(&mut self) {
+        let mut all: Vec<Diagnostic> = self
+            .server_diagnostics
+            .iter()
+            .chain(self.lint_diagnostics.iter())
+            .cloned()
+            .collect();
+        all.sort_by(|a, b| {
+            (a.line, a.col, a.severity)
+                .cmp(&(b.line, b.col, b.severity))
+                .then_with(|| a.message.cmp(&b.message))
+        });
+        self.diagnostics = all;
     }
 
     /// Diagnostics that touch the cursor line, worst first.
@@ -943,13 +1201,16 @@ impl Editor {
         self.hl.update(self.textarea.lines());
 
         let n_lines = self.textarea.lines().len();
+        // Worked out once per frame rather than once per row: the answer
+        // is the same for every row on screen.
+        let sel_word = self.selected_word();
         let mut out: Vec<Line> = Vec::with_capacity(self.inner.height as usize);
         for vis in 0..self.inner.height as usize {
             let row = self.top.0 as usize + vis;
             if row >= n_lines {
                 out.push(Line::default());
             } else {
-                out.push(self.render_row(row, cur_row, cur_col));
+                out.push(self.render_row(row, cur_row, cur_col, sel_word.as_deref()));
             }
         }
         f.render_widget(Paragraph::new(out), self.inner);
@@ -1048,7 +1309,13 @@ impl Editor {
         f.render_widget(Paragraph::new(lines), area);
     }
 
-    fn render_row(&self, row: usize, cur_row: usize, cur_col: usize) -> Line<'static> {
+    fn render_row(
+        &self,
+        row: usize,
+        cur_row: usize,
+        cur_col: usize,
+        sel_word: Option<&str>,
+    ) -> Line<'static> {
         let p = palette();
         let text = &self.textarea.lines()[row];
         let sel = self.textarea.selection_range();
@@ -1088,6 +1355,13 @@ impl Editor {
             .map(|(_, a, b)| (*a, *b))
             .collect();
         let current = self.find.current().filter(|(r, ..)| *r == row);
+        // The other places the selected word appears, marked the way an
+        // editor marks them after a double click. Skipped when nothing is
+        // selected, so an ordinary cursor lights nothing up.
+        let others: Vec<(usize, usize)> = match sel_word {
+            Some(w) => word_occurrences(text, w),
+            None => Vec::new(),
+        };
         let match_style = |ci: usize| -> Option<Style> {
             if !here.iter().any(|(a, b)| ci >= *a && ci < *b) {
                 return None;
@@ -1117,15 +1391,20 @@ impl Editor {
             cells.push((ch, Style::default().fg(p.gutter)));
         }
         match worst {
-            Some(d) if d.is_error() => {
-                cells.push(('●', Style::default().fg(p.err).add_modifier(Modifier::BOLD)))
-            }
-            Some(_) => cells.push(('▲', Style::default().fg(p.stage_partial))),
+            Some(d) => cells.push((
+                d.mark(),
+                Style::default()
+                    .fg(diagnostic_color(d))
+                    .add_modifier(Modifier::BOLD),
+            )),
             None => cells.push((' ', Style::default().fg(p.gutter))),
         }
         let mut disp = 0usize;
-        // Columns the diagnostic actually covers, so a squiggle marks the
-        // expression rather than the whole line.
+        // Columns the diagnostic actually covers, so the underline marks
+        // the expression rather than the whole line. A zero-width span —
+        // TypeScript reports one for "not assignable" — still covers the
+        // character it points at, because an underline under nothing is
+        // an underline nobody sees.
         let bad = worst.map(|d| {
             (
                 crate::lsp::char_column(text, d.col.saturating_sub(1)),
@@ -1136,20 +1415,29 @@ impl Editor {
                 },
             )
         });
+        let bad_color = worst.map(diagnostic_color);
         for (ci, ch) in text.chars().enumerate() {
             let fg = char_colors.get(ci).copied().unwrap_or(p.code);
             let mut st = Style::default().fg(fg);
             if bad.is_some_and(|(a, b)| ci >= a && ci < b.max(a + 1)) {
-                st = st.fg(if worst.is_some_and(|d| d.is_error()) {
-                    p.err
-                } else {
-                    p.stage_partial
-                });
+                // Colored *and* underlined. Color alone is the one thing
+                // a reader with a color-vision difference cannot use, and
+                // an editor that only says "this is wrong" in red says it
+                // to some people and not others.
+                st = st
+                    .fg(bad_color.unwrap_or(p.err))
+                    .add_modifier(Modifier::UNDERLINED);
             }
             // The matched pair, under the search colors: a bracket that is
             // also a search hit is a search hit first.
             if is_bracket(ci) {
                 st = st.fg(p.accent).add_modifier(Modifier::BOLD);
+            }
+            // Another use of the selected word. Under the search colors
+            // and under the selection itself: the word the reader is
+            // standing on has to keep looking selected.
+            if others.iter().any(|(a, b)| ci >= *a && ci < *b) {
+                st = st.bg(p.matched);
             }
             // A search match, under a live selection: dragging over a
             // match should still look like dragging.
@@ -1183,6 +1471,35 @@ impl Editor {
                 ' ',
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::UNDERLINED),
             ));
+        }
+
+        // The message itself, in the margin past the end of the line.
+        //
+        // A mark in the gutter says *that* something is wrong; this says
+        // *what*, without moving the cursor to the line to find out. Only
+        // when there is real room for it: a note squeezed into six
+        // columns is worse than no note, and the code has to stay
+        // readable — it is the thing being edited.
+        if let Some(d) = worst {
+            let used: usize = cells.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
+            let room = (width + skip).saturating_sub(used + MARGIN_GAP);
+            if room >= MARGIN_MIN {
+                let note = format!("{} {}", d.mark(), one_line(&d.message));
+                let style = Style::default().fg(diagnostic_color(d));
+                for _ in 0..MARGIN_GAP {
+                    cells.push((' ', style));
+                }
+                let mut w = 0usize;
+                for ch in note.chars() {
+                    let cw = ch.width().unwrap_or(0);
+                    if w + cw > room {
+                        cells.push(('…', style));
+                        break;
+                    }
+                    cells.push((ch, style));
+                    w += cw;
+                }
+            }
         }
 
         // Clip: skip `skip` display columns, keep `width`. Consecutive
@@ -1252,6 +1569,16 @@ impl Editor {
         Some((row, col as u16))
     }
 
+    /// Whether a screen cell is inside the editor surface. The
+    /// right-click menu needs to know before it decides to open, and
+    /// `hit` clamps rather than refuses.
+    pub fn contains(&self, x: u16, y: u16) -> bool {
+        x >= self.inner.x
+            && y >= self.inner.y
+            && x < self.inner.x + self.inner.width
+            && y < self.inner.y + self.inner.height
+    }
+
     pub fn on_click(&mut self, x: u16, y: u16) -> bool {
         if let Some((row, col)) = self.hit(x, y) {
             self.textarea.cancel_selection();
@@ -1261,6 +1588,58 @@ impl Editor {
         } else {
             false
         }
+    }
+
+    /// A second click on the same cell takes the whole word. Returns the
+    /// word, or `None` when the pointer is off the surface or on
+    /// punctuation.
+    ///
+    /// The drag is cancelled: the press that starts a double click has
+    /// already armed one, and moving the mouse afterwards must not throw
+    /// the word away.
+    pub fn on_double_click(&mut self, x: u16, y: u16) -> Option<String> {
+        let (row, col) = self.hit(x, y)?;
+        self.dragging = false;
+        self.select_word_at(row as usize, col as usize)
+    }
+
+    /// A third click takes the whole line.
+    pub fn on_triple_click(&mut self, x: u16, y: u16) -> bool {
+        let Some((row, _)) = self.hit(x, y) else {
+            return false;
+        };
+        self.dragging = false;
+        self.select_line_at(row as usize);
+        true
+    }
+
+    /// A right click: put the cursor under the pointer and take the word
+    /// there, so the menu that follows is about what was clicked. A click
+    /// inside a live selection keeps that selection instead — the reader
+    /// selected it on purpose.
+    ///
+    /// Returns false when the pointer is not on the editor surface, and
+    /// the caller leaves the menu closed.
+    pub fn on_right_click(&mut self, x: u16, y: u16) -> bool {
+        if !self.contains(x, y) {
+            return false;
+        }
+        let Some((row, col)) = self.hit(x, y) else {
+            return false;
+        };
+        self.dragging = false;
+        let inside = match self.textarea.selection_range() {
+            Some((start, end)) => {
+                let at = (row as usize, col as usize);
+                at >= start && at < end
+            }
+            None => false,
+        };
+        if !inside && self.select_word_at(row as usize, col as usize).is_none() {
+            self.textarea.cancel_selection();
+            self.textarea.move_cursor(CursorMove::Jump(row, col));
+        }
+        true
     }
 
     pub fn on_drag(&mut self, x: u16, y: u16) {
@@ -1653,6 +2032,98 @@ mod tests {
         assert_eq!(c.sel, 0);
     }
 
+    /// A double click takes the whole identifier, wherever in it the
+    /// pointer landed, and leaves the cursor where the lookup keys still
+    /// see the word.
+    #[test]
+    fn a_double_click_takes_the_whole_word() {
+        let mut e = ed("let total = count_items(list);\n");
+        // In the middle of `count_items`.
+        let word = e.select_word_at(0, 16).expect("a word is there");
+        assert_eq!(word, "count_items");
+        assert_eq!(e.textarea.selection_range(), Some(((0, 12), (0, 23))));
+        assert_eq!(
+            e.word_at_cursor(),
+            "count_items",
+            "the cursor sits past the word, and that still counts as in it"
+        );
+        assert_eq!(e.selected_word().as_deref(), Some("count_items"));
+    }
+
+    /// Punctuation is not a word, and a click on it selects nothing
+    /// rather than the thing beside it.
+    #[test]
+    fn a_double_click_on_punctuation_selects_nothing() {
+        let mut e = ed("a + b\n");
+        assert_eq!(e.select_word_at(0, 2), None);
+    }
+
+    /// A third click takes the line.
+    #[test]
+    fn a_triple_click_takes_the_line() {
+        let mut e = ed("first line\nsecond line\n");
+        e.select_line_at(1);
+        assert_eq!(e.textarea.selection_range(), Some(((1, 0), (1, 11))));
+        assert_eq!(
+            e.selected_word(),
+            None,
+            "a whole line is not one identifier, so nothing else lights up"
+        );
+    }
+
+    /// The other-uses highlight is whole-word: `set` must not light up
+    /// the middle of `offset`.
+    #[test]
+    fn other_uses_are_whole_words_only() {
+        assert_eq!(
+            word_occurrences("set offset set_x set", "set"),
+            vec![(0, 3), (17, 20)]
+        );
+        assert_eq!(word_occurrences("none here", "set"), vec![]);
+    }
+
+    /// `F8` walks the problems in order and wraps round the end.
+    #[test]
+    fn stepping_the_problems_wraps_at_the_ends() {
+        let mut e = ed("one\ntwo\nthree\nfour\n");
+        e.set_server_diagnostics(vec![diag(4, 2), diag(2, 1)]);
+        e.jump_to_line(1);
+
+        assert_eq!(e.step_problem(1).map(|d| d.line), Some(2));
+        assert_eq!(e.step_problem(1).map(|d| d.line), Some(4));
+        assert_eq!(
+            e.step_problem(1).map(|d| d.line),
+            Some(2),
+            "past the last one comes back to the first"
+        );
+        assert_eq!(
+            e.step_problem(-1).map(|d| d.line),
+            Some(4),
+            "and back past the first goes to the last"
+        );
+        assert_eq!(e.cursor_pos(), (4, 2), "the cursor lands on the problem");
+    }
+
+    /// A clean file has nothing to step to, and says so by answering
+    /// `None` rather than by moving the cursor.
+    #[test]
+    fn a_clean_file_has_no_next_problem() {
+        let mut e = ed("one\ntwo\n");
+        assert!(e.step_problem(1).is_none());
+    }
+
+    fn diag(line: usize, col: usize) -> Diagnostic {
+        Diagnostic {
+            line,
+            col,
+            end_col: col + 1,
+            severity: 1,
+            message: format!("wrong on line {line}"),
+            code: None,
+            source: None,
+        }
+    }
+
     #[test]
     fn diagnostics_pick_the_worst_per_line() {
         let mut e = ed("a\nb\n");
@@ -1663,12 +2134,13 @@ mod tests {
             severity,
             message: message.into(),
             code: None,
+            source: None,
         };
-        e.diagnostics = vec![
+        e.set_server_diagnostics(vec![
             d(1, 2, "just a warning"),
             d(1, 1, "a real error"),
             d(2, 3, "info"),
-        ];
+        ]);
         assert_eq!(e.diagnostic_on(1).unwrap().message, "a real error");
         assert!(e.diagnostic_on(1).unwrap().is_error());
         assert_eq!(e.diagnostic_on(3), None);

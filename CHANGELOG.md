@@ -13,13 +13,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the files the change touches and every file in the repository, each with
   its own tree and its own collapse state. Ignored files are listed and
   drawn dim; an ignored directory costs one row until it is opened, and
-  then is read one level at a time. A file the change touches keeps its
-  stage, viewed and conflict marks in both lists and opens its diff.
+  then is read one level at a time. A row there is a file and nothing
+  else — no stage box, no `+`/`−` counts, no `↺`, and clicking one opens
+  the file rather than its diff, even when the change touches it.
   Right-click to create, rename or delete a file — delete asks first.
+- **One click peeks at a file.** Walking a tree means opening a great many
+  files to look at one of them, so a click in the `Files` panel puts each
+  file in the same **peek tab**, drawn in italics to say it is about to be
+  replaced. Double-click the file or the tab to keep it. A buffer you have
+  typed into is never replaced. (A *peek* is a tab you have not committed
+  to; a *preview* is still the rendered markdown document behind `P`.)
+- **The file panel keeps working with the editor open.** Clicking another
+  file parks the one you were in rather than asking you to save or close
+  it. It keeps its tab, its cursor, its scroll and anything unsaved.
 - **More than one file open at once.** Opening a second file parks the
-  first rather than closing it; both show in the tab row with a `●` on any
-  that is unsaved. `Alt+]` and `Alt+[` step between them, and `q` counts
-  the unsaved buffers before it takes them.
+  first rather than closing it; every one shows in the tab row with a `●`
+  on any that is unsaved. `Alt+]` and `Alt+[` step between them, and `q`
+  counts the unsaved buffers before it takes them.
+- **The tab row keeps the order you opened the files in.** Clicking a tab
+  opens that file and moves nothing. Drag a tab along the row to put it
+  where you want it, and click its `✕` (or middle-click it) to close one.
+- **Double-click a word in the editor to select it.** The selection takes
+  the whole identifier, wherever in it you clicked, and every other place
+  that word appears in the file is marked while it holds. Triple-click
+  takes the line.
+- **Right-click the editor for a code menu.** The click takes the word
+  under the pointer first, so the menu names what it is about: go to the
+  definition, find every use, what is this, the signature, rename, fixes
+  and refactors, and the edits that act on the selection. A line that
+  needs a symbol is drawn dim rather than dropped when the pointer is on
+  punctuation, so the menu keeps its shape.
+- **The function keys.** `F12` goes to the definition and `F10` (or
+  `Shift+F12`) finds every use, in the editor and in the diff view.
+  `F2` renames, `F8` and `Shift+F8` walk the problems, `F3` and
+  `Shift+F3` walk the find matches, and `F1` opens the help card.
+- **Walk the problems in a file.** `F8` and `Shift+F8` put the cursor on
+  the next and previous one, in line order and wrapping at the ends, and
+  read the message out in the status bar. `Alt+E` lists them all: type to
+  filter, `Enter` goes to the line. Both are in the `☰` menu and the
+  right-click menu under `PROBLEMS`, and neither appears on a clean file.
+- **Suggestions as you type.** The completion popup opens on its own
+  after one character of a name, and after a character the server asks to
+  be told about. Loupe now reads those trigger characters from the server
+  rather than guessing at `.`, `:` and `>`, and tells the server *why* it
+  is asking — which is what makes `object.` in TypeScript list the
+  object's fields instead of everything in scope. `Tab` takes the
+  highlighted one. Narrowing is forgiving: a name that starts with what
+  you typed sorts first, and one that merely contains those letters in
+  order still shows, so a typo no longer closes the list.
+  `suggest_while_typing = false` goes back to `Ctrl+Space` only.
+- **Problems you can actually read.** The offending span is underlined as
+  well as colored, the gutter carries `✗` `▲` `ℹ` by severity, and the
+  message itself is drawn in the margin past the end of the line. Errors
+  are red and warnings are yellow, from their own palette entries rather
+  than borrowed from the staging marks.
+- **`Alt+X` explains one problem.** TypeScript folds its reasoning into a
+  single sentence and the answer is the last clause. The panel puts each
+  reason under the one it explains, picks the names and types out of the
+  prose, and breaks a wide object type over lines at its semicolons.
+- **Lint, beside the compiler.** Loupe runs `eslint` and `ruff` over the
+  buffer as you edit and draws what they say alongside the language
+  server, with the tool on every message — `eslint(no-undef)`,
+  `typescript(2552)`. It prefers the project's own copy in
+  `node_modules/.bin`, feeds it the buffer on standard input so the lint
+  is for what is on screen, and never blocks the editor. ESLint's
+  severities are turned the right way round on the way in. Add another
+  with a `[[linter]]` table, or set `linters = false`.
 - **Find and replace in the editor** (`Alt+F`), with the prompt in the
   border so nothing on screen moves while you search.
 - **Find every use from the editor** (`Alt+R`) — the list `gr` has always
@@ -43,7 +102,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writer thread now.
 - Loupe never sent `textDocument/didClose`, so every file opened in a
   session stayed open on the server for the rest of it.
+- **Go to definition landed in the wrong file in a TypeScript project.**
+  Asked before it has finished loading the project, tsserver answers a
+  definition by pointing at the `import` line in the file you are already
+  in, rather than the file the symbol is defined in. That answer is not
+  empty and not an error, so neither of the "still indexing" rules caught
+  it, and the first `F12` or `gd` after opening a TypeScript repository
+  went one line up instead of to the other file. Find-every-use had the
+  same shape: only the current file's uses came back. Rust never showed
+  it, because rust-analyzer returns *nothing* while it indexes and the
+  empty-answer rule already covered that.
+
+  An answer given while a server is still doing the work it started at
+  launch is now treated as provisional whatever it contains, and the very
+  first question of a session waits out a short grace before it is
+  believed. The obvious refinement — end that grace as soon as the server
+  says it has finished something — was measured and made the failure
+  *more* frequent, because tsserver announces smaller pieces of work
+  before it gets to the project. The elapsed time is the only part a
+  server cannot mislead us about, so that is what the wait is built on.
+- **A cold language server failed the first question instead of waiting
+  for its index.** rust-analyzer answers `ContentModified` for most of
+  the time it spends loading a project, and loupe read that as a failure
+  rather than as the "send it again" the specification says it is. So the
+  first `gd`, `gr` or `F12` after launch — the one everybody presses —
+  reported an error or nothing at all. Loupe now re-asks while the server
+  reports progress, and the budget for that grew from 12 seconds to 45,
+  which is what a real project actually costs.
+- **`loupe --lsp` promised a TypeScript server that could not run.**
+  `typescript-language-server` is a wrapper around the `typescript`
+  package, and having the first without the second is a `✓` beside
+  TypeScript and a server that dies on every question. The doctor now
+  looks for the `tsserver` it would drive and says which half is missing.
+- **The editor asked a language server in complete silence.** A lookup
+  from the editor set nothing on screen: no spinner, no message, nothing
+  until the answer landed up to half a minute later. There was no way to
+  tell a key that did nothing from a server that was still indexing. The
+  status bar now names what it is waiting for and spins until it lands.
+  Typing still works throughout — the wait was never modal, only
+  invisible.
 - The pinned tab row is per worktree, not per clone. Both pages said clone.
+- One test's doc comment held three copies of its own first line.
+- The `●` on a tab with unsaved work was drawn in one color for both tab
+  backgrounds, and the selected tab's is a saturated blue — so the mark
+  vanished on the one tab it was most needed on, the file being typed
+  into. The two backgrounds have their own colors now.
+- Tabs ran together as one line of file names. Each has a seam beside it,
+  a space between the `●` and the name, and its own `✕`.
+- **Clicking through the file tree flashed the whole window.** Loupe
+  closed the old buffer at the click and opened the new one when the read
+  landed, so every frame in between drew a pane with nothing in it — which
+  is the diff. Nothing on screen changes now until the file is in hand.
+  The click itself costs 10-70 µs and the read lands in under 2 ms; the
+  flash was never slowness, it was the order of the work.
+- A file the reader clicked waited up to 80 ms to be picked up, because
+  the main loop paces itself off the spinner. A read the reader is sitting
+  and waiting for gets the next frame instead.
+- **A pinned file opened twice.** Clicking one in the file tree gave it a
+  second tab beside its pin — a peek on one click, a kept tab on two — so
+  one file sat in the row twice and an edit went into whichever of them
+  was on screen. A pinned file now opens through its pin, and a buffer
+  whose file is pinned draws no tab of its own. Its unsaved `●` moved to
+  the pin tab, where the file's tab actually is.
+- **Every tab said "save or discard first".** Switching to a pinned tab
+  refused outright while anything was unsaved. The buffer is parked
+  instead: it keeps its text, its place in the row and its `●`, and the
+  reader goes where they were going.
 
 - **Loupe tells your coding agent what you are reading.** Loupe is the
   only process on the machine that knows which lines a human has on
