@@ -1242,6 +1242,37 @@ pub enum FileEntry {
     },
 }
 
+/// One directory's contents, read on a worker thread.
+struct DirRead {
+    dir: String,
+    files: Vec<String>,
+    dirs: Vec<String>,
+}
+
+/// The names directly inside one directory: files first, then
+/// subdirectories.
+///
+/// A symlinked directory counts as a file. Following one would let a link
+/// pointing at an ancestor draw a tree with no bottom, and nothing here
+/// needs to look inside it.
+fn read_one_dir(abs: &Path) -> Result<(Vec<String>, Vec<String>)> {
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    for entry in std::fs::read_dir(abs)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // `file_type` does not follow the link, which is the point.
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => dirs.push(name),
+            Ok(_) => files.push(name),
+            Err(_) => continue,
+        }
+    }
+    files.sort();
+    dirs.sort();
+    Ok((files, dirs))
+}
+
 /// The changeset's directory tree, built once per file list.
 ///
 /// Building this is the expensive half of the file panel and emitting the
@@ -1262,6 +1293,10 @@ pub struct TreeNodes {
 
 #[derive(Default)]
 struct Node {
+    /// A directory git would not walk into — a nested repository, or one
+    /// whose whole contents are ignored. Its children cost a `read_dir`,
+    /// and only when somebody asks for them.
+    stub: bool,
     dirs: BTreeMap<String, Node>,
     /// (base name, what the row points at), sorted at build time. Sorting
     /// here rather than in `emit` is what lets `emit` borrow the vector
@@ -1312,12 +1347,35 @@ impl TreeNodes {
         node.files.push((base, src));
     }
 
-    /// Make sure a directory exists in the tree, with nothing in it.
+    /// Make sure a directory exists in the tree, with nothing in it, and
+    /// mark it as one whose contents have not been read.
     fn dir_at(&mut self, path: &str) {
+        self.node_at(path).stub = true;
+    }
+
+    fn node_at(&mut self, path: &str) -> &mut Node {
         let mut node = &mut self.root;
         for p in path.split('/') {
             node = node.dirs.entry(p.to_string()).or_default();
         }
+        node
+    }
+
+    /// Re-sort one directory's files, after a read added to them.
+    fn resort_at(&mut self, path: &str) {
+        self.node_at(path).files.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+
+    /// Whether this directory's contents are still unread.
+    fn is_stub(&self, path: &str) -> bool {
+        let mut node = &self.root;
+        for p in path.split('/') {
+            match node.dirs.get(p) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        node.stub
     }
 
     fn finish(&mut self, built_from: usize) {
@@ -1819,11 +1877,11 @@ pub struct App {
     /// Every path in the repository, for rows the change does not touch.
     /// [`RowSrc::Path`] indexes into it. Empty until the listing lands.
     pub repo_paths: Vec<String>,
-    /// Where the ignored paths start in `repo_paths`. Rows at or past it
-    /// are drawn dim.
-    repo_ignored_from: usize,
-    /// Directories git would not walk into. See [`search::RepoListing`].
-    repo_stubs: Vec<String>,
+    /// Whether each path in `repo_paths` is one git ignores, drawn dim.
+    /// Parallel to `repo_paths` rather than a split point, because reading
+    /// inside an ignored directory appends its children to the end and
+    /// they inherit its answer, not the end of the list's.
+    repo_ignored: Vec<bool>,
     /// The repository tree, built once from the listing.
     file_tree: TreeNodes,
     /// Which list the panel is showing.
@@ -1835,6 +1893,8 @@ pub struct App {
     collapsed_files: HashSet<String>,
     /// The in-flight repository listing.
     repo_job: Option<Receiver<Result<search::RepoListing>>>,
+    /// The in-flight read of one directory the listing stopped at.
+    dir_job: Option<Receiver<Result<DirRead>>>,
     /// Width of the file panel in columns; dragged by the divider, seeded
     /// from the `file_panel_width` config key.
     pub file_panel_w: u16,
@@ -2072,12 +2132,12 @@ impl App {
             entries: Vec::new(),
             tree: TreeNodes::default(),
             repo_paths: Vec::new(),
-            repo_ignored_from: 0,
-            repo_stubs: Vec::new(),
+            repo_ignored: Vec::new(),
             file_tree: TreeNodes::default(),
             panel: PanelMode::Changes,
             collapsed_files: HashSet::new(),
             repo_job: None,
+            dir_job: None,
             file_panel_w: FILE_PANEL_DEFAULT,
             dragging: Dragging::None,
             diff: None,
@@ -2401,6 +2461,25 @@ impl App {
         // A debounced query whose quiet period has elapsed becomes a job.
         if self.maybe_spawn_search() {
             changed = true;
+        }
+        if let Some(rx) = &self.dir_job {
+            match rx.try_recv() {
+                Ok(Ok(read)) => {
+                    self.dir_job = None;
+                    self.apply_dir_read(read);
+                    changed = true;
+                }
+                Ok(Err(e)) => {
+                    self.dir_job = None;
+                    self.err(format!("Couldn't read that directory: {e:#}"));
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.dir_job = None;
+                    changed = true;
+                }
+            }
         }
         if let Some(rx) = &self.repo_job {
             match rx.try_recv() {
@@ -4681,18 +4760,77 @@ impl App {
     fn apply_repo_listing(&mut self, listing: search::RepoListing) {
         self.file_tree = TreeNodes::from_listing(&listing);
         self.collapsed_files = self.file_tree.all_dirs();
-        self.repo_ignored_from = listing.ignored_from;
-        self.repo_stubs = listing.stubs;
+        self.repo_ignored = (0..listing.paths.len())
+            .map(|i| i >= listing.ignored_from)
+            .collect();
         self.repo_paths = listing.paths;
         if self.panel == PanelMode::Files {
             self.rebuild_entries();
         }
     }
 
+    /// Read one directory the repository listing stopped at.
+    ///
+    /// One level, never a walk: the whole reason `git ls-files --directory`
+    /// hands back `node_modules/` as a single row is that nobody wants its
+    /// 17,000 descendants, and reading them here would give them back.
+    /// A subdirectory found inside becomes a stub of its own, so going
+    /// deeper costs another read and only if somebody goes deeper.
+    fn spawn_read_dir(&mut self, dir: String) {
+        if self.dir_job.is_some() {
+            return;
+        }
+        let Some(abs) = gitops::safe_repo_path(&self.repo_root, &dir) else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(read_one_dir(&abs).map(|(files, dirs)| DirRead { dir, files, dirs }));
+        });
+        self.dir_job = Some(rx);
+    }
+
+    /// Splice a directory's contents into the cached tree.
+    ///
+    /// New paths are appended to `repo_paths`, never inserted, so every
+    /// `RowSrc::Path` already on screen keeps pointing at the same file.
+    /// They inherit the directory's own ignored answer, which is why that
+    /// is stored per path rather than as a split point.
+    fn apply_dir_read(&mut self, read: DirRead) {
+        let ignored = self
+            .repo_paths
+            .iter()
+            .position(|p| p == &read.dir)
+            .and_then(|i| self.repo_ignored.get(i).copied())
+            // A directory is not itself a path in the list when git named
+            // it as a stub, and every stub git names is either ignored or
+            // a repository boundary. Treat both as "not tracked here".
+            .unwrap_or(true);
+        for name in &read.files {
+            let path = format!("{}/{}", read.dir, name);
+            let src = RowSrc::Path(self.repo_paths.len());
+            self.repo_paths.push(path.clone());
+            self.repo_ignored.push(ignored);
+            self.file_tree.insert(&path, src);
+        }
+        for name in &read.dirs {
+            let path = format!("{}/{}", read.dir, name);
+            self.file_tree.dir_at(&path);
+            // Collapsed, like every other directory in this panel.
+            self.collapsed_files.insert(path);
+        }
+        self.file_tree.node_at(&read.dir).stub = false;
+        self.file_tree.resort_at(&read.dir);
+        self.rebuild_entries();
+    }
+
     /// Whether a row names a file git is ignoring, which the panel draws
     /// dim — `.env` is worth opening, and worth knowing is not committed.
     pub fn row_ignored(&self, src: RowSrc) -> bool {
-        matches!(src, RowSrc::Path(i) if i >= self.repo_ignored_from)
+        match src {
+            RowSrc::Path(i) => self.repo_ignored.get(i).copied().unwrap_or(false),
+            RowSrc::Changed(_) => false,
+        }
     }
 
     /// The file list changed: rebuild the directory tree, then the rows.
@@ -6222,21 +6360,20 @@ impl App {
                     set.insert(path.clone());
                 }
                 // A directory git would not walk into has nothing under it
-                // yet, so opening it shows an empty folder. Say why rather
-                // than leave the click looking broken.
-                if opened && self.repo_stubs.iter().any(|d| d == &path) {
-                    self.ok(format!(
-                        "{path} is ignored — loupe has not read what is inside it."
-                    ));
+                // until somebody asks, and this is the asking.
+                if opened && self.panel == PanelMode::Files && self.file_tree.is_stub(&path) {
+                    self.spawn_read_dir(path);
                 }
                 self.rebuild_entries();
             }
             FileEntry::File { src, depth } => {
                 // A row the change does not touch has no diff, nothing to
                 // stage and nothing to put back, so none of the targets
-                // below mean anything. Opening one arrives with the file
-                // tree that produces it.
+                // below mean anything. It still opens.
                 let Some(idx) = self.changed_idx(src) else {
+                    if let Some(path) = self.row_path(src).map(str::to_string) {
+                        self.spawn_open_external(path, None);
+                    }
                     return;
                 };
                 // The icon plus its trailing space: a 4-column target.
@@ -11904,6 +12041,66 @@ b2
         highlight::set_theme(before_theme);
         crate::theme::set_appearance(before_appearance);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reading a stub must add to the list, never renumber it: a row
+    /// already on screen holds an index, and inserting in the middle would
+    /// quietly repoint it at a different file. It must also stop at one
+    /// level — the whole reason `node_modules` arrives as a single row is
+    /// that nobody wants its descendants.
+    #[test]
+    fn reading_a_stub_appends_and_stops_at_one_level() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.apply_repo_listing(search::RepoListing {
+            paths: vec!["src/app.rs".into(), ".env".into()],
+            ignored_from: 1,
+            stubs: vec!["node_modules".into()],
+        });
+        app.panel = PanelMode::Files;
+        let before = app.repo_paths.clone();
+        assert!(app.file_tree.is_stub("node_modules"));
+
+        app.apply_dir_read(DirRead {
+            dir: "node_modules".into(),
+            files: vec!["index.js".into()],
+            dirs: vec!["pkg".into()],
+        });
+
+        assert_eq!(
+            &app.repo_paths[..before.len()],
+            &before[..],
+            "every index already on screen still means the same file"
+        );
+        assert!(app
+            .repo_paths
+            .contains(&"node_modules/index.js".to_string()));
+        assert!(
+            !app.file_tree.is_stub("node_modules"),
+            "the directory has been read"
+        );
+        assert!(
+            app.file_tree.is_stub("node_modules/pkg"),
+            "its subdirectory has not — going deeper costs another read"
+        );
+        assert!(
+            app.collapsed_files.contains("node_modules/pkg"),
+            "and arrives collapsed, like every other directory here"
+        );
+
+        // A file inside an ignored directory is ignored, whatever its
+        // position in the list. This is why the flag is per path.
+        let i = app
+            .repo_paths
+            .iter()
+            .position(|p| p == "node_modules/index.js")
+            .unwrap();
+        assert!(app.row_ignored(RowSrc::Path(i)));
+        let tracked = app
+            .repo_paths
+            .iter()
+            .position(|p| p == "src/app.rs")
+            .unwrap();
+        assert!(!app.row_ignored(RowSrc::Path(tracked)));
     }
 
     /// Everything collapsed is what Files mode opens onto, and the
