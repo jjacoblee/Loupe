@@ -251,6 +251,33 @@ Tab expansion and `FileDiff::max_width` share `diff::TAB_WIDTH` — the
 horizontal-scroll clamp and the renderer must agree on tab width or
 scrolling drifts on tab-indented files.
 
+### The words that changed
+
+A `RowKind::Modified` row is the only kind with a counterpart to differ
+from, so it is the only kind that carries `old_words` / `new_words` —
+character ranges the renderer paints a stronger shade of the row's own
+colour. A whole added or removed line is all change, and a second shade
+on it would mean nothing.
+
+The tokenizer is loupe's own rather than `similar`'s. `TextDiff::from_words`
+breaks on whitespace and nothing else, which makes
+`Client::builder().timeout(timeout)` a single word — one renamed argument
+inside it then reads as the whole expression changing, and the guard
+below throws the highlight away entirely. Here a run of identifier
+characters is one token, a run of whitespace is one token, and every
+other character stands alone, so a changed bracket is a changed bracket.
+
+Two guards keep it from saying nothing. A line longer than
+`MAX_WORD_DIFF` is left alone: a minified bundle is one line of a hundred
+thousand characters, and word-diffing two of those costs more than the
+rest of the file. And past `WORD_DIFF_MAX_SHARE` of a line the ranges are
+dropped — two lines that share almost nothing are a rewrite, and painting
+nine tenths of both of them darker is louder than painting neither.
+
+The renderer takes it as a third overlay in `hl_body`, below the search
+hit and the selection: those are what the reader is doing, and this is a
+standing property of the line that can afford to give way.
+
 ## Reviews
 
 An inline comment has two exits, and they are different requests.

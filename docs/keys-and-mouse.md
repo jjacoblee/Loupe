@@ -244,6 +244,32 @@ change. That is why these lines only appear in `Files`.
 A very large repository — more than two hundred thousand files — is read
 one directory at a time instead, so the panel is usable at once.
 
+## Reading a diff
+
+A removed line is painted red and an added line green, as everywhere
+else. **The words that actually changed are painted a stronger shade of
+the same colour.**
+
+```
+ 12  −  let client = Client::builder().timeout(timeout).build()?;
+ 12  +  let client = Client::builder().timeout(deadline).build()?;
+                                              ▔▔▔▔▔▔▔▔
+```
+
+A line painted whole says the line changed and nothing about where. On a
+long line with one renamed variable in it, that is two lines you have to
+read against each other character by character — which is how a changed
+name, or an added space, gets missed.
+
+The same hue rather than a new colour, because the line already says
+added or removed and this only says *where*. It works in both views.
+
+Two lines that share almost nothing are a rewrite, not an edit, so they
+keep the plain colours: painting nine tenths of both of them darker says
+less than painting neither. A whole added or removed line has no
+counterpart to differ from, so every character of it is the change and it
+keeps one shade too.
+
 ## Diff view — move
 
 | Key | Action |

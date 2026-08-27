@@ -1759,6 +1759,21 @@ fn draw_review_confirm(f: &mut Frame, app: &mut App, area: Rect) {
 
 // ------------------------------------------------------------------ diff
 
+/// The stronger shade a changed word takes, inside a line already
+/// painted red or green.
+///
+/// Only a modified row has one. A whole added or removed line has no
+/// counterpart to differ from, so every character of it is the change
+/// and a second shade would mean nothing.
+fn word_bg(kind: RowKind, side: Side) -> Option<Color> {
+    let p = palette();
+    match (kind, side) {
+        (RowKind::Modified, Side::Left) => Some(p.removed_word),
+        (RowKind::Modified, Side::Right) => Some(p.added_word),
+        _ => None,
+    }
+}
+
 fn diff_bg(kind: RowKind, side: Side) -> Option<Color> {
     let p = palette();
     match (kind, side) {
@@ -1777,10 +1792,16 @@ fn diff_bg(kind: RowKind, side: Side) -> Option<Color> {
 /// from the highlighter.
 /// Body text as syntax-colored spans.
 ///
-/// Two overlays ride on top of the syntax colors, both as char ranges
+/// Three overlays ride on top of the syntax colors, all as char ranges
 /// within the *line* (not the segment): `sel` is the selection, `marks`
-/// are search hits. A search hit wins where they overlap — it is the
-/// thing being hunted for, and it is transient.
+/// are search hits, and `words` are the characters this line does not
+/// share with its counterpart, painted in the colour that comes with
+/// them.
+///
+/// They win in that order where they overlap. A search hit is the thing
+/// being hunted for and it is transient; a selection is what the reader
+/// is pointing at; the word highlight is a standing property of the line
+/// and can afford to give way to either.
 #[allow(clippy::too_many_arguments)]
 fn hl_body<'a>(
     text: &str,
@@ -1791,6 +1812,7 @@ fn hl_body<'a>(
     fallback_fg: Color,
     marks: &[(usize, usize)],
     sel: Option<(usize, usize)>,
+    words: Option<(&[(usize, usize)], Color)>,
 ) -> Vec<Span<'a>> {
     let p = palette();
     let mut spans: Vec<Span> = Vec::new();
@@ -1809,7 +1831,7 @@ fn hl_body<'a>(
         // Runs of one style are coalesced into a single span — no
         // per-character Span allocation in the render hot path.
         let mut out = String::new();
-        // 0 = plain, 1 = selected, 2 = search hit.
+        // 0 = plain, 1 = selected, 2 = search hit, 3 = a changed word.
         let mut out_kind = 0u8;
         macro_rules! flush {
             () => {
@@ -1818,6 +1840,11 @@ fn hl_body<'a>(
                     match out_kind {
                         1 => st = st.bg(p.selected).add_modifier(Modifier::BOLD),
                         2 => st = st.bg(p.matched),
+                        3 => {
+                            if let Some((_, bg)) = words {
+                                st = st.bg(bg);
+                            }
+                        }
                         _ => {}
                     }
                     spans.push(Span::styled(std::mem::take(&mut out), st));
@@ -1844,6 +1871,8 @@ fn hl_body<'a>(
                 2
             } else if sel.is_some_and(|(s, e)| idx >= s && idx < e) {
                 1
+            } else if words.is_some_and(|(w, _)| w.iter().any(|(s, e)| idx >= *s && idx < *e)) {
+                3
             } else {
                 0
             };
@@ -1942,6 +1971,17 @@ fn cell<'a>(
                 base = base.add_modifier(Modifier::UNDERLINED);
             }
             let marks = crate::search::find_ranges(t, query);
+            // What this side does not share with the other one. Dropped
+            // while the whole line is selected: that paints the row one
+            // colour on purpose, and a darker patch inside it would read
+            // as part of the selection rather than part of the diff.
+            let changed = match side {
+                Side::Left => row.old_words.as_slice(),
+                Side::Right => row.new_words.as_slice(),
+            };
+            let words = word_bg(row.kind, side)
+                .filter(|_| !linewise && !changed.is_empty())
+                .map(|bg| (changed, bg));
             let mut spans = vec![Span::styled(ln_str, ln_style)];
             spans.extend(hl_body(
                 t,
@@ -1952,6 +1992,7 @@ fn cell<'a>(
                 p.text,
                 &marks,
                 cols.filter(|_| !linewise),
+                words,
             ));
             spans
         }
@@ -2419,6 +2460,13 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                 }
                 let body = text.unwrap_or("");
                 let marks = crate::search::find_ranges(body, find);
+                let changed = match side {
+                    Side::Left => row.old_words.as_slice(),
+                    Side::Right => row.new_words.as_slice(),
+                };
+                let words = word_bg(row.kind, side)
+                    .filter(|_| !linewise && !changed.is_empty())
+                    .map(|bg| (changed, bg));
                 spans.push(Span::styled(gutter, gs));
                 spans.extend(hl_body(
                     body,
@@ -2429,6 +2477,7 @@ fn draw_diff(f: &mut Frame, app: &mut App, area: Rect) {
                     p.text,
                     &marks,
                     cols.filter(|_| !linewise),
+                    words,
                 ));
             }
         }
@@ -5101,6 +5150,73 @@ mod tests {
         assert!(screen.contains("☐ todo"), "and unticked ones: {screen}");
         assert!(screen.contains("PLAN.md"), "the file panel is still there");
         assert!(screen.contains("P source"), "the way back is offered");
+    }
+
+    /// A modified line is painted whole, and the words that actually
+    /// changed are painted darker inside it. Without this a one-word
+    /// change on a long line is two lines the reader has to compare
+    /// character by character.
+    #[test]
+    fn changed_words_get_their_own_shade() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.view = ViewMode::Inline;
+        app.files = vec![ChangedFile {
+            path: "code.rs".into(),
+            status: "modified".into(),
+            additions: 1,
+            deletions: 1,
+            previous: None,
+            conflicted: false,
+        }];
+        app.rebuild_files();
+        app.diff = Some(crate::diff::FileDiff::compute(
+            Some(
+                "let value = compute(timeout);
+",
+            ),
+            Some(
+                "let value = compute(deadline);
+",
+            ),
+        ));
+        app.rebuild_display();
+
+        let buf = render(&mut app);
+        let p = crate::theme::palette();
+        // The characters carrying each shade, read straight off the
+        // cells: the whole line in the plain colour, the changed name in
+        // the strong one.
+        let painted = |bg: ratatui::style::Color| -> String {
+            (0..buf.area.height)
+                .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+                .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(bg))
+                .map(|(x, y)| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+        assert_eq!(
+            painted(p.removed_word),
+            "timeout",
+            "the old name, and nothing else"
+        );
+        assert_eq!(
+            painted(p.added_word),
+            "deadline",
+            "and the new one on the other side"
+        );
+        // The rest of each line still carries the plain shade.
+        assert!(
+            painted(p.removed).contains("let value = compute("),
+            "the removed line is still painted whole"
+        );
+        assert!(
+            painted(p.added).contains("let value = compute("),
+            "and so is the added one"
+        );
     }
 
     /// Find in the preview: the prompt draws in the status line, the

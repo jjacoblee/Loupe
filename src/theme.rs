@@ -71,6 +71,14 @@ pub struct Palette {
     pub added: Color,
     /// Background of a removed line.
     pub removed: Color,
+    /// Background of the words that actually changed, inside a line that
+    /// is already painted [`Palette::added`] or [`Palette::removed`].
+    ///
+    /// Deliberately the same hue and a stronger one, rather than a
+    /// different color: the line says added or removed, and this says
+    /// where. A second hue would be a second thing to learn.
+    pub added_word: Color,
+    pub removed_word: Color,
     /// Filler where one side of a side-by-side diff has no line at all.
     pub empty: Color,
     /// Background of a selected diff line.
@@ -200,6 +208,8 @@ pub struct Palette {
 pub const DARK: Palette = Palette {
     added: Color::Rgb(16, 50, 26),
     removed: Color::Rgb(58, 22, 22),
+    added_word: Color::Rgb(28, 104, 52),
+    removed_word: Color::Rgb(118, 38, 38),
     empty: Color::Rgb(24, 24, 28),
     selected: Color::Rgb(28, 66, 120),
     matched: Color::Rgb(122, 92, 20),
@@ -271,6 +281,8 @@ pub const DARK: Palette = Palette {
 pub const LIGHT: Palette = Palette {
     added: Color::Rgb(214, 245, 222),
     removed: Color::Rgb(255, 223, 219),
+    added_word: Color::Rgb(154, 226, 175),
+    removed_word: Color::Rgb(255, 175, 166),
     empty: Color::Rgb(240, 240, 244),
     selected: Color::Rgb(200, 222, 250),
     matched: Color::Rgb(252, 222, 138),

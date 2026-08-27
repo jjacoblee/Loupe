@@ -1,7 +1,7 @@
 //! Line-diff engine: builds an aligned row model that serves both the
 //! side-by-side view and the inline (stacked) view.
 
-use similar::{ChangeTag, TextDiffConfig};
+use similar::{ChangeTag, TextDiff, TextDiffConfig};
 use std::collections::HashSet;
 use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
@@ -15,6 +15,20 @@ pub const TAB_WIDTH: usize = 4;
 /// seconds. On timeout `similar` degrades gracefully to a coarser diff
 /// instead of hanging the load job.
 const DIFF_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Longest line the word diff will look inside.
+///
+/// A minified bundle arrives as one line of a hundred thousand
+/// characters, and word-diffing two of those costs more than the rest of
+/// the file put together. Past this a row keeps the plain red and green
+/// it always had.
+const MAX_WORD_DIFF: usize = 4_000;
+
+/// Past this share of a line, the word highlight stops saying anything.
+///
+/// Two lines that share almost nothing are a rewrite, and painting nine
+/// tenths of both of them darker is louder than painting neither.
+const WORD_DIFF_MAX_SHARE: f32 = 0.7;
 
 /// Context rows kept visible on each side of a fold.
 pub const FOLD_MARGIN: usize = 3;
@@ -33,8 +47,9 @@ pub enum DisplayEntry {
     Unfold { start: usize, count: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RowKind {
+    #[default]
     Context,
     Added,
     Removed,
@@ -43,13 +58,23 @@ pub enum RowKind {
     Modified,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Row {
     pub kind: RowKind,
     pub old_ln: Option<usize>,
     pub new_ln: Option<usize>,
     pub old_text: Option<String>,
     pub new_text: Option<String>,
+    /// Character ranges the two versions of this line do not share, one
+    /// list per side. Empty on every row but a [`RowKind::Modified`] one,
+    /// which is the only kind with a counterpart to differ from.
+    ///
+    /// The renderer paints these darker than the rest of the line. A row
+    /// painted whole says the line changed and nothing about where, and
+    /// on a long line with one renamed variable in it that is two lines
+    /// the reader has to compare character by character.
+    pub old_words: Ranges,
+    pub new_words: Ranges,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +133,123 @@ pub fn char_at_col(s: &str, col: usize) -> usize {
     s.chars().count()
 }
 
+/// Character ranges within one line — what the renderer measures every
+/// overlay in, and what the word highlight is a list of.
+pub type Ranges = Vec<(usize, usize)>;
+
+/// One token of a line: where it sits in bytes, to slice the text, and
+/// in characters, which is what the renderer measures overlays in.
+struct Tok {
+    bytes: (usize, usize),
+    chars: (usize, usize),
+}
+
+/// Split a line into the pieces a reader compares.
+///
+/// A run of identifier characters is one token, a run of whitespace is
+/// one token, and every other character stands alone — so a changed
+/// bracket reads as a changed bracket rather than as a changed
+/// expression.
+///
+/// `similar`'s own word splitter breaks on whitespace and nothing else,
+/// which makes `Client::builder().timeout(timeout)` a single word. One
+/// renamed argument inside it then reads as the whole expression
+/// changing, and a highlight that covers the whole expression says no
+/// more than the red and green already did.
+fn tokenize(line: &str) -> Vec<Tok> {
+    let chars: Vec<char> = line.chars().collect();
+    let class = |ch: char| {
+        if ch.is_alphanumeric() || ch == '_' {
+            0u8
+        } else if ch.is_whitespace() {
+            1
+        } else {
+            2
+        }
+    };
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut b = 0usize;
+    while i < chars.len() {
+        let k = class(chars[i]);
+        let (start_c, start_b) = (i, b);
+        loop {
+            b += chars[i].len_utf8();
+            i += 1;
+            if k == 2 || i >= chars.len() || class(chars[i]) != k {
+                break;
+            }
+        }
+        out.push(Tok {
+            bytes: (start_b, b),
+            chars: (start_c, i),
+        });
+    }
+    out
+}
+
+/// The character ranges two versions of one line do not share.
+///
+/// Tokens rather than characters: a renamed variable reads as one range
+/// instead of a scatter of letters, and a scatter is exactly what the eye
+/// cannot pick out of a line that is already painted whole.
+///
+/// Returns two empty lists when the highlight would say nothing — a line
+/// too long to be worth the work, or two lines that share so little they
+/// are a rewrite rather than an edit.
+fn changed_words(old: &str, new: &str) -> (Ranges, Ranges) {
+    if old.len() > MAX_WORD_DIFF || new.len() > MAX_WORD_DIFF {
+        return (Vec::new(), Vec::new());
+    }
+    let (ot, nt) = (tokenize(old), tokenize(new));
+    let ow: Vec<&str> = ot.iter().map(|t| &old[t.bytes.0..t.bytes.1]).collect();
+    let nw: Vec<&str> = nt.iter().map(|t| &new[t.bytes.0..t.bytes.1]).collect();
+    let mut olds: Ranges = Vec::new();
+    let mut news: Ranges = Vec::new();
+    for change in TextDiff::from_slices(&ow, &nw).iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {}
+            ChangeTag::Delete => {
+                if let Some(i) = change.old_index() {
+                    olds.push(ot[i].chars);
+                }
+            }
+            ChangeTag::Insert => {
+                if let Some(i) = change.new_index() {
+                    news.push(nt[i].chars);
+                }
+            }
+        }
+    }
+    join_touching(&mut olds);
+    join_touching(&mut news);
+    let share = |spans: &[(usize, usize)], len: usize| {
+        if len == 0 {
+            return 0.0;
+        }
+        spans.iter().map(|(s, e)| e - s).sum::<usize>() as f32 / len as f32
+    };
+    if share(&olds, old.chars().count()) > WORD_DIFF_MAX_SHARE
+        || share(&news, new.chars().count()) > WORD_DIFF_MAX_SHARE
+    {
+        return (Vec::new(), Vec::new());
+    }
+    (olds, news)
+}
+
+/// Join ranges that touch, so a changed word beside changed punctuation
+/// is one highlight rather than three with nothing between them.
+fn join_touching(spans: &mut Ranges) {
+    let mut out: Ranges = Vec::with_capacity(spans.len());
+    for (s, e) in spans.drain(..) {
+        match out.last_mut() {
+            Some(last) if last.1 >= s => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    *spans = out;
+}
+
 impl FileDiff {
     pub fn compute(old: Option<&str>, new: Option<&str>) -> Self {
         let old_s = old.unwrap_or("");
@@ -127,12 +269,18 @@ impl FileDiff {
                      inss: &mut Vec<(usize, String)>| {
             let paired = dels.len().min(inss.len());
             for i in 0..paired {
+                // The one kind of row with a counterpart to differ from,
+                // and so the only one where "what changed" is a question
+                // narrower than "this whole line".
+                let (old_words, new_words) = changed_words(&dels[i].1, &inss[i].1);
                 rows.push(Row {
                     kind: RowKind::Modified,
                     old_ln: Some(dels[i].0),
                     new_ln: Some(inss[i].0),
                     old_text: Some(dels[i].1.clone()),
                     new_text: Some(inss[i].1.clone()),
+                    old_words,
+                    new_words,
                 });
             }
             for d in dels.iter().skip(paired) {
@@ -142,6 +290,7 @@ impl FileDiff {
                     new_ln: None,
                     old_text: Some(d.1.clone()),
                     new_text: None,
+                    ..Row::default()
                 });
             }
             for a in inss.iter().skip(paired) {
@@ -151,6 +300,7 @@ impl FileDiff {
                     new_ln: Some(a.0),
                     old_text: None,
                     new_text: Some(a.1.clone()),
+                    ..Row::default()
                 });
             }
             dels.clear();
@@ -168,6 +318,7 @@ impl FileDiff {
                         new_ln: change.new_index().map(|i| i + 1),
                         old_text: Some(text.clone()),
                         new_text: Some(text),
+                        ..Row::default()
                     });
                 }
                 ChangeTag::Delete => {
@@ -814,5 +965,112 @@ mod tests {
         // The side matters: this selection is on the old side, so the new
         // side shows nothing highlighted.
         assert_eq!(sel.cols_on(Side::Right, 1, 16), None);
+    }
+
+    // ------------------------------------------------- changed words
+
+    /// The text a set of ranges covers, joined by `|`, so a test can say
+    /// what it expects to be painted rather than count characters.
+    fn covered(line: &str, spans: &[(usize, usize)]) -> String {
+        let chars: Vec<char> = line.chars().collect();
+        spans
+            .iter()
+            .map(|(s, e)| chars[*s..*e].iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// The case the whole feature exists for: one renamed name in a line
+    /// that is otherwise identical. Both sides say which word, not just
+    /// that the line moved.
+    #[test]
+    fn a_renamed_name_is_the_only_thing_highlighted() {
+        let (old, new) = changed_words(
+            "fn handle(request: Request, timeout: Duration) -> Result<Response> {",
+            "fn handle(request: Request, deadline: Duration) -> Result<Response> {",
+        );
+        assert_eq!(
+            covered(
+                "fn handle(request: Request, timeout: Duration) -> Result<Response> {",
+                &old
+            ),
+            "timeout"
+        );
+        assert_eq!(
+            covered(
+                "fn handle(request: Request, deadline: Duration) -> Result<Response> {",
+                &new
+            ),
+            "deadline"
+        );
+    }
+
+    /// Punctuation is its own token, so a name buried in an expression
+    /// still reads as one name. `similar`'s own word splitter breaks on
+    /// whitespace alone and would call this whole chain one word.
+    #[test]
+    fn a_name_inside_an_expression_is_found_on_its_own() {
+        let o = "    let client = Client::builder().timeout(timeout).build()?;";
+        let n = "    let client = Client::builder().timeout(deadline).build()?;";
+        let (old, new) = changed_words(o, n);
+        assert_eq!(covered(o, &old), "timeout");
+        assert_eq!(covered(n, &new), "deadline");
+    }
+
+    /// A change in whitespace is a change. It is also the one a reader
+    /// has no chance of seeing without this.
+    #[test]
+    fn a_changed_space_is_visible() {
+        let o = "let x = 1;";
+        let n = "let  x = 1;";
+        let (_, new) = changed_words(o, n);
+        assert_eq!(covered(n, &new), "  ", "the wider gap is marked");
+    }
+
+    /// Two lines that share almost nothing are a rewrite. Painting nine
+    /// tenths of both of them darker says less than painting neither.
+    #[test]
+    fn a_rewritten_line_keeps_its_plain_colours() {
+        let (old, new) = changed_words(
+            "let total = items.iter().map(|i| i.price).sum();",
+            "eprintln!(\"done\");",
+        );
+        assert!(old.is_empty() && new.is_empty());
+    }
+
+    /// A line long enough to be generated is not worth the work, and
+    /// word-diffing two of them costs more than the rest of the file.
+    #[test]
+    fn a_very_long_line_is_left_alone() {
+        let o = "x".repeat(MAX_WORD_DIFF + 1);
+        let n = format!("{}y", "x".repeat(MAX_WORD_DIFF));
+        let (old, new) = changed_words(&o, &n);
+        assert!(old.is_empty() && new.is_empty());
+    }
+
+    /// Only a paired row has a counterpart to differ from. A whole added
+    /// or removed line is all change, and a second shade on it would
+    /// mean nothing.
+    #[test]
+    fn only_paired_rows_carry_word_ranges() {
+        let d = FileDiff::compute(Some("one\ntwo\n"), Some("one\ntwo two\nthree\n"));
+        let modified = d
+            .rows
+            .iter()
+            .find(|r| r.kind == RowKind::Modified)
+            .expect("the edited line pairs up");
+        assert!(!modified.new_words.is_empty(), "and says which words moved");
+        for row in d.rows.iter().filter(|r| r.kind != RowKind::Modified) {
+            assert!(row.old_words.is_empty() && row.new_words.is_empty());
+        }
+    }
+
+    /// Ranges that touch are one highlight. Three of them with nothing
+    /// between reads as three changes.
+    #[test]
+    fn touching_ranges_join_up() {
+        let mut spans = vec![(0, 3), (3, 5), (7, 9)];
+        join_touching(&mut spans);
+        assert_eq!(spans, vec![(0, 5), (7, 9)]);
     }
 }

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The words that changed are painted darker than the line.** A modified
+  line keeps its red or green; the characters the two versions do not
+  share take a stronger shade of the same colour. A line painted whole
+  says the line changed and nothing about where — on a long line with one
+  renamed variable in it, that is two lines you have to read against each
+  other character by character. Tokens rather than characters, so a
+  rename reads as one mark instead of a scatter of letters. Rewrites and
+  generated-length lines keep the plain colours.
+
 - **Right-click a tab for its path.** `Copy relative path` and `Copy full
   path`, the same question the file panel answers about a row. It matters
   most for a file pinned from outside the repository: the tab shows it,
