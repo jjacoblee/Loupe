@@ -6853,18 +6853,27 @@ impl App {
                     self.toggle_preview();
                 }
                 KeyCode::Esc => self.close_preview(),
-                KeyCode::Char('q') => self.should_quit = true,
+                // `r` re-reads the document rather than the review, which
+                // is the one thing this pane means by "refresh".
                 KeyCode::Char('r') => self.reload_preview(),
                 KeyCode::Char('g') => self.pending_g = true,
-                KeyCode::Char('m') => self.open_menu_from_key(),
-                KeyCode::Char('t') => self.open_theme_picker(),
-                KeyCode::Char('?') => self.overlay = Overlay::Help,
-                KeyCode::Char('p') if ctrl => self.open_finder(FinderMode::Files),
-                KeyCode::Char('<') => self.resize_file_panel(-2),
-                KeyCode::Char('>') => self.resize_file_panel(2),
-                KeyCode::Char(']') if !self.preview_only => self.step_file(1),
-                KeyCode::Char('[') if !self.preview_only => self.step_file(-1),
-                _ if self.pin_key_bare(key) => {}
+                // `loupe md <file>` has no review behind the document, so
+                // the keys that would go there are left off.
+                _ if self.preview_only
+                    && matches!(
+                        key.code,
+                        KeyCode::Char('b')
+                            | KeyCode::Char('`')
+                            | KeyCode::Char(']')
+                            | KeyCode::Char('[')
+                            | KeyCode::Char('x')
+                            | KeyCode::Char('X')
+                            | KeyCode::Char('S')
+                            | KeyCode::Char('F')
+                    ) => {}
+                // Reading a document is not a reason to be locked out of
+                // the app: everything the review answers, this answers.
+                _ if self.global_key(key) => {}
                 _ => {
                     let Some(pv) = &mut self.preview else { return };
                     match key.code {
@@ -7049,6 +7058,15 @@ impl App {
                     self.ok("Find in this file — Tab adds a replacement, Esc cancels.");
                 }
                 _ if is_find_all_key(key) => self.open_finder(FinderMode::Grep),
+                // The editor takes bare letters as text, so `m` cannot
+                // open the ☰ menu here — and the menu is where a reader
+                // in a buffer reaches everything the app answers
+                // everywhere else. These two open it: the context-menu
+                // key a PC keyboard has, and the gesture for it that
+                // every keyboard has.
+                (KeyCode::Menu, _) | (KeyCode::Enter, KeyModifiers::ALT) => {
+                    self.open_menu_from_key();
+                }
                 (KeyCode::Char('n'), KeyModifiers::ALT)
                 | (KeyCode::Char('N'), KeyModifiers::ALT) => editor.step_match(1),
                 (KeyCode::Char('b'), KeyModifiers::ALT)
@@ -7274,21 +7292,9 @@ impl App {
                     KeyCode::Esc if self.selection.is_some() => self.clear_selection(),
                     KeyCode::Esc if self.find.active() => self.clear_find(),
                     // --- everything that was already bound
-                    KeyCode::Char('q') => self.request_quit(),
-                    KeyCode::Esc | KeyCode::Char('b') => self.back_to_pr_list(),
+                    KeyCode::Esc => self.back_to_pr_list(),
                     KeyCode::Char('v') => self.toggle_view(),
                     KeyCode::Char('z') => self.toggle_fold(),
-                    KeyCode::Char('B') => self.toggle_blame(),
-                    KeyCode::Char('F') => self.toggle_panel(),
-                    KeyCode::Char('x') => self.toggle_file_mark(self.file_cursor),
-                    // The same question about the whole change: stage all
-                    // of it, or — when it is all staged already — take all
-                    // of it back out.
-                    KeyCode::Char('X') => self.toggle_stage_all(),
-                    // Put work aside, or take it back. Shift, because `s`
-                    // is not free and this is not a thing to press by
-                    // accident.
-                    KeyCode::Char('S') => self.open_stash_menu_from_key(),
                     // Put changes back: the section at the cursor, or (with
                     // shift) the whole file. Both ask first.
                     KeyCode::Char('u') => self.ask_revert_section(self.diff_cursor),
@@ -7311,25 +7317,73 @@ impl App {
                     // The review box at the foot of the file panel: the
                     // pull request as a whole, rather than one line of it.
                     KeyCode::Char('R') => self.focus_review(),
-                    KeyCode::Char('`') => self.toggle_workspace(),
                     KeyCode::Char('r') => self.refresh_review(),
-                    KeyCode::Char('m') => self.open_menu_from_key(),
-                    KeyCode::Char('t') => self.open_theme_picker(),
-                    KeyCode::Char('?') => self.overlay = Overlay::Help,
-                    KeyCode::Char('<') => self.resize_file_panel(-2),
-                    KeyCode::Char('>') => self.resize_file_panel(2),
-                    // `n`/`p` used to do this too; they belong to search
-                    // now, and `]`/`[` is the convention anyway.
-                    KeyCode::Char(']') => self.step_file(1),
-                    KeyCode::Char('[') => self.step_file(-1),
-                    // The tab row: `1`-`9` open a tab, `,`/`.` step
-                    // through them, `=` pins the file in front of you and
-                    // `-` unpins the one you are in.
-                    _ if self.pin_key_bare(key) => {}
-                    _ => {}
+                    // Everything the app answers everywhere — quit, go,
+                    // find, stage, stash, settings, and the tab row —
+                    // lives in one place. See [`Self::global_key`].
+                    _ => {
+                        self.global_key(key);
+                    }
                 }
             }
         }
+    }
+
+    /// The keys that are about the app rather than about the pane in
+    /// front of the reader: quit, go somewhere, find something, stage,
+    /// stash, and the settings.
+    ///
+    /// Every mode answers these. They were spelled out once per mode
+    /// before, and each mode answered a different subset — a reader in a
+    /// document could not swap to the pull request, open the grep, or
+    /// reach the Commits panel, for no reason anybody chose. Modes keep
+    /// their own keys above this and fall through to it.
+    ///
+    /// True when the key was answered.
+    fn global_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if is_find_all_key(key) {
+            self.open_finder(FinderMode::Grep);
+            return true;
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P')) {
+            self.open_finder(FinderMode::Files);
+            return true;
+        }
+        // Everything below is a bare key. A modifier on it means it
+        // belongs to whoever bound it — Ctrl+B pages back in both the
+        // diff and the document, and must not read as "back to the list".
+        if ctrl || alt {
+            return false;
+        }
+        match key.code {
+            // --- leaving
+            KeyCode::Char('q') => self.request_quit(),
+            KeyCode::Char('b') => self.back_to_pr_list(),
+            KeyCode::Char('`') => self.toggle_workspace(),
+            // --- finding
+            KeyCode::Char('#') => self.open_finder(FinderMode::Grep),
+            KeyCode::Char('@') => self.open_finder(FinderMode::Symbols),
+            // --- the file panel
+            KeyCode::Char('F') => self.toggle_panel(),
+            KeyCode::Char(']') => self.step_file(1),
+            KeyCode::Char('[') => self.step_file(-1),
+            KeyCode::Char('<') => self.resize_file_panel(-2),
+            KeyCode::Char('>') => self.resize_file_panel(2),
+            // --- the index
+            KeyCode::Char('x') => self.toggle_file_mark(self.file_cursor),
+            KeyCode::Char('X') => self.toggle_stage_all(),
+            KeyCode::Char('S') => self.open_stash_menu_from_key(),
+            // --- everything else
+            KeyCode::Char('B') => self.toggle_blame(),
+            KeyCode::Char('Y') => self.yank_context(),
+            KeyCode::Char('m') => self.open_menu_from_key(),
+            KeyCode::Char('t') => self.open_theme_picker(),
+            KeyCode::Char('?') | KeyCode::F(1) => self.overlay = Overlay::Help,
+            _ => return self.pin_key_bare(key),
+        }
+        true
     }
 
     fn back_to_pr_list(&mut self) {
@@ -7594,48 +7648,28 @@ impl App {
             return;
         }
 
-        // Preview mode: the file panel still switches files, because a
-        // rendered document has nothing unsaved to lose.
+        // Everything that belongs to the window rather than to whatever
+        // is in the middle of it. Answered once, above the mode split, so
+        // no mode can forget one of them.
+        if self.chrome_mouse(m, x, y) {
+            return;
+        }
+
+        // Preview mode: the document, and the wheel over it.
         if self.preview.is_some() {
-            if self.divider_mouse(m, x, y) {
-                return;
-            }
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    match self.layout.button_at(x, y) {
-                        Some(ButtonId::Menu) => {
-                            self.open_menu(x, y);
-                            return;
-                        }
-                        Some(id) if self.activate(id) => return,
-                        _ => {}
-                    }
-                    if contains(self.layout.file_list, x, y) {
-                        self.file_list_click(x, y);
-                        return;
-                    }
                     if let Some(pv) = &mut self.preview {
                         pv.on_click(x, y);
                     }
                 }
-                MouseEventKind::Down(MouseButton::Right) => {
-                    if contains(self.layout.file_list, x, y) {
-                        self.open_path_menu(x, y);
-                    }
-                }
                 MouseEventKind::ScrollUp => {
-                    if contains(self.layout.file_list, x, y) {
-                        self.file_scroll = self.file_scroll.saturating_sub(3);
-                    } else if let Some(pv) = &mut self.preview {
+                    if let Some(pv) = &mut self.preview {
                         pv.scroll_rows(-preview::WHEEL_ROWS);
                     }
                 }
                 MouseEventKind::ScrollDown => {
-                    if contains(self.layout.file_list, x, y) {
-                        let h = self.layout.file_list.height as usize;
-                        let max = self.entries.len().saturating_sub(h.max(1));
-                        self.file_scroll = (self.file_scroll + 3).min(max);
-                    } else if let Some(pv) = &mut self.preview {
+                    if let Some(pv) = &mut self.preview {
                         pv.scroll_rows(preview::WHEEL_ROWS);
                     }
                 }
@@ -7644,30 +7678,10 @@ impl App {
             return;
         }
 
-        // Editor mode: top-bar buttons, the file list, and the editor surface.
+        // Editor mode: the text surface itself.
         if self.editor.is_some() {
-            // The panel divider stays draggable with the editor open.
-            if self.divider_mouse(m, x, y) {
-                return;
-            }
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    match self.layout.button_at(x, y) {
-                        Some(ButtonId::Menu) => {
-                            self.open_menu(x, y);
-                            return;
-                        }
-                        Some(id) if self.activate(id) => return,
-                        _ => {}
-                    }
-                    // The file panel keeps working with the editor
-                    // open. Switching files parks this buffer rather
-                    // than closing it, so there is nothing to save
-                    // first and nothing to lose by clicking away.
-                    if contains(self.layout.file_list, x, y) {
-                        self.file_list_click(x, y);
-                        return;
-                    }
                     // One click places the cursor, two take the word,
                     // three take the line — what every other editor does,
                     // and the reason a double click is how you pick a
@@ -7691,13 +7705,11 @@ impl App {
                         ));
                     }
                 }
-                // Copying a path does not switch files, so the menu still
-                // works while the editor holds the file panel. Over the
-                // text itself, the right button is the code menu.
+                // Over the text itself, the right button is the code
+                // menu. Over the file panel it is the path menu, and the
+                // chrome above has already answered that.
                 MouseEventKind::Down(MouseButton::Right) => {
-                    if contains(self.layout.file_list, x, y) {
-                        self.open_path_menu(x, y);
-                    } else if self
+                    if self
                         .editor
                         .as_mut()
                         .is_some_and(|ed| ed.on_right_click(x, y))
@@ -7716,18 +7728,12 @@ impl App {
                     }
                 }
                 MouseEventKind::ScrollUp => {
-                    if contains(self.layout.file_list, x, y) {
-                        self.file_scroll = self.file_scroll.saturating_sub(3);
-                    } else if let Some(ed) = &mut self.editor {
+                    if let Some(ed) = &mut self.editor {
                         ed.scroll_lines(-3);
                     }
                 }
                 MouseEventKind::ScrollDown => {
-                    if contains(self.layout.file_list, x, y) {
-                        let h = self.layout.file_list.height as usize;
-                        let max = self.entries.len().saturating_sub(h.max(1));
-                        self.file_scroll = (self.file_scroll + 3).min(max);
-                    } else if let Some(ed) = &mut self.editor {
+                    if let Some(ed) = &mut self.editor {
                         ed.scroll_lines(3);
                     }
                 }
@@ -7744,15 +7750,9 @@ impl App {
 
     fn mouse_pr_list(&mut self, m: MouseEvent, x: u16, y: u16) {
         match m.kind {
+            // The toolbar and the ☰ menu are answered by `chrome_mouse`
+            // before this runs, on this screen as on every other.
             MouseEventKind::Down(MouseButton::Left) => {
-                match self.layout.button_at(x, y) {
-                    Some(ButtonId::Menu) => {
-                        self.open_menu(x, y);
-                        return;
-                    }
-                    Some(id) if self.activate(id) => return,
-                    _ => {}
-                }
                 let r = self.layout.pr_list;
                 if contains(r, x, y) {
                     let idx = self.pr_scroll + (y - r.y) as usize;
@@ -7774,27 +7774,72 @@ impl App {
         }
     }
 
-    fn mouse_review(&mut self, m: MouseEvent, x: u16, y: u16) {
+    /// The parts of the window that belong to the window rather than to
+    /// whatever is in the middle of it: the panel divider, the toolbar,
+    /// the ☰ menu, the review badge, and the file panel.
+    ///
+    /// Every mode used to answer these itself, and every mode answered a
+    /// different subset — right-clicking the badge to copy the PR link
+    /// did nothing at all while a document or the editor was open. They
+    /// are answered once here instead, above the mode split, so a mode
+    /// cannot forget one and a new mode gets them for free.
+    ///
+    /// True when the click was answered and the mode should not see it.
+    fn chrome_mouse(&mut self, m: MouseEvent, x: u16, y: u16) -> bool {
         if self.divider_mouse(m, x, y) {
-            return;
+            return true;
         }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 match self.layout.button_at(x, y) {
                     Some(ButtonId::Menu) => {
                         self.open_menu(x, y);
-                        return;
+                        return true;
                     }
-                    Some(id) if self.activate(id) => return,
+                    Some(id) if self.activate(id) => return true,
                     _ => {}
                 }
+                // The file panel keeps working with the editor or a
+                // document open. Switching files parks the buffer rather
+                // than closing it, so there is nothing to save first and
+                // nothing to lose by clicking away.
+                if contains(self.layout.file_list, x, y) {
+                    self.file_list_click(x, y);
+                    return true;
+                }
+                false
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                // The badge carries the PR link wherever the reader is.
+                if contains(self.layout.badge, x, y) {
+                    self.copy_pr_link();
+                    return true;
+                }
+                if contains(self.layout.file_list, x, y) {
+                    self.open_path_menu(x, y);
+                    return true;
+                }
+                false
+            }
+            MouseEventKind::ScrollUp if contains(self.layout.file_list, x, y) => {
+                self.file_scroll = self.file_scroll.saturating_sub(3);
+                true
+            }
+            MouseEventKind::ScrollDown if contains(self.layout.file_list, x, y) => {
+                let h = self.layout.file_list.height as usize;
+                let max = self.entries.len().saturating_sub(h.max(1));
+                self.file_scroll = (self.file_scroll + 3).min(max);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn mouse_review(&mut self, m: MouseEvent, x: u16, y: u16) {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
                 if contains(self.layout.review_box, x, y) {
                     self.focus_review();
-                    return;
-                }
-                let fl = self.layout.file_list;
-                if contains(fl, x, y) {
-                    self.file_list_click(x, y);
                     return;
                 }
                 // A click anywhere else takes the keyboard back from the
@@ -7819,14 +7864,11 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag_select = false;
             }
-            // Right-click on the file panel asks about the row's path;
-            // anywhere else it drops the diff selection.
+            // The badge and the file panel are answered above. Over the
+            // blame pane the right button asks about the commit; anywhere
+            // else it drops the diff selection.
             MouseEventKind::Down(MouseButton::Right) => {
-                if contains(self.layout.badge, x, y) {
-                    self.copy_pr_link();
-                } else if contains(self.layout.file_list, x, y) {
-                    self.open_path_menu(x, y);
-                } else if contains(self.layout.blame, x, y) {
+                if contains(self.layout.blame, x, y) {
                     self.open_blame_menu(x, y);
                 } else {
                     self.clear_selection();
@@ -7846,22 +7888,12 @@ impl App {
                 self.scroll_diff_h(HSCROLL_WHEEL);
             }
             MouseEventKind::ScrollUp => {
-                if contains(self.layout.file_list, x, y) {
-                    self.file_scroll = self.file_scroll.saturating_sub(3);
-                } else {
-                    self.scroll_diff(-3);
-                    self.clamp_cursor_to_view();
-                }
+                self.scroll_diff(-3);
+                self.clamp_cursor_to_view();
             }
             MouseEventKind::ScrollDown => {
-                if contains(self.layout.file_list, x, y) {
-                    let h = self.layout.file_list.height as usize;
-                    let max = self.entries.len().saturating_sub(h.max(1));
-                    self.file_scroll = (self.file_scroll + 3).min(max);
-                } else {
-                    self.scroll_diff(3);
-                    self.clamp_cursor_to_view();
-                }
+                self.scroll_diff(3);
+                self.clamp_cursor_to_view();
             }
             _ => {}
         }
@@ -8725,6 +8757,25 @@ impl App {
                 ButtonId::EditorClose,
             ));
             rows.extend(self.pin_menu_rows());
+            // The editor takes bare letters as text, so the keys that go
+            // somewhere cannot be pressed while it is open. The menu is
+            // how a reader in a buffer reaches them.
+            if self.local {
+                rows.push(MenuRow::Heading("STAGE"));
+                rows.push(item("✚  Stage this file".into(), "", ButtonId::StageFile));
+                rows.push(item("📦 Stash…".into(), "", ButtonId::StashMenu));
+            }
+            rows.push(MenuRow::Heading("GO"));
+            rows.push(item(
+                if self.local {
+                    "⇄  Swap to the pull request".into()
+                } else {
+                    "⇄  Swap to local changes".into()
+                },
+                "",
+                ButtonId::SwapView,
+            ));
+            rows.push(item("←  Pull request list".into(), "", ButtonId::BackToPrs));
             rows.push(MenuRow::Heading("SETTINGS"));
             rows.push(item("🎨 Theme".into(), "t", ButtonId::Theme));
             rows.push(item("?  Help".into(), "?", ButtonId::Help));
@@ -18769,6 +18820,147 @@ more
             other => panic!("cursor should be on a line, got {other:?}"),
         };
         assert_eq!(app.diff.as_ref().unwrap().rows[row].new_ln, Some(3));
+    }
+
+    // ------------------------------------------- nothing is locked down
+
+    /// A local review with a document open over it.
+    fn preview_app() -> App {
+        let mut app = folded_app();
+        app.local = true;
+        app.repo_root = std::env::temp_dir();
+        app.preview = Some(crate::preview::Preview::new(
+            "PLAN.md",
+            "/repo/PLAN.md".into(),
+            "# Plan\n\nBody.\n",
+        ));
+        app.layout.badge = Rect::new(0, 0, 10, 1);
+        app
+    }
+
+    /// The bug this audit started from: right-clicking the PR badge to
+    /// copy the link did nothing while a document was open, because the
+    /// preview answered its own clicks and never learned about the badge.
+    #[test]
+    fn the_badge_copies_the_pr_link_from_every_mode() {
+        for (what, mut app) in [
+            ("the diff", {
+                let mut a = folded_app();
+                a.layout.badge = Rect::new(0, 0, 10, 1);
+                a
+            }),
+            ("a document", preview_app()),
+        ] {
+            // No PR here, so the answer is the refusal rather than a
+            // copy — but it is an answer, which is the whole point.
+            app.local = true;
+            app.pr = None;
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 2, 0));
+            assert!(
+                app.status.contains("No PR link here"),
+                "the badge answered in {what}: {}",
+                app.status
+            );
+        }
+    }
+
+    /// Reading a document is not a reason to be locked out of the app.
+    /// Every key here used to do nothing at all with the preview open.
+    #[test]
+    fn the_document_answers_the_app_level_keys() {
+        let mut app = preview_app();
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(app.panel, PanelMode::Files, "F walks the panels");
+
+        let mut app = preview_app();
+        app.handle_key(key(KeyCode::Char('#')));
+        assert!(
+            matches!(&app.overlay, Overlay::Finder(f) if f.mode == FinderMode::Grep),
+            "# opens the grep"
+        );
+
+        let mut app = preview_app();
+        app.handle_key(key(KeyCode::Char('@')));
+        assert!(
+            matches!(&app.overlay, Overlay::Finder(_)),
+            "@ opens symbols"
+        );
+
+        let mut app = preview_app();
+        app.handle_key(key(KeyCode::Char('X')));
+        assert!(
+            app.status.contains("Staged") || app.status.contains("staged"),
+            "X stages the change: {}",
+            app.status
+        );
+
+        let mut app = preview_app();
+        app.handle_key(key(KeyCode::Char('S')));
+        assert!(
+            matches!(&app.overlay, Overlay::Menu(m) if m.title.contains("Stash")),
+            "S opens the stash menu"
+        );
+
+        let mut app = preview_app();
+        app.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(app.screen, Screen::PrList, "b goes back to the list");
+    }
+
+    /// The document's own keys still win over the app's. Ctrl+B pages
+    /// back there; it must not read as "back to the pull request list".
+    #[test]
+    fn the_documents_own_keys_come_first() {
+        let mut app = preview_app();
+        app.handle_key(ctrl(KeyCode::Char('b')));
+        assert_eq!(app.screen, Screen::Review, "Ctrl+B paged, it did not leave");
+
+        // Esc closes the document rather than leaving the review.
+        let mut app = preview_app();
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.preview.is_none(), "Esc closed the document");
+        assert_eq!(app.screen, Screen::Review);
+
+        // `r` re-reads the document, not the review.
+        let mut app = preview_app();
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(
+            !app.status.contains("Rescanning"),
+            "r reloaded the document: {}",
+            app.status
+        );
+    }
+
+    /// The editor takes bare letters as text, so the ☰ menu is how a
+    /// reader in a buffer reaches everything else — and it has to be
+    /// reachable without the mouse.
+    #[test]
+    fn the_editor_can_open_the_menu_and_it_carries_the_way_out() {
+        let mut app = folded_app();
+        app.local = true;
+        app.checked_out = true;
+        app.open_buffer(buf("test.rs"));
+        assert!(app.editor.is_some(), "the editor opened: {}", app.status);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        let Overlay::Menu(menu) = &app.overlay else {
+            panic!("Alt+Enter opens the menu, status: {}", app.status);
+        };
+        let ids: Vec<ButtonId> = menu
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                MenuRow::Item(it) => Some(it.id),
+                _ => None,
+            })
+            .collect();
+        for want in [
+            ButtonId::SwapView,
+            ButtonId::BackToPrs,
+            ButtonId::StageFile,
+            ButtonId::StashMenu,
+        ] {
+            assert!(ids.contains(&want), "the editor menu offers {want:?}");
+        }
     }
 
     /// The key everyone reaches for. `/` still works; Ctrl+F is what a
