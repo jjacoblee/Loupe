@@ -8873,6 +8873,9 @@ impl App {
             // The editor takes bare letters as text, so the keys that go
             // somewhere cannot be pressed while it is open. The menu is
             // how a reader in a buffer reaches them.
+            rows.push(MenuRow::Heading("FIND"));
+            rows.push(item("🔍 Find in every file".into(), "", ButtonId::FindGrep));
+            rows.push(item("Go to a file".into(), "Ctrl+P", ButtonId::Find));
             if self.local {
                 rows.push(MenuRow::Heading("STAGE"));
                 rows.push(item("✚  Stage this file".into(), "", ButtonId::StageFile));
