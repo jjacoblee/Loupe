@@ -5567,6 +5567,18 @@ impl App {
                 | (KeyCode::Char('P'), KeyModifiers::ALT) => {
                     self.toggle_preview();
                 }
+                // The find prompt, when it has the keyboard.
+                _ if editor.find.typing.is_some() && editor.find_key(key) => {}
+                // Find and replace inside the buffer.
+                (KeyCode::Char('f'), KeyModifiers::ALT)
+                | (KeyCode::Char('F'), KeyModifiers::ALT) => {
+                    editor.open_find();
+                    self.ok("Find in this file — Tab adds a replacement, Esc cancels.");
+                }
+                (KeyCode::Char('n'), KeyModifiers::ALT)
+                | (KeyCode::Char('N'), KeyModifiers::ALT) => editor.step_match(1),
+                (KeyCode::Char('b'), KeyModifiers::ALT)
+                | (KeyCode::Char('B'), KeyModifiers::ALT) => editor.step_match(-1),
                 // `gr` in the diff view. Alt rather than Ctrl for the same
                 // reason as the preview above: the editor takes plain
                 // characters as text, and the free Ctrl keys are spoken

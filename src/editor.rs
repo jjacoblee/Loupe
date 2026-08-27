@@ -50,6 +50,8 @@ pub struct Editor {
     /// Hash of the text last handed to the language server, so an idle
     /// tick can tell whether there is anything new to send.
     pub synced: u64,
+    /// Find and replace within this buffer. See [`BufferFind`].
+    pub find: BufferFind,
     /// The buffer as it was immediately before a format.
     ///
     /// Replacing the whole buffer costs *two* of tui-textarea's undo
@@ -72,6 +74,49 @@ pub struct CompletionState {
     pub scroll: usize,
     /// Where the word being completed starts: (row, col), 0-based.
     pub start: (usize, usize),
+}
+
+/// Find, and optionally replace, inside one buffer.
+///
+/// Deliberately its own thing rather than a second user of `App::find`.
+/// That one searches the diff and counts in display rows, which fold and
+/// pair two sides together; this counts in buffer lines. Sharing the state
+/// would have meant one of them lying about what a number means.
+///
+/// The prompt has no pane of its own — it is written into the editor's
+/// border, where the file name goes. A find bar that pushed the text down
+/// would move the line somebody is reading in order to help them find it.
+#[derive(Default)]
+pub struct BufferFind {
+    pub query: String,
+    /// What to put in place of a match, once `Tab` has been pressed.
+    pub replacement: String,
+    /// Whether keystrokes are going to the prompt, and to which field.
+    pub typing: Option<Field>,
+    /// Every match: (row, first char col, last char col + 1).
+    pub matches: Vec<(usize, usize, usize)>,
+    /// Index into `matches` of the one the cursor is on.
+    pub at: usize,
+    /// Where the cursor was when the prompt opened, so Esc can put it
+    /// back after the incremental jumping around.
+    origin: (usize, usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Query,
+    Replacement,
+}
+
+impl BufferFind {
+    pub fn active(&self) -> bool {
+        !self.query.is_empty()
+    }
+
+    /// The match the cursor is on, if there is one.
+    pub fn current(&self) -> Option<(usize, usize, usize)> {
+        self.matches.get(self.at).copied()
+    }
 }
 
 /// Rows of suggestions on screen at once.
@@ -230,6 +275,7 @@ impl Editor {
             completion: None,
             synced: 0,
             pre_format: None,
+            find: BufferFind::default(),
         }
     }
 
@@ -461,6 +507,184 @@ impl Editor {
     /// The first buffer row on screen. The blame pane beside the editor
     /// scrolls with this, and only this — a buffer has no folds, so one
     /// file line is one row there.
+    fn match_count(&self) -> String {
+        if self.find.matches.is_empty() {
+            format!("no match for “{}”", self.find.query)
+        } else {
+            format!("{}/{}", self.find.at + 1, self.find.matches.len())
+        }
+    }
+
+    /// The prompt, written into the border where the file name goes.
+    fn prompt_title(&self, field: Field) -> String {
+        let mark = |f: Field| if f == field { "▏" } else { "" };
+        format!(
+            " find: {}{} → {}{} — {} · Tab switches · Enter next · Alt+A all · Esc cancels ",
+            self.find.query,
+            mark(Field::Query),
+            self.find.replacement,
+            mark(Field::Replacement),
+            self.match_count()
+        )
+    }
+
+    /// A keystroke for the prompt. False when the key was not one of its.
+    pub fn find_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let Some(field) = self.find.typing else {
+            return false;
+        };
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => self.cancel_find(),
+            KeyCode::Tab => {
+                self.find.typing = Some(match field {
+                    Field::Query => Field::Replacement,
+                    Field::Replacement => Field::Query,
+                });
+            }
+            KeyCode::Enter => self.step_match(1),
+            KeyCode::Char('a') | KeyCode::Char('A') if alt => {
+                self.replace_all();
+                self.find.typing = None;
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') if alt => {
+                self.replace_current();
+            }
+            KeyCode::Backspace => {
+                match field {
+                    Field::Query => {
+                        self.find.query.pop();
+                    }
+                    Field::Replacement => {
+                        self.find.replacement.pop();
+                    }
+                }
+                self.refresh_find();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !alt => {
+                match field {
+                    Field::Query => self.find.query.push(c),
+                    Field::Replacement => self.find.replacement.push(c),
+                }
+                self.refresh_find();
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Open the prompt, remembering where to put the cursor back.
+    pub fn open_find(&mut self) {
+        self.find.origin = self.textarea.cursor();
+        self.find.typing = Some(Field::Query);
+    }
+
+    /// Re-scan the buffer and move to the first match at or after where
+    /// the search started, so the view follows the query as it is typed.
+    pub fn refresh_find(&mut self) {
+        self.find.matches.clear();
+        if !self.find.query.is_empty() {
+            for (row, line) in self.textarea.lines().iter().enumerate() {
+                for (a, b) in crate::search::find_ranges(line, &self.find.query) {
+                    self.find.matches.push((row, a, b));
+                }
+            }
+        }
+        let (from, _) = self.find.origin;
+        self.find.at = self
+            .find
+            .matches
+            .iter()
+            .position(|(row, ..)| *row >= from)
+            .unwrap_or(0);
+        self.go_to_match();
+    }
+
+    /// Step to the next or previous match, wrapping at each end.
+    pub fn step_match(&mut self, delta: i32) {
+        let n = self.find.matches.len();
+        if n == 0 {
+            return;
+        }
+        self.find.at = (self.find.at as i32 + delta).rem_euclid(n as i32) as usize;
+        self.go_to_match();
+    }
+
+    fn go_to_match(&mut self) {
+        let Some((row, col, _)) = self.find.current() else {
+            return;
+        };
+        self.textarea
+            .move_cursor(CursorMove::Jump(row as u16, col as u16));
+    }
+
+    /// Put the cursor back where the search started and forget the query.
+    pub fn cancel_find(&mut self) {
+        let (row, col) = self.find.origin;
+        self.find = BufferFind::default();
+        self.textarea
+            .move_cursor(CursorMove::Jump(row as u16, col as u16));
+    }
+
+    /// Replace the match the cursor is on, and move to the next.
+    ///
+    /// Returns false when there was nothing to replace. The edit goes
+    /// through the same insert and delete the keyboard uses, so one undo
+    /// step covers it and the language server hears about it like any
+    /// other typing.
+    pub fn replace_current(&mut self) -> bool {
+        let Some((row, col, end)) = self.find.current() else {
+            return false;
+        };
+        self.textarea
+            .move_cursor(CursorMove::Jump(row as u16, col as u16));
+        self.textarea.start_selection();
+        self.textarea
+            .move_cursor(CursorMove::Jump(row as u16, end as u16));
+        self.textarea.cut();
+        let replacement = self.find.replacement.clone();
+        if !replacement.is_empty() {
+            self.textarea.insert_str(&replacement);
+        }
+        self.touched();
+        self.dirty = true;
+        // The text moved, so every match after this one did too.
+        let at = self.find.at;
+        self.refresh_find();
+        self.find.at = at.min(self.find.matches.len().saturating_sub(1));
+        self.go_to_match();
+        true
+    }
+
+    /// Replace every match. Returns how many.
+    pub fn replace_all(&mut self) -> usize {
+        let mut n = 0;
+        // Back to front: replacing shifts the columns of everything after
+        // a match on the same line, and nothing before it.
+        let mut targets = self.find.matches.clone();
+        targets.sort();
+        for (row, col, end) in targets.into_iter().rev() {
+            self.textarea
+                .move_cursor(CursorMove::Jump(row as u16, col as u16));
+            self.textarea.start_selection();
+            self.textarea
+                .move_cursor(CursorMove::Jump(row as u16, end as u16));
+            self.textarea.cut();
+            let replacement = self.find.replacement.clone();
+            if !replacement.is_empty() {
+                self.textarea.insert_str(&replacement);
+            }
+            n += 1;
+        }
+        if n > 0 {
+            self.touched();
+            self.dirty = true;
+        }
+        self.refresh_find();
+        n
+    }
+
     pub fn scroll_top(&self) -> usize {
         self.top.0 as usize
     }
@@ -476,7 +700,15 @@ impl Editor {
     /// text, horizontally scrolled by `top.1`) that `hit` assumes.
     /// Must be called every frame the editor is visible.
     pub fn render(&mut self, f: &mut Frame, area: Rect, focused: bool) {
-        let title = if self.read_only {
+        let title = if let Some(field) = self.find.typing {
+            self.prompt_title(field)
+        } else if self.find.active() {
+            format!(
+                " ✎ {} — {} · Alt+N / Alt+B step · Esc clears ",
+                self.path,
+                self.match_count()
+            )
+        } else if self.read_only {
             format!(" 👁 {} — read-only · Ctrl+C copy · Esc close ", self.path)
         } else {
             format!(
@@ -641,6 +873,31 @@ impl Editor {
             Some((start, end)) => (row, ci) >= start && (row, ci) < end,
             None => false,
         };
+        // Search matches on this row, and which of them the cursor is on.
+        // Painted here rather than through `tui-textarea`'s own search
+        // colors: this renderer builds its own spans, so those colors
+        // would never reach the screen.
+        let here: Vec<(usize, usize)> = self
+            .find
+            .matches
+            .iter()
+            .filter(|(r, ..)| *r == row)
+            .map(|(_, a, b)| (*a, *b))
+            .collect();
+        let current = self.find.current().filter(|(r, ..)| *r == row);
+        let match_style = |ci: usize| -> Option<Style> {
+            if !here.iter().any(|(a, b)| ci >= *a && ci < *b) {
+                return None;
+            }
+            let on_this_one = current.is_some_and(|(_, a, b)| ci >= a && ci < b);
+            // The same two colors the diff's search uses, so a match
+            // means the same thing wherever the reader meets one.
+            Some(if on_this_one {
+                Style::default().bg(p.selected).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(p.matched)
+            })
+        };
 
         // Build single-column cells in combined (gutter + text) space so
         // horizontal clipping below stays exact.
@@ -685,6 +942,11 @@ impl Editor {
                 } else {
                     p.stage_partial
                 });
+            }
+            // A search match, under a live selection: dragging over a
+            // match should still look like dragging.
+            if let Some(m) = match_style(ci) {
+                st = st.patch(m);
             }
             if selected(ci) {
                 st = st.bg(p.editor_sel);
@@ -896,6 +1158,65 @@ mod tests {
             sort: label.into(),
             replace: None,
         }
+    }
+
+    /// Replacing has to work back to front. Every match after the one
+    /// being replaced sits at a column the replacement is about to move,
+    /// so replacing forwards would write the second one into the wrong
+    /// place as soon as the replacement is a different length.
+    #[test]
+    fn replace_all_survives_a_longer_replacement() {
+        let mut ed = ed("let a = a + a;\nlet b = a;\n");
+        ed.find.query = "a".into();
+        ed.find.replacement = "alpha".into();
+        ed.refresh_find();
+        assert_eq!(
+            ed.find.matches.len(),
+            4,
+            "three on the first line, one on the second"
+        );
+
+        assert_eq!(ed.replace_all(), 4);
+        assert_eq!(ed.content(), "let alpha = alpha + alpha;\nlet b = alpha;\n");
+        assert!(ed.dirty, "the buffer knows it changed");
+    }
+
+    /// Stepping wraps, and Esc puts the cursor back where the search
+    /// started — the incremental jumping around is undone, not left.
+    #[test]
+    fn stepping_wraps_and_cancelling_returns_the_cursor() {
+        let mut ed = ed("one\ntwo\nthree\ntwo\n");
+        ed.textarea.move_cursor(CursorMove::Jump(2, 0));
+        let before = ed.cursor_pos();
+
+        ed.open_find();
+        ed.find.query = "two".into();
+        ed.refresh_find();
+        assert_eq!(ed.find.matches.len(), 2);
+        assert_eq!(
+            ed.cursor_pos().0,
+            4,
+            "it went to the first match at or after the cursor, 1-based"
+        );
+
+        ed.step_match(1);
+        assert_eq!(ed.cursor_pos().0, 2, "past the end wraps to the first");
+
+        ed.cancel_find();
+        assert_eq!(ed.cursor_pos(), before, "and Esc puts the cursor back");
+        assert!(!ed.find.active());
+    }
+
+    /// A replacement that contains the query must not be found again, or
+    /// replacing `a` with `aa` never finishes.
+    #[test]
+    fn replacing_does_not_re_match_its_own_replacement() {
+        let mut ed = ed("a a\n");
+        ed.find.query = "a".into();
+        ed.find.replacement = "aa".into();
+        ed.refresh_find();
+        assert_eq!(ed.replace_all(), 2);
+        assert_eq!(ed.content(), "aa aa\n");
     }
 
     #[test]
