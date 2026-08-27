@@ -1096,6 +1096,12 @@ pub const BLAME_MIN: u16 = 12;
 /// when reverting is possible at all (see [`App::revert_gutter`]), so a
 /// read-only review still gets the full width for code.
 pub const REVERT_W: u16 = 2;
+
+/// How old the repository listing may get before coming back to the file
+/// panel re-reads it. Long, because the read costs about 93 ms on a
+/// 16,761-file repository and nothing on screen goes wrong while it is
+/// out of date — a file added a minute ago simply is not listed yet.
+const REPO_LISTING_MAX_AGE: Duration = Duration::from_secs(60);
 /// Lines of context kept between the cursor and the edge of the diff pane.
 const SCROLLOFF: usize = 3;
 /// Columns one Left/Right key press scrolls the diff body.
@@ -1877,6 +1883,9 @@ pub struct App {
     /// Every path in the repository, for rows the change does not touch.
     /// [`RowSrc::Path`] indexes into it. Empty until the listing lands.
     pub repo_paths: Vec<String>,
+    /// Path to its index in `files`, so a row in the repository list can
+    /// find the change behind it without scanning. Rebuilt with the tree.
+    changed_by_path: HashMap<String, usize>,
     /// Whether each path in `repo_paths` is one git ignores, drawn dim.
     /// Parallel to `repo_paths` rather than a split point, because reading
     /// inside an ignored directory appends its children to the end and
@@ -1895,6 +1904,9 @@ pub struct App {
     repo_job: Option<Receiver<Result<search::RepoListing>>>,
     /// The in-flight read of one directory the listing stopped at.
     dir_job: Option<Receiver<Result<DirRead>>>,
+    /// When the repository listing last landed, for the staleness check on
+    /// the way back into Files mode.
+    repo_listed: Option<Instant>,
     /// Width of the file panel in columns; dragged by the divider, seeded
     /// from the `file_panel_width` config key.
     pub file_panel_w: u16,
@@ -2132,12 +2144,14 @@ impl App {
             entries: Vec::new(),
             tree: TreeNodes::default(),
             repo_paths: Vec::new(),
+            changed_by_path: HashMap::new(),
             repo_ignored: Vec::new(),
             file_tree: TreeNodes::default(),
             panel: PanelMode::Changes,
             collapsed_files: HashSet::new(),
             repo_job: None,
             dir_job: None,
+            repo_listed: None,
             file_panel_w: FILE_PANEL_DEFAULT,
             dragging: Dragging::None,
             diff: None,
@@ -4676,18 +4690,24 @@ impl App {
     /// is why this returns an `Option` rather than panicking on a bad
     /// index the way `files[idx]` did.
     pub fn changed_of(&self, src: RowSrc) -> Option<&ChangedFile> {
-        match src {
-            RowSrc::Changed(i) => self.files.get(i),
-            RowSrc::Path(_) => None,
-        }
+        self.changed_idx(src).and_then(|i| self.files.get(i))
     }
 
     /// The index into `files` behind a row, for the callers that need to
     /// act on the changeset rather than read from it.
+    /// A row in the repository list that names a file the change *does*
+    /// touch resolves to it. So its stage mark, its viewed mark and its
+    /// conflict mark all show in either panel, and clicking it opens the
+    /// diff rather than the plain file — the two lists disagreeing about
+    /// the same file would be the worse answer.
     pub fn changed_idx(&self, src: RowSrc) -> Option<usize> {
         match src {
             RowSrc::Changed(i) if i < self.files.len() => Some(i),
-            _ => None,
+            RowSrc::Changed(_) => None,
+            RowSrc::Path(i) => {
+                let path = self.repo_paths.get(i)?;
+                self.changed_by_path.get(path).copied()
+            }
         }
     }
 
@@ -4719,9 +4739,7 @@ impl App {
         self.panel = panel;
         self.file_scroll = 0;
         if panel == PanelMode::Files {
-            if self.repo_paths.is_empty() && self.repo_job.is_none() {
-                self.spawn_repo_listing();
-            }
+            self.refresh_repo_listing_if_stale();
             self.ok("Files — every file in the repository. F goes back to the change.");
         } else {
             self.ok("Back to the files this change touches.");
@@ -4735,6 +4753,25 @@ impl App {
             PanelMode::Changes => PanelMode::Files,
             PanelMode::Files => PanelMode::Changes,
         });
+    }
+
+    /// Re-read the repository if the listing has gone stale.
+    ///
+    /// Deliberately not a tick. `git ls-files` costs about 93 ms on a
+    /// 16,761-file repository, and paying that on a timer while somebody
+    /// reads would spend the whole budget this panel was built around. It
+    /// runs when the reader comes back to the panel, and when they ask.
+    fn refresh_repo_listing_if_stale(&mut self) {
+        if self.repo_job.is_some() {
+            return;
+        }
+        let stale = match self.repo_listed {
+            None => true,
+            Some(at) => at.elapsed() >= REPO_LISTING_MAX_AGE,
+        };
+        if stale {
+            self.spawn_repo_listing();
+        }
     }
 
     /// Read the repository's file list on a worker thread.
@@ -4758,8 +4795,23 @@ impl App {
     /// tree costs 2.1 ms and a 400,000-entry `Vec` on every toggle;
     /// collapsed it costs about 2 µs and seven entries.
     fn apply_repo_listing(&mut self, listing: search::RepoListing) {
+        // What the reader had opened, before the tree is replaced. A
+        // refresh that collapsed the folder somebody was reading would be
+        // worse than not refreshing at all.
+        let was_open: HashSet<String> = self
+            .file_tree
+            .all_dirs()
+            .into_iter()
+            .filter(|d| !self.collapsed_files.contains(d))
+            .collect();
         self.file_tree = TreeNodes::from_listing(&listing);
-        self.collapsed_files = self.file_tree.all_dirs();
+        self.collapsed_files = self
+            .file_tree
+            .all_dirs()
+            .into_iter()
+            .filter(|d| !was_open.contains(d))
+            .collect();
+        self.repo_listed = Some(Instant::now());
         self.repo_ignored = (0..listing.paths.len())
             .map(|i| i >= listing.ignored_from)
             .collect();
@@ -4840,6 +4892,12 @@ impl App {
     /// or the tree/flat toggle — because that keeps the tree.
     pub fn rebuild_files(&mut self) {
         self.tree = TreeNodes::build(&self.files);
+        self.changed_by_path = self
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.path.clone(), i))
+            .collect();
         self.rebuild_entries();
     }
 
@@ -9971,6 +10029,11 @@ impl App {
         }
         // A manual refresh restarts the idle clock: the tree was just read.
         self.last_auto_rescan = Instant::now();
+        // Asking for a refresh means the whole panel, whichever list is in
+        // front of the reader.
+        if self.panel == PanelMode::Files && self.repo_job.is_none() {
+            self.spawn_repo_listing();
+        }
         if self.local {
             self.ok("⟳ Rescanning local changes…");
             self.spawn_quiet_local(false);
@@ -12041,6 +12104,102 @@ b2
         highlight::set_theme(before_theme);
         crate::theme::set_appearance(before_appearance);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file the change touches keeps its marks in either panel, and a
+    /// click on it opens the diff rather than the plain file. Two lists
+    /// disagreeing about the same file would be the worse answer.
+    #[test]
+    fn a_changed_file_keeps_its_marks_in_the_repository_list() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.files = vec![cf("src/app.rs")];
+        app.rebuild_files();
+        app.apply_repo_listing(search::RepoListing {
+            paths: vec!["src/app.rs".into(), "src/untouched.rs".into()],
+            ignored_from: 2,
+            stubs: Vec::new(),
+        });
+
+        let changed = RowSrc::Path(0);
+        let untouched = RowSrc::Path(1);
+        assert_eq!(
+            app.changed_of(changed).map(|f| f.path.as_str()),
+            Some("src/app.rs"),
+            "the repository row found the change behind it"
+        );
+        assert_eq!(app.changed_idx(changed), Some(0));
+        assert!(
+            app.changed_of(untouched).is_none(),
+            "and the file beside it has no change to find"
+        );
+    }
+
+    /// A refresh must not collapse the folder somebody is reading. It
+    /// re-reads the repository, so the tree is replaced wholesale, and
+    /// nothing but this carries the reader's place across it.
+    #[test]
+    fn refreshing_the_listing_keeps_open_folders_open() {
+        let mut app = App::new(LaunchMode::Local, None);
+        let listing = || search::RepoListing {
+            paths: vec!["src/app.rs".into(), "docs/plan.md".into()],
+            ignored_from: 2,
+            stubs: Vec::new(),
+        };
+        app.apply_repo_listing(listing());
+        assert!(
+            app.collapsed_files.contains("src"),
+            "everything starts shut"
+        );
+
+        app.collapsed_files.remove("src");
+        app.apply_repo_listing(listing());
+
+        assert!(
+            !app.collapsed_files.contains("src"),
+            "the folder the reader opened is still open"
+        );
+        assert!(
+            app.collapsed_files.contains("docs"),
+            "and the one they never touched is still shut"
+        );
+    }
+
+    /// The panel's whole speed budget in one assertion. Absolute bounds
+    /// rather than the ratio next door, so a change that makes both halves
+    /// slowly worse together still fails.
+    ///
+    /// They are deliberately loose — about 20 times what this machine
+    /// measures — because a shared CI runner is not a laptop. What they
+    /// catch is a change of *shape*: a walk that became quadratic, or a
+    /// subprocess that found its way onto the emit path.
+    #[test]
+    fn the_tree_stays_inside_its_budget() {
+        let paths: Vec<String> = (0..20_000)
+            .map(|i| format!("pkg{}/mod{}/file{i}.rs", i % 40, i % 400))
+            .collect();
+        let listing = search::RepoListing {
+            ignored_from: paths.len(),
+            paths,
+            stubs: Vec::new(),
+        };
+
+        let t = Instant::now();
+        let tree = TreeNodes::from_listing(&listing);
+        let build = t.elapsed();
+        assert!(
+            build < Duration::from_millis(200),
+            "building 20,000 paths took {build:?} — it measures about 8 ms"
+        );
+
+        let collapsed = tree.all_dirs();
+        let t = Instant::now();
+        let mut rows = Vec::new();
+        tree.emit(&collapsed, &mut rows);
+        let emit = t.elapsed();
+        assert!(
+            emit < Duration::from_millis(5),
+            "emitting a collapsed 20,000-path tree took {emit:?} — it measures about 4 µs"
+        );
     }
 
     /// Reading a stub must add to the list, never renumber it: a row

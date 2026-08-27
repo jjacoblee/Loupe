@@ -517,10 +517,17 @@ is no slower than it is today.
   `ChangedFile`. Look that up through the cached list, not a scan.
 - Refresh the path list on an explicit action and on a long interval, per
   D4. Never per tick.
-- **Add the timing tests.** Generate 20,000 synthetic paths, then assert:
-  `emit` under 50 µs collapsed, and `build_nodes` under 10 ms. A test that
-  fails when someone puts a walk back on the UI thread is the only thing
-  that keeps this plan true after it ships.
+- **Add the timing tests.** Generate 20,000 synthetic paths, then assert
+  the bounds.
+
+  **Correction found while doing it:** the 10 ms build bound named here is
+  too tight. The build measures 8.06 ms on this machine, so a shared CI
+  runner would fail it for being a shared CI runner. The tests use bounds
+  about 20 times the measurement — 200 ms build, 5 ms emit — which still
+  catch a change of *shape* (a walk gone quadratic, a subprocess on the
+  emit path) and never catch a slow afternoon. The ratio test from STEP 1
+  stays beside them: it is what catches both halves getting slowly worse
+  together.
 
 **Size:** 1 day.
 
