@@ -1714,6 +1714,36 @@ pub struct HoverData {
     text: Option<String>,
 }
 
+/// Turn a language server's positions into rows somebody can read.
+///
+/// The positions alone would make an unreadable list, so the line each one
+/// points at is read, once per file. The server counts columns in UTF-16
+/// units and the rest of loupe counts chars, so the column is converted
+/// here rather than at every use.
+fn build_places(root: &Path, rev: Option<&str>, locs: Vec<lsp::Loc>) -> Vec<Place> {
+    let mut cache: HashMap<String, Option<String>> = HashMap::new();
+    locs.into_iter()
+        .take(search::RESULT_LIMIT)
+        .map(|loc| {
+            let content = cache
+                .entry(loc.path.clone())
+                .or_insert_with(|| read_source(root, rev, &loc.path));
+            let line = content
+                .as_ref()
+                .and_then(|c| c.lines().nth(loc.line.saturating_sub(1)))
+                .unwrap_or("");
+            let loc = lsp::Loc {
+                col: lsp::char_column(line, loc.col.saturating_sub(1)) + 1,
+                ..loc
+            };
+            Place {
+                loc,
+                text: line.trim_end().to_string(),
+            }
+        })
+        .collect()
+}
+
 /// Read a file the way the current review reads files: from the commit
 /// under review, falling back to the working tree.
 fn read_source(root: &std::path::Path, rev: Option<&str>, path: &str) -> Option<String> {
@@ -1731,6 +1761,9 @@ enum EditorRequest {
     Complete,
     Hover,
     Definition,
+    /// Every place a symbol is used. `gr` has answered this in the diff
+    /// view since language servers arrived; the editor could not.
+    References,
     Format,
 }
 
@@ -1766,6 +1799,9 @@ enum EditorOutcome {
     },
     /// `None` when the server does not format this language.
     Formatted(Option<Vec<lsp::TextEdit>>),
+    /// Every place a symbol is used, ready for the same list the diff
+    /// view shows.
+    References(Box<LocationsData>),
 }
 
 /// A finder query running in the background. Unlike every other job this
@@ -5504,6 +5540,14 @@ impl App {
                 | (KeyCode::Char('P'), KeyModifiers::ALT) => {
                     self.toggle_preview();
                 }
+                // `gr` in the diff view. Alt rather than Ctrl for the same
+                // reason as the preview above: the editor takes plain
+                // characters as text, and the free Ctrl keys are spoken
+                // for.
+                (KeyCode::Char('r'), KeyModifiers::ALT)
+                | (KeyCode::Char('R'), KeyModifiers::ALT) => {
+                    self.spawn_editor_request(EditorRequest::References);
+                }
                 // tui-textarea's own undo is Ctrl+U; Ctrl+Z is what
                 // everyone reaches for, so both work. A format is undone
                 // whole rather than in the two steps it took to apply.
@@ -8114,6 +8158,24 @@ impl App {
     /// if it isn't.
     fn open_hit(&mut self, path: String, line: Option<usize>) {
         self.overlay = Overlay::None;
+        // Landing somewhere from the editor has to leave it first, and
+        // must not throw away unsaved work to do it. Inside the open
+        // buffer there is nothing to leave.
+        if let Some(ed) = &self.editor {
+            if ed.path == path {
+                if let (Some(l), Some(ed)) = (line, &mut self.editor) {
+                    ed.jump_to_line(l);
+                }
+                return;
+            }
+            if ed.dirty {
+                self.err(format!(
+                    "{path} is another file — save (Ctrl+S) or discard first."
+                ));
+                return;
+            }
+            self.editor = None;
+        }
         // Already looking at it.
         if self.files.get(self.file_cursor).map(|f| f.path.as_str()) == Some(path.as_str())
             && self.diff.is_some()
@@ -8220,6 +8282,13 @@ impl App {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let result = match what {
+                EditorRequest::References => lsp.references(&root, &path, &text, at).map(|locs| {
+                    EditorOutcome::References(Box::new(LocationsData {
+                        action: LspAction::References,
+                        places: build_places(&root, None, locs),
+                        word,
+                    }))
+                }),
                 EditorRequest::Complete => lsp
                     .complete(&root, &path, &text, at)
                     .map(EditorOutcome::Completions),
@@ -8290,6 +8359,7 @@ impl App {
                 self.editor = None;
                 self.open_hit(loc.path, Some(loc.line));
             }
+            EditorOutcome::References(d) => self.apply_locations(*d),
             EditorOutcome::Formatted(edits) => {
                 let Some(edits) = edits else {
                     self.err("This language server does not format.".to_string());
@@ -8606,32 +8676,7 @@ impl App {
                 } else {
                     lsp.references(&root, &path, &text, at)?
                 };
-                // The positions alone would make an unreadable list; read
-                // the line each one points at, once per file.
-                let mut cache: HashMap<String, Option<String>> = HashMap::new();
-                let places = locs
-                    .into_iter()
-                    .take(search::RESULT_LIMIT)
-                    .map(|loc| {
-                        let content = cache
-                            .entry(loc.path.clone())
-                            .or_insert_with(|| read_source(&root, rev.as_deref(), &loc.path));
-                        let line = content
-                            .as_ref()
-                            .and_then(|c| c.lines().nth(loc.line.saturating_sub(1)))
-                            .unwrap_or("");
-                        // The server counts columns in UTF-16 units; the
-                        // rest of loupe counts chars.
-                        let loc = lsp::Loc {
-                            col: lsp::char_column(line, loc.col.saturating_sub(1)) + 1,
-                            ..loc
-                        };
-                        Place {
-                            loc,
-                            text: line.trim_end().to_string(),
-                        }
-                    })
-                    .collect();
+                let places = build_places(&root, rev.as_deref(), locs);
                 Ok(Outcome::Locations(Box::new(LocationsData {
                     action,
                     word,
@@ -12104,6 +12149,54 @@ b2
         highlight::set_theme(before_theme);
         crate::theme::set_appearance(before_appearance);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `gr` answered in the diff view and did nothing in the editor, so
+    /// opening a file from the tree used to cost you the ability to ask
+    /// who calls it. Both now reach the same request.
+    #[test]
+    fn the_editor_can_ask_for_references() {
+        assert!(
+            EditorRequest::References.is_explicit(),
+            "a key press, so a missing server is worth saying out loud"
+        );
+
+        let mut app = App::new(LaunchMode::Local, None);
+        app.files = vec![cf("src/app.rs")];
+        app.rebuild_files();
+        app.apply_locations(LocationsData {
+            action: LspAction::References,
+            word: "walk".into(),
+            places: vec![
+                Place {
+                    loc: lsp::Loc {
+                        path: "src/app.rs".into(),
+                        line: 12,
+                        col: 4,
+                    },
+                    text: "    walk(&self.root);".into(),
+                },
+                Place {
+                    loc: lsp::Loc {
+                        path: "src/ui.rs".into(),
+                        line: 40,
+                        col: 8,
+                    },
+                    text: "        walk(node);".into(),
+                },
+            ],
+        });
+
+        let Overlay::Finder(f) = &app.overlay else {
+            panic!("references open the finder");
+        };
+        assert_eq!(f.mode, FinderMode::Refs);
+        assert_eq!(f.preset.len(), 2);
+        assert!(
+            f.preset[0].in_changeset,
+            "a use inside the change is marked as one"
+        );
+        assert!(!f.preset[1].in_changeset);
     }
 
     /// A file the change touches keeps its marks in either panel, and a
