@@ -1315,6 +1315,127 @@ impl Lsp {
         })
     }
 
+    /// Rename a symbol everywhere the server knows about it.
+    ///
+    /// The answer is a `WorkspaceEdit`, which touches files that are not
+    /// open. Loupe does not write those: each one comes back as an unsaved
+    /// buffer for the reader to look at before saving, because a tool that
+    /// silently rewrites twelve files is a tool nobody can review.
+    ///
+    /// `prepareRename` first, when the server offers it. It is the
+    /// difference between "you cannot rename a keyword" and a rename that
+    /// half happens.
+    pub fn rename(
+        &self,
+        root: &Path,
+        path: &str,
+        text: &str,
+        at: (usize, usize),
+        new_name: &str,
+    ) -> Result<Vec<(String, Vec<TextEdit>)>> {
+        let uri = uri_of(&root.join(path));
+        self.with_client(root, path, |c| {
+            let provider = c.caps.get("renameProvider").cloned().unwrap_or(Value::Null);
+            if provider.is_null() || provider == Value::Bool(false) {
+                bail!("This language server does not rename.");
+            }
+            c.sync(&uri, path, text)?;
+            let position = json!({"line": at.0, "character": at.1});
+            if provider.get("prepareProvider") == Some(&Value::Bool(true)) {
+                let ready = c.request(
+                    "textDocument/prepareRename",
+                    json!({"textDocument": {"uri": uri}, "position": position}),
+                    REQUEST_TIMEOUT,
+                )?;
+                if ready.is_null() {
+                    bail!("There is nothing here that can be renamed.");
+                }
+            }
+            let result = c.request(
+                "textDocument/rename",
+                json!({
+                    "textDocument": {"uri": uri},
+                    "position": position,
+                    "newName": new_name,
+                }),
+                REQUEST_TIMEOUT,
+            )?;
+            Ok(parse_workspace_edit(&result, root))
+        })
+    }
+
+    /// The fixes and refactors a server offers for a place in a file.
+    pub fn code_actions(
+        &self,
+        root: &Path,
+        path: &str,
+        text: &str,
+        at: (usize, usize),
+        diagnostics: &[Diagnostic],
+    ) -> Result<Vec<CodeAction>> {
+        let uri = uri_of(&root.join(path));
+        self.with_client(root, path, |c| {
+            if c.caps.get("codeActionProvider").is_none() {
+                return Ok(Vec::new());
+            }
+            c.sync(&uri, path, text)?;
+            // The diagnostics on this line are what turn a general list of
+            // refactors into "fix this error" — a server that is not told
+            // about them offers the refactors and none of the fixes.
+            let diags: Vec<Value> = diagnostics
+                .iter()
+                .filter(|d| d.line == at.0 + 1)
+                .map(|d| {
+                    json!({
+                        "range": {
+                            "start": {"line": d.line - 1, "character": d.col - 1},
+                            "end": {"line": d.line - 1, "character": d.end_col - 1},
+                        },
+                        "severity": d.severity,
+                        "message": d.message,
+                    })
+                })
+                .collect();
+            let position = json!({"line": at.0, "character": at.1});
+            let result = c.request(
+                "textDocument/codeAction",
+                json!({
+                    "textDocument": {"uri": uri},
+                    "range": {"start": position, "end": position},
+                    "context": {"diagnostics": diags},
+                }),
+                REQUEST_TIMEOUT,
+            )?;
+            Ok(parse_code_actions(&result, root))
+        })
+    }
+
+    /// The signature of the call the cursor is inside, if it is inside one.
+    pub fn signature_help(
+        &self,
+        root: &Path,
+        path: &str,
+        text: &str,
+        at: (usize, usize),
+    ) -> Result<Option<Signature>> {
+        let uri = uri_of(&root.join(path));
+        self.with_client(root, path, |c| {
+            if c.caps.get("signatureHelpProvider").is_none() {
+                return Ok(None);
+            }
+            c.sync(&uri, path, text)?;
+            let result = c.request(
+                "textDocument/signatureHelp",
+                json!({
+                    "textDocument": {"uri": uri},
+                    "position": {"line": at.0, "character": at.1},
+                }),
+                REQUEST_TIMEOUT,
+            )?;
+            Ok(parse_signature(&result))
+        })
+    }
+
     /// One line per language: running, not installed, or never asked.
     pub fn status(&self) -> Vec<(&'static str, String)> {
         let map = lock(&self.slots);
@@ -1466,6 +1587,163 @@ fn parse_edits(value: &Value) -> Vec<TextEdit> {
             })
         })
         .collect()
+}
+
+/// One fix or refactor a server offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeAction {
+    pub title: String,
+    /// "quickfix", "refactor.extract", and so on. Empty when the server
+    /// does not say.
+    pub kind: String,
+    /// What it changes, per file. Empty for an action the server wants to
+    /// run itself, which loupe does not offer — a command is arbitrary
+    /// server-side work, and there is nothing to show the reader first.
+    pub edits: Vec<(String, Vec<TextEdit>)>,
+}
+
+/// The call the cursor is inside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signature {
+    /// `fn insert(&mut self, path: &str, src: RowSrc)`.
+    pub label: String,
+    /// Char range within `label` of the parameter the cursor is on, when
+    /// the server says which.
+    pub active: Option<(usize, usize)>,
+    pub doc: Option<String>,
+}
+
+/// A server's URI as a repo-relative path.
+///
+/// `None` for anything outside the repository. A rename reaching into a
+/// dependency or the standard library is a rename loupe will not apply:
+/// those files are not the reader's to change, and editing them would put
+/// the change somewhere `git status` never looks.
+fn rel_path(uri: &str, root: &Path) -> Option<String> {
+    let path = path_of_uri(uri)?;
+    let rel = path.strip_prefix(root).ok()?;
+    Some(rel.to_string_lossy().to_string())
+}
+
+/// A `WorkspaceEdit` as repo-relative paths and their edits.
+///
+/// Both shapes the protocol allows: the plain `changes` map, and the
+/// ordered `documentChanges` list that newer servers prefer. A rename
+/// that quietly dropped half its files because the server used the other
+/// shape would be the worst kind of wrong.
+fn parse_workspace_edit(value: &Value, root: &Path) -> Vec<(String, Vec<TextEdit>)> {
+    let mut out: Vec<(String, Vec<TextEdit>)> = Vec::new();
+    let mut add = |uri: &str, edits: Vec<TextEdit>| {
+        if edits.is_empty() {
+            return;
+        }
+        if let Some(path) = rel_path(uri, root) {
+            match out.iter_mut().find(|(p, _)| *p == path) {
+                Some((_, existing)) => existing.extend(edits),
+                None => out.push((path, edits)),
+            }
+        }
+    };
+    if let Some(changes) = value.get("changes").and_then(Value::as_object) {
+        for (uri, edits) in changes {
+            add(uri, parse_edits(edits));
+        }
+    }
+    if let Some(docs) = value.get("documentChanges").and_then(Value::as_array) {
+        for doc in docs {
+            // A `CreateFile`/`RenameFile`/`DeleteFile` has no `textDocument`
+            // and is skipped: loupe shows edits for review, and there is
+            // nothing to show for a file operation.
+            let Some(uri) = doc.pointer("/textDocument/uri").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(edits) = doc.get("edits") {
+                add(uri, parse_edits(edits));
+            }
+        }
+    }
+    out
+}
+
+fn parse_code_actions(value: &Value, root: &Path) -> Vec<CodeAction> {
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|a| {
+            let title = a.get("title")?.as_str()?.to_string();
+            let edits = a
+                .get("edit")
+                .map(|e| parse_workspace_edit(e, root))
+                .unwrap_or_default();
+            // Nothing to apply and nothing to show: a bare command.
+            if edits.is_empty() {
+                return None;
+            }
+            Some(CodeAction {
+                title,
+                kind: a
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                edits,
+            })
+        })
+        .collect()
+}
+
+fn parse_signature(value: &Value) -> Option<Signature> {
+    let sigs = value.get("signatures")?.as_array()?;
+    let active = value
+        .get("activeSignature")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let sig = sigs.get(active).or_else(|| sigs.first())?;
+    let label = sig.get("label")?.as_str()?.to_string();
+    // Which parameter the cursor is on. The protocol allows the label to
+    // be a range into the signature or a string to find in it; both are
+    // in the wild, so both are read.
+    let active_param = sig
+        .get("activeParameter")
+        .or_else(|| value.get("activeParameter"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let range = sig
+        .get("parameters")
+        .and_then(Value::as_array)
+        .and_then(|ps| ps.get(active_param))
+        .and_then(|p| match p.get("label") {
+            Some(Value::Array(r)) => {
+                let a = r.first()?.as_u64()? as usize;
+                let b = r.get(1)?.as_u64()? as usize;
+                Some((a, b))
+            }
+            Some(Value::String(name)) => {
+                let at = label.find(name.as_str())?;
+                Some((
+                    label[..at].chars().count(),
+                    label[..at + name.len()].chars().count(),
+                ))
+            }
+            _ => None,
+        });
+    let doc = sig
+        .get("documentation")
+        .and_then(|d| match d {
+            Value::String(s) => Some(s.clone()),
+            other => other
+                .get("value")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+        .filter(|d| !d.trim().is_empty());
+    Some(Signature {
+        label,
+        active: range,
+        doc,
+    })
 }
 
 /// Whether an answer is "nothing" — which from a server that is still
@@ -1637,7 +1915,97 @@ mod tests {
         }
     }
 
-    /// A closed document must be forgotten on both sides. The client's
+    /// A `WorkspaceEdit` comes in two shapes and servers use both. Reading
+    /// only one would drop half a rename's files silently, which is the
+    /// worst way for a rename to be wrong.
+    #[test]
+    fn a_workspace_edit_is_read_in_both_shapes() {
+        let root = Path::new("/repo");
+        let edit = |line: u64| {
+            json!([{
+                "range": {
+                    "start": {"line": line, "character": 4},
+                    "end": {"line": line, "character": 7},
+                },
+                "newText": "beta",
+            }])
+        };
+
+        let plain = json!({"changes": {"file:///repo/src/a.rs": edit(1)}});
+        let got = parse_workspace_edit(&plain, root);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "src/a.rs");
+        assert_eq!(got[0].1[0].text, "beta");
+
+        let ordered = json!({
+            "documentChanges": [
+                {"textDocument": {"uri": "file:///repo/src/a.rs", "version": 1},
+                 "edits": edit(1)},
+                {"textDocument": {"uri": "file:///repo/src/b.rs", "version": 1},
+                 "edits": edit(9)},
+                // A file operation carries no `textDocument` and is skipped:
+                // there are no edits in it to show anybody.
+                {"kind": "create", "uri": "file:///repo/src/c.rs"},
+            ]
+        });
+        let got = parse_workspace_edit(&ordered, root);
+        assert_eq!(got.len(), 2, "both files, and not the create: {got:?}");
+
+        // A rename reaching into a dependency is not the reader's to make.
+        let outside = json!({"changes": {"file:///elsewhere/dep.rs": edit(1)}});
+        assert!(parse_workspace_edit(&outside, root).is_empty());
+    }
+
+    /// A code action with nothing but a command is not offered. Running one
+    /// is arbitrary work on the server's side with nothing to show the
+    /// reader first, and this menu's whole promise is that you see the
+    /// change before it happens.
+    #[test]
+    fn a_code_action_with_no_edits_is_not_offered() {
+        let root = Path::new("/repo");
+        let actions = json!([
+            {"title": "Run the thing", "kind": "source", "command": {"command": "do.it"}},
+            {"title": "Import Foo", "kind": "quickfix", "edit": {
+                "changes": {"file:///repo/src/a.rs": [{
+                    "range": {"start": {"line": 0, "character": 0},
+                              "end": {"line": 0, "character": 0}},
+                    "newText": "use Foo;\n",
+                }]}
+            }},
+        ]);
+        let got = parse_code_actions(&actions, root);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].title, "Import Foo");
+    }
+
+    /// The parameter the cursor is on can be a range into the label or a
+    /// string to find in it. Both are in the wild.
+    #[test]
+    fn signature_help_reads_both_parameter_shapes() {
+        let by_range = json!({
+            "signatures": [{
+                "label": "insert(path, src)",
+                "parameters": [{"label": [7, 11]}, {"label": [13, 16]}],
+                "activeParameter": 1,
+            }],
+            "activeSignature": 0,
+        });
+        let sig = parse_signature(&by_range).unwrap();
+        assert_eq!(sig.label, "insert(path, src)");
+        assert_eq!(sig.active, Some((13, 16)));
+
+        let by_name = json!({
+            "signatures": [{
+                "label": "insert(path, src)",
+                "parameters": [{"label": "path"}, {"label": "src"}],
+                "activeParameter": 0,
+            }],
+        });
+        let sig = parse_signature(&by_name).unwrap();
+        assert_eq!(sig.active, Some((7, 11)), "found by name in the label");
+    }
+
+    /// A closed document must be forgotten on both sides.    /// A closed document must be forgotten on both sides. The client's
     /// half is what stops `sync` from sending a `didChange` for a file
     /// nobody has open, which the server would rightly reject.
     #[test]

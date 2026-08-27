@@ -68,6 +68,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::ThemePicker(_) => draw_theme_picker(f, app, area),
         Overlay::Finder(_) => draw_finder(f, app, area),
         Overlay::Hover(_) => draw_hover(f, app, area),
+        Overlay::CodeActions(_) => draw_code_actions(f, app, area),
         Overlay::PathMenu(_) => draw_path_menu(f, app, area),
         Overlay::BlameMenu(_) => draw_blame_menu(f, app, area),
         Overlay::ConflictMenu(_) => draw_conflict_menu(f, app, area),
@@ -3188,6 +3189,65 @@ fn draw_hover(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The finder overlay: one input, one list, three modes.
+/// The fixes and refactors a language server offers, centred over the
+/// editor. A list rather than a set of hotkeys: their titles are sentences
+/// a server wrote, and there is no letter to give them.
+fn draw_code_actions(f: &mut Frame, app: &App, area: Rect) {
+    let Overlay::CodeActions(menu) = &app.overlay else {
+        return;
+    };
+    let p = palette();
+    let w = menu
+        .actions
+        .iter()
+        .map(|a| disp_width(&a.title) + 6)
+        .max()
+        .unwrap_or(30)
+        .clamp(30, area.width.saturating_sub(8) as usize) as u16;
+    let h = (menu.actions.len() as u16 + 2).min(area.height.saturating_sub(4));
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.accent))
+        .title(" Fixes and refactors ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let lines: Vec<Line> = menu
+        .actions
+        .iter()
+        .enumerate()
+        .take(inner.height as usize)
+        .map(|(i, a)| {
+            let base = if i == menu.sel {
+                Style::default().bg(p.row).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            // How many files it touches, because "extract function" over
+            // one file and over nine are different decisions.
+            let n = a.edits.len();
+            let where_ = if n > 1 {
+                format!(" ({n} files)")
+            } else {
+                String::new()
+            };
+            Line::from(vec![
+                Span::styled(if i == menu.sel { " ▸ " } else { "   " }, base.fg(p.accent)),
+                Span::styled(a.title.clone(), base.fg(p.text)),
+                Span::styled(where_, base.fg(p.dim)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_finder(f: &mut Frame, app: &mut App, area: Rect) {
     let p = palette();
     let w = area.width.saturating_sub(6).clamp(40, 110);

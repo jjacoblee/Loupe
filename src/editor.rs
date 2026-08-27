@@ -50,6 +50,9 @@ pub struct Editor {
     /// Hash of the text last handed to the language server, so an idle
     /// tick can tell whether there is anything new to send.
     pub synced: u64,
+    /// The signature of the call the cursor is inside, when the server
+    /// knows one. Shown in the border beside the file name.
+    pub signature: Option<crate::lsp::Signature>,
     /// Find and replace within this buffer. See [`BufferFind`].
     pub find: BufferFind,
     /// The buffer as it was immediately before a format.
@@ -276,6 +279,7 @@ impl Editor {
             synced: 0,
             pre_format: None,
             find: BufferFind::default(),
+            signature: None,
         }
     }
 
@@ -708,6 +712,8 @@ impl Editor {
                 self.path,
                 self.match_count()
             )
+        } else if let Some(sig) = &self.signature {
+            format!(" ƒ {} — Esc clears ", sig.label)
         } else if self.read_only {
             format!(" 👁 {} — read-only · Ctrl+C copy · Esc close ", self.path)
         } else {

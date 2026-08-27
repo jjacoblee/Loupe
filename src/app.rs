@@ -158,6 +158,8 @@ pub enum Overlay {
     ReviewConfirm(Box<ReviewPrompt>),
     /// The verdict list under the review box's ▾.
     VerdictMenu,
+    /// The fixes and refactors a language server offers here.
+    CodeActions(Box<CodeActionMenu>),
     /// "Open a file by path" (`Ctrl+O`) — one line to type or paste a path
     /// into. It is the way in for a terminal that cannot report a drop,
     /// and for a path an agent just printed.
@@ -174,6 +176,14 @@ pub enum PathBoxKind {
     NewFile { dir: String },
     /// A new name for a file that exists.
     Rename { from: String },
+    /// A new name for the symbol under the editor's cursor.
+    RenameSymbol { word: String },
+}
+
+/// The fixes and refactors on offer, and which is selected.
+pub struct CodeActionMenu {
+    pub actions: Vec<lsp::CodeAction>,
+    pub sel: usize,
 }
 
 /// The one-line path box behind `Ctrl+O`.
@@ -1838,11 +1848,17 @@ fn read_source(root: &std::path::Path, rev: Option<&str>, path: &str) -> Option<
 }
 
 /// What the editor is asking its language server for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum EditorRequest {
     Complete,
     Hover,
     Definition,
+    /// Rename the symbol under the cursor everywhere, to this name.
+    Rename(String),
+    /// The fixes and refactors on offer where the cursor is.
+    CodeActions,
+    /// The signature of the call the cursor is inside.
+    SignatureHelp,
     /// Every place a symbol is used. `gr` has answered this in the diff
     /// view since language servers arrived; the editor could not.
     References,
@@ -1853,8 +1869,8 @@ impl EditorRequest {
     /// Whether the user asked for this by pressing a key — completion
     /// also fires on its own while typing, and an unavailable server
     /// must not shout about it once per character.
-    fn is_explicit(self) -> bool {
-        self != EditorRequest::Complete
+    fn is_explicit(&self) -> bool {
+        *self != EditorRequest::Complete
     }
 }
 
@@ -1884,6 +1900,13 @@ enum EditorOutcome {
     /// Every place a symbol is used, ready for the same list the diff
     /// view shows.
     References(Box<LocationsData>),
+    /// A rename's edits, per file.
+    Renamed {
+        to: String,
+        edits: Vec<(String, Vec<lsp::TextEdit>)>,
+    },
+    CodeActions(Vec<lsp::CodeAction>),
+    Signature(Option<lsp::Signature>),
 }
 
 /// A finder query running in the background. Unlike every other job this
@@ -4970,6 +4993,75 @@ impl App {
         }
     }
 
+    /// Apply a rename or a code action, and show every file it touched.
+    ///
+    /// The buffer on screen is edited in place, so one undo puts it back.
+    /// Every other file the server named is **opened as an unsaved
+    /// buffer** rather than written: a tool that silently rewrites twelve
+    /// files is a tool nobody can review, and `Ctrl+S` per file is a small
+    /// price for seeing what changed. The tab row shows a dot on each one
+    /// until it is saved.
+    ///
+    /// A file the reader already has open is edited where it stands, so
+    /// unsaved work in it is never read over.
+    fn apply_workspace_edit(&mut self, what: &str, edits: Vec<(String, Vec<lsp::TextEdit>)>) {
+        if edits.is_empty() {
+            self.err(format!("Nothing to change for {what}."));
+            return;
+        }
+        let here = self.editor.as_ref().map(|e| e.path.clone());
+        let mut touched = 0usize;
+        let mut opened = 0usize;
+        for (path, file_edits) in edits {
+            if Some(&path) == here.as_ref() {
+                if let Some(ed) = &mut self.editor {
+                    ed.apply_edits(&file_edits);
+                }
+                touched += 1;
+                continue;
+            }
+            if self.switch_buffer(&path) {
+                if let Some(ed) = &mut self.editor {
+                    ed.apply_edits(&file_edits);
+                }
+                touched += 1;
+                continue;
+            }
+            let Some(abs) = gitops::safe_repo_path(&self.repo_root, &path) else {
+                self.err(format!("Refusing to change “{path}” — unsafe path."));
+                continue;
+            };
+            if is_symlink(&abs) {
+                self.err(format!("Skipped {path} — it is a symlink."));
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&abs) else {
+                self.err(format!("Skipped {path} — cannot read it."));
+                continue;
+            };
+            let mut ed = Editor::new(&path, abs, &content);
+            ed.standalone = true;
+            ed.apply_edits(&file_edits);
+            ed.dirty = true;
+            self.open_buffer(ed);
+            touched += 1;
+            opened += 1;
+        }
+        // Back to where the reader was.
+        if let Some(path) = here {
+            self.switch_buffer(&path);
+        }
+        self.ok(format!(
+            "{what}: {touched} file{} changed{} — nothing is saved yet, Ctrl+S each.",
+            if touched == 1 { "" } else { "s" },
+            if opened > 0 {
+                format!(", {opened} opened for you to read")
+            } else {
+                String::new()
+            }
+        ));
+    }
+
     /// Read one directory the repository listing stopped at.
     ///
     /// One level, never a walk: the whole reason `git ls-files --directory`
@@ -5241,6 +5333,26 @@ impl App {
                     self.overlay = Overlay::None;
                 } else if let Some(i) = hit {
                     self.run_path_menu(i);
+                }
+                return;
+            }
+            Overlay::CodeActions(menu) => {
+                let last = menu.actions.len().saturating_sub(1);
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => menu.sel = menu.sel.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => menu.sel = (menu.sel + 1).min(last),
+                    KeyCode::Enter => {
+                        let chosen = menu.actions.get(menu.sel).cloned();
+                        self.overlay = Overlay::None;
+                        if let Some(a) = chosen {
+                            self.apply_workspace_edit(&a.title, a.edits);
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.overlay = Overlay::None;
+                        self.ok("Nothing applied.");
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -5658,6 +5770,26 @@ impl App {
                 }
                 // The find prompt, when it has the keyboard.
                 _ if editor.find.typing.is_some() && editor.find_key(key) => {}
+                // Rename the symbol under the cursor, everywhere.
+                (KeyCode::Char('m'), KeyModifiers::ALT)
+                | (KeyCode::Char('M'), KeyModifiers::ALT) => {
+                    let word = editor.word_at_cursor();
+                    if word.is_empty() {
+                        self.err("Put the cursor on a name first.");
+                    } else {
+                        self.open_path_box(PathBoxKind::RenameSymbol { word });
+                    }
+                }
+                // What the server offers here: quick fixes, refactors.
+                (KeyCode::Char('.'), KeyModifiers::ALT) => {
+                    self.ok("Asking what is on offer here…");
+                    self.spawn_editor_request(EditorRequest::CodeActions);
+                }
+                // The signature of the call the cursor is inside.
+                (KeyCode::Char('s'), KeyModifiers::ALT)
+                | (KeyCode::Char('S'), KeyModifiers::ALT) => {
+                    self.spawn_editor_request(EditorRequest::SignatureHelp);
+                }
                 // Find and replace inside the buffer.
                 (KeyCode::Char('f'), KeyModifiers::ALT)
                 | (KeyCode::Char('F'), KeyModifiers::ALT) => {
@@ -5701,6 +5833,9 @@ impl App {
                 (KeyCode::PageUp, _) | (KeyCode::Char('v'), KeyModifiers::ALT) => {
                     let page = editor.page();
                     editor.scroll_lines(-page);
+                }
+                (KeyCode::Esc, _) if editor.signature.is_some() => {
+                    editor.signature = None;
                 }
                 (KeyCode::Esc, _) => {
                     if editor.dirty && !editor.discard_armed {
@@ -5945,7 +6080,7 @@ impl App {
 
         // Overlays.
         match &mut self.overlay {
-            Overlay::Help => {
+            Overlay::Help | Overlay::CodeActions(_) => {
                 if matches!(m.kind, MouseEventKind::Down(_)) {
                     self.overlay = Overlay::None;
                 }
@@ -8472,6 +8607,7 @@ impl App {
         let path = editor.path.clone();
         let at = editor.cursor_pos();
         let word = editor.word_at_cursor();
+        let diagnostics = editor.diagnostics.clone();
         let lsp = self.lsp.clone();
         let root = self.repo_root.clone();
         self.editor_gen += 1;
@@ -8479,6 +8615,15 @@ impl App {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let result = match what {
+                EditorRequest::Rename(to) => lsp
+                    .rename(&root, &path, &text, at, &to)
+                    .map(|edits| EditorOutcome::Renamed { to, edits }),
+                EditorRequest::CodeActions => lsp
+                    .code_actions(&root, &path, &text, at, &diagnostics)
+                    .map(EditorOutcome::CodeActions),
+                EditorRequest::SignatureHelp => lsp
+                    .signature_help(&root, &path, &text, at)
+                    .map(EditorOutcome::Signature),
                 EditorRequest::References => lsp.references(&root, &path, &text, at).map(|locs| {
                     EditorOutcome::References(Box::new(LocationsData {
                         action: LspAction::References,
@@ -8557,6 +8702,31 @@ impl App {
                 self.open_hit(loc.path, Some(loc.line));
             }
             EditorOutcome::References(d) => self.apply_locations(*d),
+            EditorOutcome::Renamed { to, edits } => self.apply_workspace_edit(&to, edits),
+            EditorOutcome::CodeActions(actions) => {
+                if actions.is_empty() {
+                    self.err("Nothing on offer here.");
+                    return;
+                }
+                self.ok(format!(
+                    "{} on offer — Enter applies, Esc closes.",
+                    actions.len()
+                ));
+                self.overlay = Overlay::CodeActions(Box::new(CodeActionMenu { actions, sel: 0 }));
+            }
+            EditorOutcome::Signature(sig) => match sig {
+                Some(sig) => {
+                    if let Some(ed) = &mut self.editor {
+                        ed.signature = Some(sig);
+                    }
+                }
+                None => {
+                    if let Some(ed) = &mut self.editor {
+                        ed.signature = None;
+                    }
+                    self.err("The cursor is not inside a call the server knows.");
+                }
+            },
             EditorOutcome::Formatted(edits) => {
                 let Some(edits) = edits else {
                     self.err("This language server does not format.".to_string());
@@ -10022,6 +10192,9 @@ impl App {
                 format!("Name for the new file in {dir} — Enter creates and opens it.")
             }
             PathBoxKind::Rename { from } => format!("New name for {from} — Esc cancels."),
+            PathBoxKind::RenameSymbol { word } => {
+                format!("Rename {word} to — every file it touches opens unsaved for you to read.")
+            }
         });
         self.overlay = Overlay::OpenPath(Box::new(OpenPathBox {
             kind,
@@ -10158,6 +10331,11 @@ impl App {
                     format!("{dir}/{typed}")
                 };
                 self.create_file(&path);
+                return;
+            }
+            PathBoxKind::RenameSymbol { .. } => {
+                self.overlay = Overlay::None;
+                self.spawn_editor_request(EditorRequest::Rename(typed));
                 return;
             }
             PathBoxKind::Rename { from } => {
@@ -12679,7 +12857,66 @@ b2
         assert!(app.editor.as_ref().unwrap().dirty);
     }
 
-    /// Above the threshold the tree holds the top level only, and every
+    /// The promise a rename makes: it changes the buffer you are looking
+    /// at, opens every other file it touched so you can read it, saves
+    /// none of them, and puts you back where you started.
+    #[test]
+    fn a_rename_opens_every_file_it_touched_and_saves_none() {
+        let dir = std::env::temp_dir().join(format!("loupe-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "let alpha = 1;\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "use alpha;\n").unwrap();
+
+        let mut app = App::new(LaunchMode::Local, None);
+        app.repo_root = dir.clone();
+        let mut open = Editor::new("src/a.rs", dir.join("src/a.rs"), "let alpha = 1;\n");
+        open.standalone = true;
+        app.open_buffer(open);
+
+        let swap = |line: usize| {
+            vec![lsp::TextEdit {
+                start: (line, 4),
+                end: (line, 9),
+                text: "beta".into(),
+            }]
+        };
+        app.apply_workspace_edit(
+            "alpha → beta",
+            vec![
+                ("src/a.rs".to_string(), swap(0)),
+                (
+                    "src/b.rs".to_string(),
+                    vec![lsp::TextEdit {
+                        start: (0, 4),
+                        end: (0, 9),
+                        text: "beta".into(),
+                    }],
+                ),
+            ],
+        );
+
+        assert_eq!(app.buffers().count(), 2, "the other file opened");
+        assert_eq!(
+            app.editor.as_ref().unwrap().path,
+            "src/a.rs",
+            "and the reader is back where they were"
+        );
+        assert_eq!(app.dirty_buffers(), 2, "neither is saved");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/b.rs")).unwrap(),
+            "use alpha;\n",
+            "nothing was written behind the reader's back"
+        );
+
+        let changed: Vec<String> = app.buffers().map(|e| e.content()).collect();
+        assert!(changed.iter().any(|c| c.contains("let beta")));
+        assert!(changed.iter().any(|c| c.contains("use beta")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Above the threshold the tree holds the top level only    /// Above the threshold the tree holds the top level only, and every
     /// directory arrives as a stub. What matters is that the panel is
     /// usable at once rather than holding half a million `String`s nobody
     /// is going to look at.
