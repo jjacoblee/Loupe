@@ -769,6 +769,34 @@ to some other branch; the text then comes from the commit and the editor
 is marked read-only, because saving would write over an unrelated
 branch's file.
 
+## Tabs
+
+`tab_order` is the row, by path, and the only thing that is in row order.
+Storage is elsewhere and neither list is ordered: `parked` holds buffers,
+`parked_diffs` holds diffs, and the one on screen stays in the fields it
+has always been in — `editor` for a buffer, `diff`/`old_content`/… for a
+diff. That is what kept the change small: every one of the places that
+reads `self.diff` still means "the diff the reader is looking at".
+
+**A tab is a file, not a view of one.** The same path can have a parked
+diff and a parked buffer at once, which is what `e` on a diff and `Esc`
+back again produce, and the row draws it once either way. Closing a tab
+closes both; closing the editor over a diff leaves the tab, because the
+file is still open.
+
+The row used to reconstruct its order from `buffer_slot` — where the
+active buffer had been taken out of `parked`. That works while a tab is
+only ever a buffer and cannot survive a second kind, because two storage
+lists cannot agree on one order.
+
+**The peek tab is what keeps the row short.** A review means opening a
+great many files to read one, so a click reuses one tab and a double
+click keeps it. The replacement takes the screen *before* the old tab
+closes — otherwise the pane stands empty for the length of a read — so it
+is already at the end of the row when the close happens and has to be
+moved back into the tab it took over. `tab_hole` covers the other order,
+where the close comes first.
+
 ## Pinned files, and files dropped on the window
 
 `pins.rs` owns the tab row. A `Pin` is a path and nothing else: a bookmark,
@@ -835,6 +863,38 @@ the same reasons: it is per-clone state, it must never be committed by
 accident, and it belongs to this checkout. It is rewritten on every change,
 so quitting never costs the reader their tabs, and a pin whose file has
 since been deleted is dropped when it is read back.
+
+## Nothing is locked down
+
+Every mode used to answer its own clicks and its own keys, and every mode
+answered a different subset. Right-clicking the PR badge to copy the link
+did nothing at all while a document or the editor was open, because the
+badge was only ever wired up in the diff.
+
+Two functions are the whole of the fix, and both work the same way: the
+mode's own handling comes first, and what is left falls through to one
+shared definition.
+
+- `chrome_mouse` — the panel divider, the toolbar, the ☰ menu, the badge,
+  the file panel. Everything that belongs to the window rather than to
+  whatever is in the middle of it. It runs above the mode split, so a new
+  mode gets them for free and cannot forget one.
+- `global_key` — quit, go somewhere, find something, stage, stash, and
+  the settings. A mode's own keys are matched before it, which is how
+  `Ctrl+B` still pages back in a document instead of reading as "back to
+  the pull request list", and how `Esc` still closes the document instead
+  of leaving the review. Bare keys only: a modifier means the key belongs
+  to whoever bound it.
+
+The editor is the one mode that cannot answer bare keys — they are text —
+so `Alt+Enter` opens the ☰ menu there and the menu carries the lines that
+go somewhere.
+
+A foreground job is modal for the **pane**, not for the window. It used
+to be modal for both, which is why the second click of a double click
+went nowhere: the first click started the read and the read swallowed the
+second. A load takes tens of milliseconds and a double click takes four
+hundred, so every one of them landed mid-read.
 
 ## Talking to git and GitHub
 

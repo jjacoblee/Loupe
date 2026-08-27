@@ -34,9 +34,12 @@ const MENU_MIN_H: u16 = 8;
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.layout = Default::default();
     let area = f.area();
-    // The tab row only takes a line when something is pinned, so a reader
-    // who never pins a file never pays for the feature.
-    let tabs = u16::from(!app.pins.is_empty() || app.buffers().count() > 0);
+    // The tab row only takes a line when it says something. Reading one
+    // file at a time is what most of a review is, and a row naming the
+    // one file already named by the pane above it would be a line spent
+    // on nothing.
+    let tabs =
+        u16::from(!app.pins.is_empty() || app.buffers().count() > 0 || app.buffer_tabs().len() > 1);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

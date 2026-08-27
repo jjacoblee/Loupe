@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Diffs open in tabs.** A tab is a file, and the same tab holds its
+  diff, its buffer and its rendered document — `e`, `P` and `Esc` move
+  between them and the tab stays put. Coming back to one lands you where
+  you left it: same scroll, same cursor, same folds, same selection, and
+  nothing is read again to get there. One click walks the change in the
+  peek tab; a double click keeps it, and the next file gets its own.
+
 - **`Ctrl+F` finds in whatever you are reading.** The diff, the markdown
   preview and the editor all answer the same key, and `/` still opens the
   first two. `Ctrl+Shift+F` runs the repository-wide `git grep` that `#`
@@ -136,6 +143,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Right-clicking the PR badge did nothing while a document or the
+  editor was open.** Each mode answered its own clicks and each answered
+  a different subset of the window; the badge was only ever wired up in
+  the diff. The window chrome is answered once now, above the mode split.
+- **A reader in a document was locked out of the app.** Swapping to the
+  pull request, going back to the list, the grep, the symbol list, the
+  Commits panel, staging and the stash menu all did nothing there — none
+  of which is about the pane in front of you.
+- **The second click of a double click went nowhere.** A file loading
+  froze the whole window, and a read takes tens of milliseconds against a
+  four-hundred-millisecond double click, so every one of them landed
+  mid-read. A load is modal for the pane now, not for the window.
 - `git show` ran in whatever directory loupe was started in rather than in
   the repository root, which every other git call uses. The same
   repository today, and silently the wrong one the moment the two differ.

@@ -1490,6 +1490,30 @@ impl StageSection {
     }
 }
 
+/// One file open as a diff, and everything about how it is being read.
+///
+/// The same bundle the PR ⇄ local swap parks (see [`Workspace`]), for the
+/// same reason: coming back to a file has to land the reader exactly
+/// where they left it — same scroll, same cursor, same folds, same
+/// selection — or the tab is a bookmark rather than a place.
+pub struct DiffTab {
+    pub path: String,
+    /// The commit it came out of, when it came from the Commits panel.
+    open_commit: Option<OpenCommit>,
+    conflict: Option<ConflictView>,
+    diff: Option<FileDiff>,
+    expanded_folds: HashSet<usize>,
+    old_content: Option<String>,
+    new_content: Option<String>,
+    old_hl: Vec<HlLine>,
+    new_hl: Vec<HlLine>,
+    differs_from_head: bool,
+    diff_scroll: usize,
+    diff_cursor: usize,
+    diff_hscroll: usize,
+    selection: Option<Selection>,
+}
+
 /// The commit whose diff the pane is showing, and which of its files.
 ///
 /// It carries the commit's own labels rather than an index into
@@ -2480,6 +2504,17 @@ pub struct App {
     /// change. Opening another file parks this one here; coming back
     /// swaps them.
     pub parked: Vec<Editor>,
+    /// Diffs the reader has open other than the one on screen.
+    ///
+    /// The same shape as [`Self::parked`], and for the same reason: the
+    /// diff on screen stays in the fields it has always been in, so every
+    /// place that reads `self.diff` still means "the diff the reader is
+    /// looking at". Opening another one parks this one here; coming back
+    /// swaps them.
+    parked_diffs: Vec<DiffTab>,
+    /// Set by a double click in the file panel: the diff about to land
+    /// keeps its tab instead of becoming the one the next click replaces.
+    keep_tab: bool,
     /// The tab row, by path, in the reader's own order.
     ///
     /// One list for every kind of tab. A file is in the row while it is
@@ -2782,6 +2817,8 @@ impl App {
             editor: None,
             quit_armed: false,
             parked: Vec::new(),
+            parked_diffs: Vec::new(),
+            keep_tab: false,
             tab_order: Vec::new(),
             tab_hole: None,
             tab_drag: None,
@@ -3703,6 +3740,20 @@ impl App {
                 // reader was doing, not what they last clicked.
                 // A pinned tab asked for the document rather than the
                 // diff, so it forces the same door open.
+                // The tab this file has. It takes over the peek tab —
+                // the reviewer walks the whole file list, and a tab per
+                // step would be a row nobody could read — unless a
+                // double click asked to keep it. Dropped after the open,
+                // not before, so the pane is never empty in between and
+                // the new tab lands where the old one was.
+                //
+                // The peek tab goes either way. "Keep" means keep *this*
+                // tab, not keep both — a double click that left the file
+                // it replaced behind would grow the row exactly where a
+                // single click does not.
+                let keep = std::mem::take(&mut self.keep_tab);
+                self.drop_peek(&d.path);
+                self.peek = (!keep).then(|| d.path.clone());
                 let wants = std::mem::take(&mut self.pin_wants_preview);
                 let keep_preview =
                     (self.preview.take().is_some() || wants) && markdown::is_markdown(&d.path);
@@ -4083,6 +4134,14 @@ impl App {
         }
     }
 
+    /// Open a file of the change as a diff.
+    ///
+    /// A file already open in a tab is switched to rather than read
+    /// again, so its scroll, its cursor, its folds and its selection all
+    /// come back — that is what makes a tab a place rather than a
+    /// bookmark. Anything else is read, and takes over the peek tab: a
+    /// reviewer walks the whole file list, and a tab per step would be a
+    /// row nobody could read. A double click keeps it.
     fn spawn_load_file(&mut self, idx: usize) {
         let Some(file) = self.files.get(idx).cloned() else {
             return;
@@ -4090,6 +4149,13 @@ impl App {
         // This file belongs to the change, not to a commit, so the diff
         // pane stops being a commit's before opening it.
         self.leave_open_commit();
+        if self.switch_diff(&file.path) {
+            self.file_cursor = idx;
+            self.ok(format!("{} — already open.", file.path));
+            return;
+        }
+        self.park_diff();
+        self.note_tab(&file.path);
         let ctx = self.file_load_ctx();
         self.spawn(format!("Loading {}", file.path), true, false, move || {
             load_file_data(idx, file, ctx).map(|d| Outcome::FileLoaded(Box::new(d)))
@@ -7410,9 +7476,6 @@ impl App {
 
     pub fn handle_mouse(&mut self, m: MouseEvent) {
         self.last_input = Instant::now();
-        if self.job.is_some() {
-            return;
-        }
         let (x, y) = (m.column, m.row);
 
         // Overlays.
@@ -7660,6 +7723,17 @@ impl App {
         // is in the middle of it. Answered once, above the mode split, so
         // no mode can forget one of them.
         if self.chrome_mouse(m, x, y) {
+            return;
+        }
+
+        // A file loading is modal for the *pane* — there is nothing there
+        // to click yet — but not for the window. It used to be modal for
+        // both, which is why the second click of a double click went
+        // nowhere: the first click started the read, and the read
+        // swallowed the second. A load takes tens of milliseconds and a
+        // double click takes four hundred, so every one of them landed
+        // mid-read.
+        if self.job.is_some() {
             return;
         }
 
@@ -8157,8 +8231,14 @@ impl App {
                     }
                 } else if self.can_revert() && !conflicted && x >= revert_from {
                     self.ask_revert_file(idx);
-                } else if idx != self.file_cursor {
+                } else if idx != self.file_cursor || self.diff.is_none() {
+                    // A double click keeps the tab, the way it does in
+                    // the tree: one click walks the change, two say "I am
+                    // coming back to this one".
+                    self.keep_tab = double;
                     self.spawn_load_file(idx);
+                } else if double {
+                    self.keep_peek();
                 }
             }
             // The heading is a label, not a target.
@@ -12036,7 +12116,9 @@ impl App {
             if self.screen != Screen::Review {
                 return None;
             }
-            let file = self.files.get(self.file_cursor)?;
+            // Whatever the diff pane is showing, which while a commit
+            // is open is one of its files rather than the change's.
+            let file = self.open_file()?;
             gitops::safe_repo_path(&self.repo_root, &file.path)?
         };
         // Resolved, so it compares equal to a pin made from a dropped
@@ -12795,30 +12877,36 @@ impl App {
     pub fn buffer_tabs(&self) -> Vec<BufferTab> {
         // A pinned file already has a tab, so it gets no second one. The
         // row would otherwise name one file twice — once under the pin
-        // the reader chose and once under the buffer that happens to hold
+        // the reader chose and once under the tab that happens to hold
         // it — and closing either would leave the other looking wrong.
-        let mine: Vec<&Editor> = self
-            .buffers()
-            .filter(|e| !self.is_pinned(&e.path))
+        let mine: Vec<&String> = self
+            .tab_order
+            .iter()
+            .filter(|p| !self.is_pinned(p))
             .collect();
         let name = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-        // The document P opens is a rendering of a parked buffer, so the
-        // tab it belongs to is still the one on screen.
+        // Whatever the pane is showing, whichever of the three it is
+        // showing it as. The document `P` opens is a rendering of a
+        // parked buffer, so the tab it belongs to is still the one on
+        // screen; so is the diff underneath the editor.
         let active = match &self.editor {
             Some(e) => Some(e.path.as_str()),
-            None => self.preview.as_ref().map(|pv| pv.path.as_str()),
+            None => match &self.preview {
+                Some(pv) => Some(pv.path.as_str()),
+                None => self.diff_path(),
+            },
         };
         let peek = self.peek_path();
         mine.iter()
             .enumerate()
-            .map(|(i, e)| {
-                let own = name(&e.path);
+            .map(|(i, path)| {
+                let own = name(path);
                 let shared = mine
                     .iter()
                     .enumerate()
-                    .any(|(j, other)| j != i && name(&other.path) == own);
+                    .any(|(j, other)| j != i && name(other) == own);
                 let label = if shared {
-                    let mut parts = e.path.rsplitn(3, '/');
+                    let mut parts = path.rsplitn(3, '/');
                     let base = parts.next().unwrap_or("");
                     match parts.next() {
                         Some(dir) => format!("{dir}/{base}"),
@@ -12828,11 +12916,13 @@ impl App {
                     own
                 };
                 BufferTab {
-                    path: e.path.clone(),
+                    path: (*path).clone(),
                     label,
-                    dirty: e.dirty,
-                    active: active == Some(e.path.as_str()),
-                    peek: peek == Some(e.path.as_str()),
+                    // A diff has nothing unsaved in it; only a buffer can
+                    // carry the dot.
+                    dirty: self.editor_for(path).is_some_and(|e| e.dirty),
+                    active: active == Some(path.as_str()),
+                    peek: peek == Some(path.as_str()),
                 }
             })
             .collect()
@@ -12869,13 +12959,32 @@ impl App {
         self.buffers().any(|e| e.dirty && e.path == pin.path)
     }
 
-    /// Bring the nth open buffer forward, counting the way the row reads.
+    /// The labels the tab row is drawing, for the tests that check it.
+    #[cfg(test)]
+    pub fn tab_labels(&self) -> Vec<String> {
+        self.buffer_tabs().into_iter().map(|t| t.label).collect()
+    }
+
+    /// Bring the nth tab forward, counting the way the row reads.
+    ///
+    /// A tab is a file, and a file can be open as a buffer, as a diff, or
+    /// as both. The buffer wins: it is the one that can hold unsaved
+    /// work, so it is the one the reader would be surprised to lose.
     pub fn open_buffer_at(&mut self, i: usize) {
         let Some(path) = self.buffer_tabs().get(i).map(|t| t.path.clone()) else {
             return;
         };
         if self.switch_buffer(&path) {
-            self.ok(format!("{path} — {} open.", self.buffers().count()));
+            self.preview = None;
+            self.ok(format!("{path} — {} open.", self.tab_order.len()));
+            return;
+        }
+        if self.switch_diff(&path) {
+            // The diff is what this tab holds, so the editor and the
+            // document over it stand down.
+            self.editor = None;
+            self.preview = None;
+            self.ok(format!("{path} — {} open.", self.tab_order.len()));
         }
     }
 
@@ -12893,6 +13002,17 @@ impl App {
             self.request_close_editor();
             return;
         }
+        // A tab holding only a diff has nothing to ask about: there is no
+        // unsaved work in one, and the file list is still right there.
+        if !self.parked.iter().any(|e| e.path == path) {
+            if self.close_diff_tab(&path) {
+                self.ok(format!(
+                    "{path} closed — {} still open.",
+                    self.tab_order.len()
+                ));
+            }
+            return;
+        }
         let Some(at) = self.parked.iter().position(|e| e.path == path) else {
             return;
         };
@@ -12904,6 +13024,8 @@ impl App {
             return;
         }
         self.parked.remove(at);
+        // The tab is the file, so its ✕ closes both views of it.
+        self.close_diff_tab(&path);
         self.forget_tab(&path);
         // Fire and forget, on a worker: the registry blocks, and the
         // reader is already looking at something else.
@@ -12931,6 +13053,130 @@ impl App {
             .unwrap_or(0) as i32;
         let next = (at + delta).rem_euclid(n as i32) as usize;
         self.open_buffer_at(next);
+    }
+
+    // ------------------------------------------------------ diff tabs
+
+    /// The path the diff pane is showing, when it is showing one.
+    pub fn diff_path(&self) -> Option<&str> {
+        self.diff.as_ref()?;
+        self.open_file().map(|f| f.path.as_str())
+    }
+
+    /// Take the diff off the screen and keep it, so coming back to this
+    /// file is a swap rather than a re-read.
+    ///
+    /// Nothing is parked for a file with no diff loaded, and nothing is
+    /// parked twice: a file already in the list is replaced, because the
+    /// copy on screen is the newer one.
+    fn park_diff(&mut self) {
+        let Some(path) = self.diff_path().map(str::to_string) else {
+            return;
+        };
+        let tab = DiffTab {
+            path: path.clone(),
+            open_commit: self.open_commit.take(),
+            conflict: self.conflict.take(),
+            diff: self.diff.take(),
+            expanded_folds: std::mem::take(&mut self.expanded_folds),
+            old_content: self.old_content.take(),
+            new_content: self.new_content.take(),
+            old_hl: std::mem::take(&mut self.old_hl),
+            new_hl: std::mem::take(&mut self.new_hl),
+            differs_from_head: self.differs_from_head,
+            diff_scroll: self.diff_scroll,
+            diff_cursor: self.diff_cursor,
+            diff_hscroll: self.diff_hscroll,
+            selection: self.selection.take(),
+        };
+        self.parked_diffs.retain(|t| t.path != path);
+        self.parked_diffs.push(tab);
+        self.display.clear();
+    }
+
+    /// Put a parked diff back on screen, exactly as it was left.
+    fn restore_diff(&mut self, tab: DiffTab) {
+        self.open_commit = tab.open_commit;
+        self.conflict = tab.conflict;
+        self.diff = tab.diff;
+        self.expanded_folds = tab.expanded_folds;
+        self.old_content = tab.old_content;
+        self.new_content = tab.new_content;
+        self.old_hl = tab.old_hl;
+        self.new_hl = tab.new_hl;
+        self.differs_from_head = tab.differs_from_head;
+        self.selection = tab.selection;
+        // The file cursor follows the tab, so the panel highlights the
+        // row for what is on screen. A re-scan can have dropped the file
+        // since; the diff stays, and the cursor simply does not move.
+        if let Some(i) = self.files.iter().position(|f| f.path == tab.path) {
+            self.file_cursor = i;
+        }
+        self.rebuild_display();
+        // The view mode is shared between tabs, so a stored position can
+        // be out of range if it changed while parked — clamp.
+        let last = self.display.len().saturating_sub(1);
+        self.diff_cursor = tab.diff_cursor.min(last);
+        self.diff_scroll = tab.diff_scroll.min(last);
+        self.diff_hscroll = tab.diff_hscroll.min(self.max_hscroll());
+        self.recompute_matches();
+        self.reveal_current_file();
+        self.spawn_blame(self.file_cursor);
+    }
+
+    /// Close the tab a diff has, and show the neighbour it leaves.
+    ///
+    /// A diff holds nothing unsaved, so nothing is asked. Closing the one
+    /// on screen leaves the pane needing something to show: the tab
+    /// beside it, or the file list when that was the last one.
+    fn close_diff_tab(&mut self, path: &str) -> bool {
+        let was = self.tab_order.iter().position(|p| p == path);
+        let on_screen = self.diff_path() == Some(path);
+        self.parked_diffs.retain(|t| t.path != path);
+        if !on_screen && was.is_none() {
+            return false;
+        }
+        self.forget_tab(path);
+        if !on_screen {
+            return true;
+        }
+        // The neighbour in the row, which is the tab that took its place.
+        let next = was
+            .map(|i| i.min(self.tab_order.len().saturating_sub(1)))
+            .and_then(|i| self.tab_order.get(i))
+            .cloned();
+        self.diff = None;
+        self.conflict = None;
+        self.display.clear();
+        self.selection = None;
+        match next {
+            Some(p) if self.switch_diff(&p) => {}
+            Some(p) if self.switch_buffer(&p) => {}
+            _ => self.ok("Nothing open — pick a file on the left."),
+        }
+        true
+    }
+
+    /// Bring a parked diff forward by path. False when this file has none.
+    fn switch_diff(&mut self, path: &str) -> bool {
+        if self.diff_path() == Some(path) {
+            return true;
+        }
+        let Some(i) = self.parked_diffs.iter().position(|t| t.path == path) else {
+            return false;
+        };
+        self.park_diff();
+        let Some(i) = self
+            .parked_diffs
+            .iter()
+            .position(|t| t.path == path)
+            .or(Some(i).filter(|i| *i < self.parked_diffs.len()))
+        else {
+            return false;
+        };
+        let tab = self.parked_diffs.remove(i);
+        self.restore_diff(tab);
+        true
     }
 
     /// Put a path in the tab row, if it is not there already.
@@ -13041,8 +13287,13 @@ impl App {
     /// this tab either. `find` answers that without a second field.
     pub fn peek_path(&self) -> Option<&str> {
         let path = self.peek.as_deref()?;
-        let held = self.buffers().find(|e| e.path == path)?;
-        (!held.dirty).then_some(path)
+        // A buffer somebody has typed into is theirs, not a peek.
+        if let Some(held) = self.editor_for(path) {
+            return (!held.dirty).then_some(path);
+        }
+        // A diff holds nothing unsaved, so it is always replaceable —
+        // and it is only a peek while it is still in the row.
+        self.tab_order.iter().any(|p| p == path).then_some(path)
     }
 
     /// Park a language-server request in flight, for the render test,
@@ -13107,6 +13358,9 @@ impl App {
         } else if self.editor.as_ref().is_some_and(|e| e.path == path) {
             self.editor = None;
         }
+        // The same file may also have been open as a diff. The tab is
+        // the file, so closing it closes both.
+        self.parked_diffs.retain(|t| t.path != path);
         self.forget_tab(&path);
         // The replacement usually has the screen already — see
         // `apply_external`, which opens it first so the pane is never
@@ -13210,7 +13464,13 @@ impl App {
             .as_deref()
             .and_then(|p| self.tab_order.iter().position(|q| q == p));
         if let Some(path) = &closing {
-            self.forget_tab(path);
+            // The same file may still be open as a diff — the editor
+            // opened over it — and the tab is the file, so it stays.
+            let has_diff = self.diff_path() == Some(path.as_str())
+                || self.parked_diffs.iter().any(|t| t.path == *path);
+            if !has_diff {
+                self.forget_tab(path);
+            }
         }
         // Another buffer waiting is what the reader goes back to, not the
         // diff. Closing one file of several should not close them all.
@@ -18992,6 +19252,179 @@ more
         ] {
             assert!(ids.contains(&want), "the editor menu offers {want:?}");
         }
+    }
+
+    /// Wait for the foreground job the way the app does.
+    fn pump(app: &mut App) {
+        for _ in 0..400 {
+            app.poll_jobs();
+            if app.job.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A local review of three real files, with a file panel to click.
+    fn tabs_app(dir: &std::path::Path) -> App {
+        let mut app = staging_app(dir);
+        for n in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(dir.join(n), "one\ntwo\n").unwrap();
+        }
+        app.checked_out = true;
+        app.layout.file_list = Rect::new(0, 0, 30, 10);
+        app
+    }
+
+    /// The panel row a file is drawn on.
+    fn file_row(app: &App, path: &str) -> u16 {
+        app.entries
+            .iter()
+            .position(
+                |e| matches!(e, FileEntry::File { src, .. } if app.row_path(*src) == Some(path)),
+            )
+            .unwrap_or_else(|| panic!("{path} has no row")) as u16
+    }
+
+    fn click_row(app: &mut App, path: &str) {
+        let y = file_row(app, path);
+        app.file_list_click(10, y);
+        pump(app);
+    }
+
+    /// One click walks the change and reuses one tab; a double click says
+    /// "I am coming back to this one" and the next file gets its own.
+    #[test]
+    fn diffs_open_in_tabs_that_a_double_click_keeps() {
+        let dir = TempDir::new("difftab-keep");
+        let mut app = tabs_app(&dir.0);
+
+        click_row(&mut app, "a.rs");
+        assert_eq!(app.tab_labels(), ["a.rs"], "one click, one tab");
+        assert_eq!(app.peek_path(), Some("a.rs"), "and it is the peek tab");
+
+        // A second file takes that tab over rather than adding to the row.
+        click_row(&mut app, "b.rs");
+        assert_eq!(
+            app.tab_labels(),
+            ["b.rs"],
+            "the peek tab was reused, not added to"
+        );
+
+        // Kept, so the next file gets a tab of its own.
+        app.keep_peek();
+        click_row(&mut app, "c.rs");
+        assert_eq!(app.tab_labels(), ["b.rs", "c.rs"]);
+        assert!(
+            app.buffer_tabs()[1].peek,
+            "c.rs is the one a click replaces"
+        );
+    }
+
+    /// A double click on a file still loading has to keep it too. The
+    /// first click starts the read and the second lands mid-read, which
+    /// is where every real double click lands.
+    #[test]
+    fn a_double_click_lands_mid_read_and_still_keeps() {
+        let dir = TempDir::new("difftab-race");
+        let mut app = tabs_app(&dir.0);
+        click_row(&mut app, "a.rs");
+
+        // Both clicks before the read is polled, the way the terminal
+        // delivers them.
+        let y = file_row(&app, "b.rs");
+        app.file_list_click(10, y);
+        app.file_list_click(10, y);
+        assert!(app.job.is_some(), "the read is still in flight");
+        pump(&mut app);
+
+        assert_eq!(app.tab_labels(), ["b.rs"], "b.rs took a.rs's peek tab");
+        assert_eq!(app.peek_path(), None, "and the double click kept it");
+
+        click_row(&mut app, "c.rs");
+        assert_eq!(
+            app.tab_labels(),
+            ["b.rs", "c.rs"],
+            "so the next file got its own"
+        );
+    }
+
+    /// The whole point: coming back to a tab lands where you left it.
+    #[test]
+    fn a_diff_tab_keeps_the_place_you_left_it() {
+        let dir = TempDir::new("difftab-place");
+        let mut app = tabs_app(&dir.0);
+        click_row(&mut app, "a.rs");
+        app.keep_peek();
+        // Somewhere that is not the top.
+        app.diff_cursor = 1;
+        app.diff_scroll = 1;
+        let folds = app.expanded_folds.clone();
+        app.expanded_folds.insert(0);
+
+        click_row(&mut app, "b.rs");
+        assert_ne!(app.diff_cursor, 1, "the new file starts at its own place");
+        assert_eq!(app.expanded_folds, folds, "and with its own folds");
+
+        // Back again — by the tab, the way a click on the row does it.
+        app.open_buffer_at(0);
+        assert_eq!(app.diff_path(), Some("a.rs"));
+        assert_eq!(app.diff_cursor, 1, "the cursor came back");
+        assert_eq!(app.diff_scroll, 1, "and the scroll");
+        assert!(app.expanded_folds.contains(&0), "and the folds");
+        assert!(app.job.is_none(), "and none of it was read again");
+    }
+
+    /// Closing a diff tab needs no question — there is nothing unsaved in
+    /// one — and leaves the reader on the tab beside it.
+    #[test]
+    fn closing_a_diff_tab_shows_its_neighbour() {
+        let dir = TempDir::new("difftab-close");
+        let mut app = tabs_app(&dir.0);
+        click_row(&mut app, "a.rs");
+        app.keep_peek();
+        click_row(&mut app, "b.rs");
+        app.keep_peek();
+        assert_eq!(app.tab_labels(), ["a.rs", "b.rs"]);
+
+        app.close_buffer_at(1);
+        assert_eq!(app.tab_labels(), ["a.rs"]);
+        assert_eq!(app.diff_path(), Some("a.rs"), "the neighbour is on screen");
+        assert!(app.diff.is_some());
+    }
+
+    /// One tab per file, whichever way the file is being read. `e` on a
+    /// diff opens the buffer in the tab the diff already had, and Esc
+    /// hands it back — the tab never moves under the reader.
+    #[test]
+    fn one_tab_holds_both_views_of_a_file() {
+        let dir = TempDir::new("difftab-both");
+        let mut app = tabs_app(&dir.0);
+        click_row(&mut app, "a.rs");
+        app.keep_peek();
+        click_row(&mut app, "b.rs");
+        app.keep_peek();
+        assert_eq!(app.tab_labels(), ["a.rs", "b.rs"]);
+
+        // Edit the file the diff is showing.
+        app.open_editor(None);
+        assert_eq!(
+            app.editor.as_ref().map(|e| e.path.as_str()),
+            Some("b.rs"),
+            "the editor opened: {}",
+            app.status
+        );
+        assert_eq!(
+            app.tab_labels(),
+            ["a.rs", "b.rs"],
+            "the buffer took the tab the diff had, it did not add one"
+        );
+
+        // And back. The tab is still b.rs's, in the same place.
+        app.request_close_editor();
+        assert!(app.editor.is_none());
+        assert_eq!(app.tab_labels(), ["a.rs", "b.rs"]);
+        assert_eq!(app.diff_path(), Some("b.rs"), "the diff is back");
     }
 
     /// The key everyone reaches for. `/` still works; Ctrl+F is what a

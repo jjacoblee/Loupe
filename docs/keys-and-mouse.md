@@ -123,7 +123,8 @@ buffer belongs to the side you are leaving.
 
 | Key / mouse | Action |
 | --- | --- |
-| Click a file | Open its diff |
+| Click a file | Open its diff, in the tab the last click used |
+| Double-click a file | Open its diff and **keep** its tab |
 | Click a folder | Collapse / expand it |
 | Right-click a file or folder | Copy its path (see [Copying a path](#copying-a-path)) |
 | `]` / `[` | Next / previous file |
@@ -976,10 +977,46 @@ Four ways in:
   a review write-up in a central tree, a note in `/tmp`. There is no
   review behind it, so the document takes the whole window and `q` quits.
 
-## Pinned files
+## Tabs
 
-A row of tabs under the top bar, holding the files you keep coming back
-to. It takes no height at all until you pin something.
+A row under the top bar, one tab per file you have open. It takes no
+height at all while you are reading one file.
+
+**A tab is a file, not a view of one.** The same tab holds the file's
+diff, its buffer and its rendered document; `e`, `P` and `Esc` move
+between them and the tab stays where it is. Come back to a tab and you
+land where you left it — same scroll, same cursor, same folds, same
+selection — because nothing was re-read to get there.
+
+**One click walks, two keep.** A review means opening a great many files
+to read one of them, so a click puts the file in the **peek tab** and the
+next click puts the next file in the same tab. The peek tab is drawn in
+*italics* to say so, and there is only ever one. **Double-click the file,
+or double-click the tab, to keep it** — it stops being italic, and the
+next click peeks in a tab of its own beside it.
+
+A peek is not a preview. In Loupe a *preview* is the rendered markdown
+document that `P` opens; a *peek* is a tab you have not committed to yet.
+
+| Key / mouse | Action |
+| --- | --- |
+| Click a file in the panel | Open it in the peek tab |
+| Double-click it | Keep its tab |
+| Click a tab | Go to it |
+| Click its `✕`, or middle-click the tab | Close it |
+| Drag a tab | Put it where you want it in the row |
+| `,` / `.` | Previous / next tab, wrapping at each end |
+| `Alt+]` / `Alt+[` | The same, from inside the editor |
+
+A tab with unsaved work carries a `●` and asks before it closes. A tab
+holding only a diff has nothing to lose, so it closes without asking and
+leaves you on the tab beside it.
+
+### Pinned files
+
+A pin is a tab you have promised to keep: it survives quitting, it takes
+a number, and it can hold a file from anywhere on the machine rather than
+only from the change.
 
 | Key / mouse | Action |
 | --- | --- |
