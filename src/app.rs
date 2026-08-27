@@ -9925,6 +9925,13 @@ impl App {
 
     fn close_editor(&mut self) {
         let standalone = self.editor.as_ref().is_some_and(|e| e.standalone);
+        if let Some(path) = self.editor.as_ref().map(|e| e.path.clone()) {
+            // Fire and forget, on a worker: the registry blocks, and the
+            // reader is already looking at something else.
+            let lsp = self.lsp.clone();
+            let root = self.repo_root.clone();
+            thread::spawn(move || lsp.close(&root, &path));
+        }
         self.editor = None;
         if standalone {
             // The review was never disturbed — there is nothing to reload,

@@ -711,6 +711,19 @@ impl Client {
         self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
     }
 
+    /// Tell the server to forget a document, and forget it here too.
+    fn close(&mut self, uri: &str) -> Result<()> {
+        if self.opened.remove(uri).is_none() {
+            return Ok(());
+        }
+        self.diagnostics.remove(uri);
+        self.diag_version += 1;
+        self.notify(
+            "textDocument/didClose",
+            json!({"textDocument": {"uri": uri}}),
+        )
+    }
+
     /// Deal with one incoming message. Returns it only if it is a
     /// *response* (something a caller might be waiting for); everything
     /// else is absorbed here.
@@ -1220,6 +1233,29 @@ impl Lsp {
         client.sync(&uri, path, text).is_ok()
     }
 
+    /// Close a document the reader has finished with.
+    ///
+    /// Without this every file ever opened stays open for the life of the
+    /// session, and the server keeps re-analysing files nobody is reading
+    /// — which the reader pays for as latency on every later question.
+    /// One buffer hid that. A buffer list will not.
+    ///
+    /// This takes the lock rather than trying it, because a document that
+    /// failed to close is a document that never closes. Call it from a
+    /// worker thread, like everything else here.
+    pub fn close(&self, root: &Path, path: &str) {
+        let Some(spec) = spec_for(path) else { return };
+        let slot = {
+            let map = lock(&self.slots);
+            map.get(spec.lang).cloned()
+        };
+        let Some(slot) = slot else { return };
+        let mut guard = lock(&slot);
+        if let Slot::Ready(client) = &mut *guard {
+            let _ = client.close(&uri_of(&root.join(path)));
+        }
+    }
+
     /// Suggestions at a position. Returns an empty list (not an error)
     /// when the server offers no completion at all.
     pub fn complete(
@@ -1561,6 +1597,82 @@ fn hover_text(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Client` around `cat`, with no handshake.
+    ///
+    /// Everything under test here is bookkeeping on this side of the pipe
+    /// — what `opened` holds, and what goes out — so the far end only has
+    /// to accept bytes. A real server would cost a toolchain the machine
+    /// may not have.
+    fn fake_client() -> Client {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cat is on every machine this runs on");
+        let mut stdin = child.stdin.take().expect("piped");
+        let (out, outbox) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            for frame in outbox {
+                if stdin.write_all(&frame).is_err() || stdin.flush().is_err() {
+                    break;
+                }
+            }
+        });
+        let (_tx, rx) = mpsc::channel();
+        Client {
+            lang: "Rust",
+            cmd: "cat",
+            child,
+            out,
+            rx,
+            next_id: 0,
+            opened: HashMap::new(),
+            progress: std::collections::HashSet::new(),
+            caps: Value::Null,
+            diagnostics: HashMap::new(),
+            diag_version: 0,
+            stderr: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// A closed document must be forgotten on both sides. The client's
+    /// half is what stops `sync` from sending a `didChange` for a file
+    /// nobody has open, which the server would rightly reject.
+    #[test]
+    fn closing_a_document_forgets_it() {
+        let mut client = fake_client();
+        let uri = "file:///tmp/x.rs";
+
+        client.sync(uri, "x.rs", "fn main() {}\n").unwrap();
+        assert!(client.opened.contains_key(uri), "didOpen recorded it");
+        client.diagnostics.insert(
+            uri.to_string(),
+            vec![Diagnostic {
+                line: 1,
+                col: 1,
+                end_col: 2,
+                severity: 1,
+                message: "something is wrong".into(),
+                code: None,
+            }],
+        );
+
+        client.close(uri).unwrap();
+        assert!(
+            !client.opened.contains_key(uri),
+            "the document is gone, so the next sync opens it again"
+        );
+        assert!(
+            !client.diagnostics.contains_key(uri),
+            "and its diagnostics went with it — they describe a file nobody has open"
+        );
+
+        // Closing twice is not an error, and does not send a second
+        // notification for a document the server already forgot.
+        client.close(uri).unwrap();
+    }
 
     /// The bug this replaced: `send` wrote straight to the server's pipe
     /// from whichever thread called it, and `sync_open` calls it from the
