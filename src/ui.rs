@@ -990,10 +990,12 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
             format!(" Files — {} in the repo ", app.repo_paths.len())
         }
     } else if app.panel == crate::app::PanelMode::Commits {
+        // `↑4 origin/main` is the same shape the top bar uses for the
+        // upstream drift, and short enough to survive a narrow panel.
         match (app.commits.len(), app.commits_base.as_deref()) {
             (0, _) => " Commits ".to_string(),
-            (n, Some(base)) => format!(" Commits — {n} not on {base} "),
-            (n, None) => format!(" Commits — {n} "),
+            (n, Some(base)) => format!(" Commits ↑{n} {base} "),
+            (n, None) => format!(" Commits ↑{n} "),
         }
     } else if app.local {
         format!(" Files {viewed_n}/{n} staged ")
@@ -1002,6 +1004,9 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let short = if conflicts > 0 {
         format!(" ⚠ {conflicts} ")
+    } else if app.panel == crate::app::PanelMode::Commits {
+        // The change's file count would be about the other panel.
+        format!(" ◷ {} ", app.commits.len())
     } else {
         format!(" {viewed_n}/{n} ")
     };
@@ -3953,7 +3958,11 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ),
         row(
             ("Y", "copy the context for your agent"),
-            ("", ""),
+            ("X", "stage the whole change / unstage it"),
+        ),
+        row(
+            ("S", "stash menu — put work aside, bring it back"),
+            ("F", "change · every file · unpushed commits"),
         ),
         row(
             ("u", "revert the change at the cursor"),
@@ -5506,6 +5515,72 @@ mod tests {
         app.checked_out = false;
         let buf = render(&mut app);
         assert_eq!(marks(&buf, &app), (0, 0));
+    }
+
+    /// The Commits panel draws the commit, the fold arrow, and its files
+    /// under it — with no staging box, because none of it can be staged.
+    #[test]
+    fn the_commits_panel_draws_commits_and_their_files() {
+        use crate::app::{CommitsData, PanelMode};
+        use crate::gitops::Commit;
+
+        let mut app = wide_app();
+        // Wide enough for the full title; a narrow panel shortens it to
+        // the commit count alone.
+        app.file_panel_w = 40;
+        app.set_panel(PanelMode::Commits);
+        app.apply_commits(CommitsData {
+            base: Some("origin/main".into()),
+            commits: vec![Commit {
+                oid: "a".repeat(40),
+                short: "4683983".into(),
+                subject: "Make the editor a real IDE surface".into(),
+                author: "Jacob Lee".into(),
+                when: "2 hours ago".into(),
+            }],
+        });
+        app.commit_files.insert(
+            "a".repeat(40),
+            vec![ChangedFile {
+                path: "src/app.rs".into(),
+                status: "modified".into(),
+                additions: 48,
+                deletions: 6,
+                previous: None,
+                conflicted: false,
+            }],
+        );
+        app.open_commits.insert("a".repeat(40));
+        app.rebuild_entries();
+
+        let buf = render(&mut app);
+        assert!(
+            row_text(&buf, 1).contains("↑1 origin/main"),
+            "the title names what the list is measured against: {:?}",
+            row_text(&buf, 1)
+        );
+        let panel: String = (2..5).map(|y| row_text(&buf, y)).collect();
+        assert!(
+            panel.contains("▾ 4683983"),
+            "the commit row, opened: {panel:?}"
+        );
+        assert!(panel.contains("2 hours ago"), "and when: {panel:?}");
+        assert!(
+            panel.contains("M src/app.rs") && panel.contains("+48 −6"),
+            "its file, with a status letter and counts: {panel:?}"
+        );
+        assert!(
+            !panel.contains("[+]") && !panel.contains("[ ]"),
+            "and no staging box — a commit already happened: {panel:?}"
+        );
+
+        // The panel's own bottom border offers all three panels.
+        let fl = app.layout.file_list;
+        let bottom = row_text(&buf, fl.y + fl.height);
+        assert!(
+            bottom.contains("Change") && bottom.contains("Files") && bottom.contains("Commits"),
+            "{bottom:?}"
+        );
     }
 
     /// Local review shows a staging column: [+] to stage, [±] partly staged,

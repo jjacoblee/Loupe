@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Staged and unstaged, told apart.** The local file panel is now in two
+  halves: `STAGED` at the top — what `git commit` would take — and
+  `UNSTAGED` below it. Stage a file and its row moves up; unstage it and
+  it moves back down. Either heading folds its section away, and carries
+  the action for the whole of it: `✚ all` stages everything, `↩ all` takes
+  it all back out. `X` does the same from the keyboard. A partly staged
+  file is listed once, under `STAGED`, with the `[±]` icon that says the
+  rest of it is not. Staging everything is refused while a merge conflict
+  is open, because `git add` mid-merge means "resolved".
+- **A stash menu.** `S`, or `📦 Stash…` in the ☰ menu, offers the three
+  questions git asks: stash the tracked changes, take the untracked files
+  with them, or take only what is in the index. Every one of them asks for
+  a name first — press Enter on an empty box and git names it itself. The
+  menu lists your stashes below those lines; click one to apply it, pop
+  it, or drop it.
+- **Commits you have not pushed.** A third panel beside `Change` and
+  `Files`: `Commits` lists what this branch has that the upstream does
+  not, newest first. Open a commit to see its files; open a file to read
+  that commit's diff, against the commit's own first parent. The change
+  pane only ever showed uncommitted work, so on a branch thirty commits
+  ahead the other twenty-nine were invisible.
 - **The whole repository in the file panel.** `F` swaps the panel between
   the files the change touches and every file in the repository, each with
   its own tree and its own collapse state. Ignored files are listed and
@@ -91,8 +112,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Language servers from the config file.** A `[[server]]` table adds a
   language or replaces a built-in one. `loupe --lsp` reports yours too.
 
+### Changed
+
+- `j` and `k` in the file panel now walk the rows on screen rather than
+  the file list. The staging sections make row order and list order
+  different things, and the cursor has to follow what you can see.
+- The panel title's staged count now counts what is in the index, partly
+  staged files included, so it agrees with the `STAGED` heading.
+
 ### Fixed
 
+- `git show` ran in whatever directory loupe was started in rather than in
+  the repository root, which every other git call uses. The same
+  repository today, and silently the wrong one the moment the two differ.
 - A nested worktree or repository made `Ctrl+P` show a blank row: `git
   ls-files` reports such a directory instead of its contents, and the entry
   was read as a file with no name.

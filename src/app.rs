@@ -10855,7 +10855,9 @@ impl App {
             },
             pr: self.pr.as_ref().map(|pr| (pr.number, pr.title.clone())),
             local: self.local,
-            file: self.files.get(self.file_cursor).map(|f| f.path.clone()),
+            // Whatever the diff pane is showing, which while a commit is
+            // open is one of its files rather than one of the change's.
+            file: self.open_file().map(|f| f.path.clone()),
             selection,
             hunk,
             unviewed,
@@ -13168,6 +13170,9 @@ impl App {
         // front of the reader.
         if self.panel == PanelMode::Files && self.repo_job.is_none() {
             self.spawn_repo_listing();
+        }
+        if self.panel == PanelMode::Commits && self.commits_job.is_none() {
+            self.spawn_commits();
         }
         if self.local {
             self.ok("⟳ Rescanning local changes…");
@@ -17961,6 +17966,64 @@ b2
         load_commits(&mut app, &base);
         assert!(app.commits_note.is_none());
         assert_eq!(panel_rows(&app).len(), 2);
+    }
+
+    /// The whole thing through the real doors, against a real repository:
+    /// scan the working tree, read the index, split the panel, then walk
+    /// to the commits and open one.
+    #[test]
+    fn a_real_repository_fills_both_panels() {
+        let dir = TempDir::new("end-to-end");
+        let (mut app, base) = commits_app(&dir.0);
+        let d = dir.0.to_string_lossy().into_owned();
+        // One staged edit, one untracked file.
+        std::fs::write(
+            dir.0.join("a.txt"),
+            "two
+more
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.0.join("c.txt"),
+            "loose
+",
+        )
+        .unwrap();
+        gitops::run_git(&["-C", &d, "add", "a.txt"]).unwrap();
+
+        // The index, read by the same call the panel reads it with.
+        app.files = ["a.txt", "c.txt"]
+            .iter()
+            .map(|p| ChangedFile {
+                path: (*p).into(),
+                status: "modified".into(),
+                additions: 1,
+                deletions: 0,
+                previous: None,
+                conflicted: false,
+            })
+            .collect();
+        app.stage = gitops::stage_states(&dir.0).unwrap();
+        app.rebuild_files();
+        assert_eq!(
+            panel_rows(&app),
+            ["# STAGED 1", "a.txt", "# UNSTAGED 1", "c.txt"],
+            "git status put each file in its own half"
+        );
+        assert_eq!(app.staged_count(), 1);
+
+        // And the commits, read the same way the panel reads them.
+        app.set_panel(PanelMode::Commits);
+        load_commits(&mut app, &base);
+        app.toggle_commit(0);
+        let rows = panel_rows(&app);
+        assert!(rows[0].ends_with("third"), "{rows:?}");
+        assert_eq!(rows[1], "    b.txt", "the commit's own file: {rows:?}");
+
+        // Back to the change, and the sections are as they were.
+        app.set_panel(PanelMode::Changes);
+        assert_eq!(panel_rows(&app).len(), 4);
     }
 
     /// F walks the three panels and comes back round.

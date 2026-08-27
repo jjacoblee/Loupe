@@ -19,7 +19,7 @@ threading model, and the invariants that are easy to break by accident.
 | `markdown.rs` | Markdown → styled lines: the block/inline parser and the width-dependent layout |
 | `preview.rs` | The preview pane: scrolling, the source-line map, reload, and the scrollbar |
 | `pins.rs` | Pinned files: the tab list, the state file, and reading a dropped path out of a paste |
-| `gitops.rs` | Everything that shells out to `git`: local scans, staging, refs, file content |
+| `gitops.rs` | Everything that shells out to `git`: local scans, staging, stashes, commits, refs, file content |
 | `github.rs` | Everything that shells out to `gh`: PR lists, details, comments, viewed sync |
 | `highlight.rs` | Syntax highlighting via syntect + two-face: themes, caching, incremental editor highlighting |
 | `theme.rs` | Light/dark appearance: terminal background detection and the two UI color palettes |
@@ -132,10 +132,41 @@ too wide for the column renders as `#…`.
 
 ## The file panel
 
-The panel shows one of two lists, chosen by `App::panel`: the files the
-change touches, or every file in the repository. They are separate all the
-way down — their own `TreeNodes`, their own collapse set — because a folder
-closed in one is a folder the reader never touched in the other.
+The panel shows one of three lists, chosen by `App::panel`: the files the
+change touches, every file in the repository, or the commits this branch
+has that the upstream does not. The first two are separate all the way
+down — their own `TreeNodes`, their own collapse set — because a folder
+closed in one is a folder the reader never touched in the other. The third
+has no tree at all: a commit is a row, and its files are rows under it.
+
+### Staged and unstaged
+
+A local review divides the change into a `STAGED` and an `UNSTAGED`
+section, headed by `FileEntry::StageHeading`. **Both sections are the one
+cached tree, emitted twice under a filter** (`TreeNodes::emit_where`).
+Nothing is rebuilt when a file moves across, which matters because the
+index moves on every click of the staging column and again on every
+background re-read.
+
+Emitting under a filter has one consequence the unfiltered walk does not
+have: a directory the filter empties would draw with nothing under it. So
+`walk` takes a `prune` flag — it rolls the directory row back when the
+recursion added nothing, and asks `node_keeps` directly for a collapsed
+one, whose rows are never emitted to count. `prune` is off for the panel
+that lists the repository, where a directory git would not walk into is
+legitimately empty until somebody opens it.
+
+`App::section_of` is the single answer to which half a file is in. A
+partly staged file is in the index and in the working tree at once; it is
+listed once, under `STAGED`, because two sections whose counts add up to
+more than the change has files would be worse than either count alone.
+`staged_count` — the panel title — asks the same function, so the title and
+the heading can never disagree.
+
+Because the sections reorder the rows, index order and row order are no
+longer the same thing, and `step_file` walks `entries` rather than `files`.
+It falls back to the list when the open file has no row: a folded section
+holds it, or the panel is showing something else.
 
 **The split that matters is build against emit.** `TreeNodes::build` walks
 every path into a `BTreeMap` tree; `TreeNodes::emit` walks that tree and
@@ -256,6 +287,42 @@ Two anchoring facts shape the rest:
 a (side, line) and asks whether any held comment covers it — rather than
 indexing by comment, because the same line can be reached from either view
 mode and only the row model knows which side a row is showing.
+
+## Reading one commit
+
+The `Commits` panel lists `gitops::unpushed_commits` against
+`unpushed_base` — the branch's own upstream where it has one, and
+`origin/HEAD`'s default branch where it does not, because a branch that
+tracks nothing has never been pushed at all. The list is capped at 200 and
+re-read when the reader comes back to the panel after 30 seconds. A
+commit's file list is read on the click that opens it and kept forever: a
+commit's files never change, so nothing cached about one goes stale.
+
+Opening one of those files sets `App::open_commit` and leaves `App::files`
+alone. That is the whole trick. The change under review keeps its own file
+list, its own cursor and its own staging state while the diff pane shows
+something that is not in it, and `App::open_file` — not `files[file_cursor]`
+— is what every part of the window that describes the diff asks.
+
+`load_file_data` used to take five positional arguments describing where
+the two sides come from. It now takes a `LoadCtx`, and the three reviews
+say plainly which of the two they are:
+
+| Review | Old side | New side | From disk | Anchors comments |
+| --- | --- | --- | --- | --- |
+| Pull request | merge base | head oid | when checked out | yes |
+| Local changes | `HEAD` | the working tree | yes | no |
+| One commit | its first parent | the commit | no | no |
+
+A commit is read from git on **both** sides. The copy on disk belongs to
+`HEAD`, which for every commit but the newest is a later version of the
+same file. A root commit has no first parent, so its old ref is empty and
+every file in it reads as added — which is what it is.
+
+Everything that acts on the working tree asks `open_commit` first and
+refuses: staging, reverting, editing, and the idle re-scan, which would
+otherwise replace a commit's diff with a working-tree one under a reader
+who did not ask to move.
 
 ## The PR ⇄ local swap
 
@@ -764,6 +831,10 @@ since been deleted is dropped when it is read back.
   [SECURITY.md](../SECURITY.md).
 - `git show <oid>:<path>` with an **empty** oid reads the index, not
   HEAD — any call that could receive an empty oid must guard against it.
+  `gitops::show_file` takes the repository root and passes `-C <root>` for
+  the same reason every pathspec call does: resolving against the
+  process's own directory is the same repository today and silently the
+  wrong one the moment the two differ.
 - File paths from the GitHub API are repo-root-relative; filesystem
   operations join them onto `git rev-parse --show-toplevel`, and
   staging/pathspec operations pass `-C <repo_root>` because pathspecs are
@@ -784,8 +855,9 @@ framing and every shape a `definition` answer can take — plus
 `TestBackend` render tests that assert syntax colors and search
 highlights actually reach the diff cells, and tests that drive a **real
 temporary git repository** to keep the staging, `git grep` and
-`git blame` plumbing honest. Clippy is
-kept at zero warnings across all targets.
+`git blame` plumbing honest — the staging sections, the three stash
+scopes, and the unpushed-commit list all run against one of those. Clippy
+is kept at zero warnings across all targets.
 
 ## Performance ground rules
 

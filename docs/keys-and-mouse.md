@@ -128,20 +128,62 @@ buffer belongs to the side you are leaving.
 | Right-click a file or folder | Copy its path (see [Copying a path](#copying-a-path)) |
 | `]` / `[` | Next / previous file |
 | `x` or click the icon column | PR: toggle *viewed* (syncs to GitHub) · Local: stage / unstage the file |
+| `X` | Local: stage the whole change, or unstage it when it is all staged |
+| Click a `STAGED` / `UNSTAGED` heading | Fold that section away |
+| Click `✚ all` / `↩ all` on a heading | Move that whole section across |
+| `S` | Local: open the stash menu |
 | Click `[!]` on a conflicted row | Open its resolve menu (see [Merge conflicts](#merge-conflicts)) |
 | Click `↺` at the end of a row | Revert every change in that file (asks first) |
 | `Tree` / `Flat` buttons | Switch between tree and flat list |
-| `F` or the `Change` / `Files` buttons | Swap between the change and every file in the repository |
+| `F` or the `Change` / `Files` / `Commits` buttons | Walk the three panels |
 | Drag the divider | Resize the panel |
 | Double-click the divider | Reset the panel width (34 columns) |
 | `<` / `>` | Narrow / widen the panel |
 
+### Commits not pushed yet
+
+`F` again, or the `Commits` button, lists the commits this branch has
+that the upstream does not — the work you have committed but not pushed.
+The change pane shows only what is uncommitted, so without this the other
+twenty-nine commits on a branch thirty ahead are invisible.
+
+| Key / mouse | Action |
+| --- | --- |
+| Click a commit | Open it to its files, or close it again |
+| Click a file under a commit | Read that commit's diff for that file |
+
+Each row is the short id, the subject, and how long ago it was made. The
+panel title names what the list is measured against, in the same shape
+the top bar uses for the upstream drift: `Commits ↑4 origin/main`.
+
+The upstream is the branch's own where it has one. A branch that tracks
+nothing has never been pushed at all, so the question becomes "what is on
+this branch that the default branch does not have", and `origin/HEAD`
+answers it. With neither, the panel says so and offers `git branch -u`.
+
+**A commit's diff is read against its own first parent**, both sides from
+git. The copy on disk belongs to `HEAD`, which for every commit but the
+newest is a later version of the same file. The diff title names the
+commit it came from, because the same path can be in several of them:
+
+```
+ src/app.rs — +48 −6 · ◷ 4683983 Make the editor a real IDE surface
+```
+
+A commit already happened, so nothing in its diff can be staged,
+reverted, or edited, and the idle rescan leaves it alone. Press `F` for
+the change to do any of those.
+
+The list is read again when you come back to the panel after thirty
+seconds, and capped at 200 commits — a branch that forked long ago is a
+panel nobody reads.
+
 ### Every file in the repository
 
-`F` swaps the panel between the files this change touches and every file
-in the repository. The two keep their own trees and their own collapse
-state, so a folder you closed in one is a folder you never touched in the
-other, and swapping back lands where you left off.
+`F` walks the panel through the change, every file in the repository, and
+the unpushed commits. The change and the repository keep their own trees
+and their own collapse state, so a folder you closed in one is a folder
+you never touched in the other, and coming back lands where you left off.
 
 The list comes from `git ls-files`, so it holds what git tracks plus what
 it does not yet — and, deliberately, the files git is **ignoring**:

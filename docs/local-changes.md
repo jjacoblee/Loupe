@@ -131,10 +131,36 @@ Reverting (`u` / `U` / the `↺` markers) is refused on a conflicted file:
 `git checkout HEAD -- <path>` mid-merge throws the merge away for that
 path. `u` opens the resolve menu instead.
 
-## The staging column
+## Staged and unstaged
 
-In local mode, the file panel's icon column stages instead of marking
-viewed. Click the icon (or press `x`) to toggle:
+In local mode the file panel is in two halves. `STAGED` is at the top —
+what `git commit` would take right now — and `UNSTAGED` is below it.
+Stage a file and its row moves up; unstage it and the row moves back
+down.
+
+```
+┌ Files 2/7 staged ──────────── Tree  Flat ┐
+│ ▾ STAGED 2                         ↩ all │
+│   [✓] M  src/app.rs           +48 −6   ↺ │
+│   [±] M  src/ui.rs            +12 −0   ↺ │
+│ ▾ UNSTAGED 5                       ✚ all │
+│   [+] M  docs/README.md        +3 −1   ↺ │
+└──────────────── Change │ Files │ Commits ┘
+```
+
+- **Click a heading** to fold that section away. The heading stays, with
+  its count, so you can always see how the change is divided.
+- **Click `✚ all`** to stage everything, **`↩ all`** to take it all back
+  out. `X` does the same from the keyboard: it stages what is left, and
+  unstages everything when there is nothing left to stage.
+- A **partly staged** file is in the index and in the working tree at
+  once. It is listed once, under `STAGED`, with the `[±]` icon that says
+  the rest of it is not.
+
+### The staging column
+
+The panel's icon column stages instead of marking viewed. Click the icon
+(or press `x`) to toggle:
 
 | Icon | Meaning |
 | --- | --- |
@@ -150,12 +176,59 @@ Details worth knowing:
   (e.g. from `git add -p` elsewhere) is always shown faithfully.
 - Renames stage and unstage as a unit — both the old and new path move
   together.
-- The panel title shows progress: `Files 3/7 staged`.
+- The panel title shows progress: `Files 3/7 staged`, counting what is in
+  the index — the same number the `STAGED` heading shows.
 - Works from any subdirectory of the repo, and in a brand-new repository
   with no commits yet.
+- **Staging everything is refused while a merge conflict is open.** git
+  treats a path as conflicted until it is added, so `git add -A` mid-merge
+  would mark every conflict resolved without anybody resolving one.
 
 Staging toggles are optimistic and re-read the real index in the
 background; on failure the icon reverts and the error is shown.
+
+## Putting work aside — the stash
+
+`S`, or `📦 Stash…` in the ☰ menu, opens the stash menu. It asks the three
+questions git asks:
+
+| Line | What it takes |
+| --- | --- |
+| `Stash the tracked changes` | Edits to files git already knows about |
+| `Stash everything, untracked files too` | The above, plus new files (`--include-untracked`) |
+| `Stash the staged files only` | Just what is in the index (`--staged`), leaving your unstaged edits in place |
+
+**Every one of them asks for a name first.** Type one and it is what
+`git stash list` shows; press Enter with the box empty and git names it
+itself (`WIP on <branch>`). So "stash with a name" is not a fourth way to
+stash — it is the same three, named.
+
+Below those lines the menu lists every stash you have, newest first, with
+its name and how long ago it was made. Click one for what can be done
+with it:
+
+| Line | Action |
+| --- | --- |
+| `Apply it and keep the stash` | `git stash apply` — the work comes back, the stash stays |
+| `Apply it and drop the stash` | `git stash pop` |
+| `Drop it` | `git stash drop` — asks nothing back, and cannot be undone from loupe |
+
+Applying tries to put the index back the way it was (`--index`) and falls
+back to restoring the work as unstaged edits when git cannot replay it.
+
+git calls an empty stash a success and says "No local changes to save" on
+its way out. Loupe turns that into an error, because a menu click that
+did nothing should not look like one that worked.
+
+`--staged` needs git 2.35 or later.
+
+## Commits you have not pushed
+
+The change pane shows what is uncommitted, and nothing else. Press `F`
+twice — or click `Commits` on the panel's bottom border — for the commits
+this branch has that the upstream does not. Open one to see its files,
+and open a file to read that commit's diff. See
+[Commits not pushed yet](keys-and-mouse.md#commits-not-pushed-yet).
 
 ## Putting changes back
 
@@ -230,8 +303,11 @@ keeping your place in both. See
 2. Walk the file list top to bottom, reading each diff. Fix small things
    in place with the editor.
 3. Stage each file as you finish reviewing it — `x`, or click the icon.
-   Something you didn't mean to keep? `↺` beside it puts it back.
-   Hand a fix to an agent and keep reading: its edits appear on their
-   own, or press `r` to pull them in now.
-4. Quit (`q`) and `git commit`: the index already contains exactly what
+   It moves up into `STAGED`, so what is left below is what you have not
+   read yet. Something you didn't mean to keep? `↺` beside it puts it
+   back. Hand a fix to an agent and keep reading: its edits appear on
+   their own, or press `r` to pull them in now.
+4. Something half-finished in the way? `S` puts it aside with a name, and
+   the same menu brings it back later.
+5. Quit (`q`) and `git commit`: the index already contains exactly what
    you reviewed.
