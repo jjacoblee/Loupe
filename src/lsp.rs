@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -478,7 +478,9 @@ struct Client {
     lang: &'static str,
     cmd: &'static str,
     child: Child,
-    stdin: ChildStdin,
+    /// Frames waiting to go to the server, and the thread that writes
+    /// them. See [`Client::send`].
+    out: mpsc::Sender<Vec<u8>>,
     rx: Receiver<Value>,
     next_id: i64,
     /// uri → (version, hash of the text we last sent).
@@ -580,10 +582,20 @@ impl Client {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("{} produced no stdout", spec.cmd))?;
-        let stdin = child
+        let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| anyhow!("{} accepts no stdin", spec.cmd))?;
+        // One thread owns the pipe, and everybody else reaches it through
+        // this channel. See `Client::send` for why.
+        let (out, outbox) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            for frame in outbox {
+                if stdin.write_all(&frame).is_err() || stdin.flush().is_err() {
+                    break;
+                }
+            }
+        });
         let stderr = Arc::new(Mutex::new(Vec::new()));
         if let Some(pipe) = child.stderr.take() {
             let sink = stderr.clone();
@@ -615,7 +627,7 @@ impl Client {
             lang: spec.lang,
             cmd: spec.cmd,
             child,
-            stdin,
+            out,
             rx,
             next_id: 0,
             opened: HashMap::new(),
@@ -669,12 +681,30 @@ impl Client {
         Ok(client)
     }
 
+    /// Hand one JSON-RPC frame to the writer thread.
+    ///
+    /// This must not block, and writing to the pipe here would. A pipe
+    /// holds 64 KB on macOS; `didChange` on a 536 KB buffer is 553 KB of
+    /// escaped JSON, so nine of those writes wait on the server draining
+    /// the other end — and a server busy indexing a project does not.
+    /// `sync_open` is called from the idle tick on the drawing thread, so
+    /// that wait was a frozen window.
+    ///
+    /// One channel per server rather than a thread per message, because
+    /// the protocol is ordered: `didOpen` must reach the server before the
+    /// `didChange` that builds on it, and version 2 before version 3. Two
+    /// threads racing on the same pipe would corrupt the stream outright.
+    ///
+    /// A broken pipe surfaces one message late — the writer thread ends,
+    /// which drops the receiver, which fails the next send. That is soon
+    /// enough for something already this far gone.
     fn send(&mut self, msg: &Value) -> Result<()> {
         let body = serde_json::to_vec(msg)?;
-        write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len())?;
-        self.stdin.write_all(&body)?;
-        self.stdin.flush()?;
-        Ok(())
+        let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        frame.extend_from_slice(&body);
+        self.out
+            .send(frame)
+            .map_err(|_| anyhow!("{} stopped reading its input", self.cmd))
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
@@ -1531,6 +1561,60 @@ fn hover_text(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this replaced: `send` wrote straight to the server's pipe
+    /// from whichever thread called it, and `sync_open` calls it from the
+    /// idle tick on the drawing thread. A pipe holds 64 KB; a `didChange`
+    /// on a large buffer is several times that, so the write waited on a
+    /// server that was busy indexing, and the window stopped.
+    ///
+    /// This drives the same shape without a language server: a pipe
+    /// nobody reads, and frames far larger than it holds. If `send` ever
+    /// writes to the pipe again rather than handing it to the writer
+    /// thread, this blocks forever instead of failing.
+    #[test]
+    fn sending_does_not_wait_for_the_server_to_read() {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        // `cat` with its stdout going nowhere we read: its input pipe
+        // fills and stays full.
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cat is on every machine this runs on");
+        let mut stdin = child.stdin.take().expect("piped");
+        let (out, outbox) = mpsc::channel::<Vec<u8>>();
+        thread::spawn(move || {
+            for frame in outbox {
+                if stdin.write_all(&frame).is_err() || stdin.flush().is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Ten megabytes, in a pipe that holds 64 kilobytes.
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..10 {
+                if out.send(vec![b'x'; 1024 * 1024]).is_err() {
+                    break;
+                }
+            }
+            let _ = done_tx.send(());
+        });
+
+        assert!(
+            !matches!(
+                done_rx.recv_timeout(Duration::from_secs(5)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "handing frames over blocked on the pipe"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     #[test]
     fn maps_extensions_to_servers() {

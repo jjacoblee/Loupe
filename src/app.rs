@@ -2306,6 +2306,11 @@ impl App {
     /// Debounced, and deliberately best-effort: `sync_open` never blocks
     /// and never starts a server, so a slow or missing one costs a
     /// skipped tick rather than a stutter between keystrokes.
+    ///
+    /// "Never blocks" covers the locks — it takes them with `try_lock` —
+    /// and, since the writer thread landed, the pipe as well. Before that
+    /// it did not: a `didChange` larger than the pipe waited here on a
+    /// server that was busy indexing. See `lsp::Client::send`.
     fn sync_editor_buffer(&mut self) -> bool {
         if !self.lsp_enabled {
             return false;
