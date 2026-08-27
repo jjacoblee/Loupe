@@ -599,7 +599,13 @@ gets lost.
 ### STEP 10 — Buffer tabs
 
 Reuse `draw_pin_tabs` (`ui.rs:89`) and `Pins::labels` (`pins.rs:155`).
-Settle open question 2 first.
+
+**Correction found while doing it:** one strip, yes — but drawn together
+and **addressed apart**. The pin row is index-coupled through
+`open_pin`, `PinTab`, `open_pin_number`, `active_pin` and `Pins::step`, and
+folding buffers into that numbering would renumber a reader's pins every
+time a file was opened. Buffers get `ButtonId::BufferTab` and `Alt+[` /
+`Alt+]`, beside the pins' `,` and `.`, and a divider between the two runs.
 **Size:** 1 day.
 
 ## Phase C — editor depth

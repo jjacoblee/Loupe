@@ -30,7 +30,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     // The tab row only takes a line when something is pinned, so a reader
     // who never pins a file never pays for the feature.
-    let tabs = u16::from(!app.pins.is_empty());
+    let tabs = u16::from(!app.pins.is_empty() || app.buffers().count() > 1);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -218,6 +218,66 @@ fn draw_pin_tabs(f: &mut Frame, app: &mut App, area: Rect) {
         app.layout.buttons.push((rect, ButtonId::PinTab(i)));
         x += w;
     }
+    // The open buffers, after the pins and in the same row. They are drawn
+    // together and addressed apart: a pin is a bookmark the reader chose
+    // and a buffer is a file that happens to be open, and merging their
+    // numbering would renumber the pins every time a file was opened.
+    let bufs = app.buffer_tabs();
+    if bufs.len() > 1 {
+        // A divider, so the two kinds of tab do not read as one run.
+        if x + 2 <= right && !labels.is_empty() {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "│",
+                    Style::default().bg(p.btn_bg).fg(p.faint),
+                ))),
+                Rect {
+                    x,
+                    y: area.y,
+                    width: 1,
+                    height: 1,
+                },
+            );
+            x += 1;
+        }
+        for (i, (label, dirty, active)) in bufs.iter().enumerate() {
+            // " ●name " — the dot only when there is unsaved work in it.
+            let w = width(label) + if *dirty { 1 } else { 0 } + 2;
+            if x + w > right.saturating_sub(1) {
+                hidden += bufs.len() - i;
+                break;
+            }
+            let (bg, fg) = if *active {
+                (p.btn_active_bg, p.btn_active_fg)
+            } else {
+                (p.btn_bg, p.btn_fg)
+            };
+            let base = Style::default().bg(bg).fg(fg);
+            let mut spans = vec![Span::styled(" ", base)];
+            if *dirty {
+                spans.push(Span::styled("●", Style::default().bg(bg).fg(p.accent)));
+            }
+            spans.push(Span::styled(
+                label.clone(),
+                if *active {
+                    base.add_modifier(Modifier::BOLD)
+                } else {
+                    base
+                },
+            ));
+            spans.push(Span::styled(" ", base));
+            let rect = Rect {
+                x,
+                y: area.y,
+                width: w,
+                height: 1,
+            };
+            f.render_widget(Paragraph::new(Line::from(spans)), rect);
+            app.layout.buttons.push((rect, ButtonId::BufferTab(i)));
+            x += w;
+        }
+    }
+
     // A `›` and a count for the tabs that did not fit — silently dropping
     // them would make the row lie about how many files are pinned.
     if hidden > 0 {

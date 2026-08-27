@@ -997,6 +997,8 @@ pub enum ButtonId {
     // --- the pinned-file tab row (see [`crate::pins`])
     /// A tab in the row: a click opens the file it holds.
     PinTab(usize),
+    /// One of the open buffers, in the same row after the pins.
+    BufferTab(usize),
     /// The ✕ on one tab, which unpins it.
     PinClose(usize),
     /// 📌 in the top bar, and the ☰ row beside it: pin the file in front
@@ -7129,6 +7131,7 @@ impl App {
             ButtonId::PreviewToggle => self.toggle_preview(),
             ButtonId::PreviewClose => self.close_preview(),
             ButtonId::PinTab(i) => self.open_pin(i),
+            ButtonId::BufferTab(i) => self.open_buffer_at(i),
             ButtonId::PinClose(i) => self.close_pin(i),
             ButtonId::PinToggle => self.toggle_pin_current(),
             ButtonId::PinOpenPath => self.open_path_box(),
@@ -9786,6 +9789,11 @@ impl App {
             KeyCode::Char('-') if alt => self.close_open_pin(),
             KeyCode::Char('.') if alt => self.step_pin(1),
             KeyCode::Char(',') if alt => self.step_pin(-1),
+            // `,` and `.` step the pins, so the buffers take the brackets.
+            // Alt, not Ctrl: the editor takes plain characters as text and
+            // `Ctrl+]` is already the jump to a definition.
+            KeyCode::Char(']') if alt => self.step_buffer(1),
+            KeyCode::Char('[') if alt => self.step_buffer(-1),
             _ => return false,
         }
         true
@@ -9952,6 +9960,66 @@ impl App {
             if dirty == 1 { "buffer" } else { "buffers" },
             if dirty == 1 { "it" } else { "them" }
         ));
+    }
+
+    /// What the tab row says about the open buffers: label, whether it
+    /// holds unsaved work, and whether it is the one on screen.
+    ///
+    /// The label rule is the pins' rule (`pins::Pins::labels`): the file
+    /// name alone, unless two buffers share one, in which case both get
+    /// their parent directory. Two tabs both reading `mod.rs` name
+    /// nothing.
+    pub fn buffer_tabs(&self) -> Vec<(String, bool, bool)> {
+        let paths: Vec<&str> = self.buffers().map(|e| e.path.as_str()).collect();
+        let name = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+        let active = self.editor.as_ref().map(|e| e.path.as_str());
+        self.buffers()
+            .enumerate()
+            .map(|(i, e)| {
+                let mine = name(&e.path);
+                let shared = paths
+                    .iter()
+                    .enumerate()
+                    .any(|(j, other)| j != i && name(other) == mine);
+                let label = if shared {
+                    let mut parts = e.path.rsplitn(3, '/');
+                    let base = parts.next().unwrap_or("");
+                    match parts.next() {
+                        Some(dir) => format!("{dir}/{base}"),
+                        None => base.to_string(),
+                    }
+                } else {
+                    mine
+                };
+                (label, e.dirty, active == Some(e.path.as_str()))
+            })
+            .collect()
+    }
+
+    /// Bring the nth open buffer forward, counting the way the row reads.
+    pub fn open_buffer_at(&mut self, i: usize) {
+        let Some(path) = self.buffers().nth(i).map(|e| e.path.clone()) else {
+            return;
+        };
+        if self.switch_buffer(&path) {
+            self.ok(format!("{path} — {} open.", self.buffers().count()));
+        }
+    }
+
+    /// Step to the next or previous buffer, wrapping at each end.
+    pub fn step_buffer(&mut self, delta: i32) {
+        let n = self.buffers().count();
+        if n < 2 {
+            self.err("Only one file is open.");
+            return;
+        }
+        let at = self
+            .buffer_tabs()
+            .iter()
+            .position(|(_, _, active)| *active)
+            .unwrap_or(0) as i32;
+        let next = (at + delta).rem_euclid(n as i32) as usize;
+        self.open_buffer_at(next);
     }
 
     /// Every open buffer, the one on screen last.
@@ -12301,7 +12369,57 @@ b2
         assert!(app.editor.as_ref().unwrap().dirty);
     }
 
-    /// `q` used to be one keypress from gone. One buffer guarded itself
+    /// Two buffers both called `mod.rs` name nothing, so a shared name
+    /// costs both of them their parent directory — the rule the pins
+    /// already use.
+    #[test]
+    fn buffer_tabs_disambiguate_a_shared_name() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.open_buffer(buf("src/parser/mod.rs"));
+        app.open_buffer(buf("src/lexer/mod.rs"));
+        app.open_buffer(buf("src/main.rs"));
+
+        let labels: Vec<String> = app.buffer_tabs().into_iter().map(|(l, ..)| l).collect();
+        assert!(labels.iter().any(|l| l == "parser/mod.rs"), "{labels:?}");
+        assert!(labels.iter().any(|l| l == "lexer/mod.rs"), "{labels:?}");
+        assert!(
+            labels.iter().any(|l| l == "main.rs"),
+            "and a name nobody shares stays short: {labels:?}"
+        );
+
+        let active: Vec<String> = app
+            .buffer_tabs()
+            .into_iter()
+            .filter(|(_, _, a)| *a)
+            .map(|(l, ..)| l)
+            .collect();
+        assert_eq!(active, vec!["main.rs"], "exactly one tab is the open one");
+    }
+
+    /// Stepping wraps, and lands on the buffer the tab row shows in that
+    /// position — the row and the key must not disagree about the order.
+    #[test]
+    fn stepping_buffers_wraps_and_follows_the_row() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.open_buffer(buf("a.rs"));
+        app.open_buffer(buf("b.rs"));
+        app.open_buffer(buf("c.rs"));
+        let order: Vec<String> = app.buffer_tabs().iter().map(|(l, ..)| l.clone()).collect();
+
+        let active = |app: &App| app.editor.as_ref().unwrap().path.clone();
+        assert_eq!(active(&app), "c.rs");
+
+        app.step_buffer(1);
+        assert_eq!(
+            active(&app),
+            order[0],
+            "past the end comes back to the first tab in the row"
+        );
+        app.step_buffer(-1);
+        assert_eq!(active(&app), "c.rs", "and back again");
+    }
+
+    /// `q` used to be one keypress from gone.    /// `q` used to be one keypress from gone. One buffer guarded itself
     /// with Esc-then-Esc, but `q` reaches past that, and with several
     /// buffers open it could take unsaved work in files that were not even
     /// on screen.
