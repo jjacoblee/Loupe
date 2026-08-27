@@ -1003,6 +1003,7 @@ document that `P` opens; a *peek* is a tab you have not committed to yet.
 | Click a file in the panel | Open it in the peek tab |
 | Double-click it | Keep its tab |
 | Click a tab | Go to it |
+| **Right-click a tab** | Copy its path — relative, or full |
 | Click its `✕`, or middle-click the tab | Close it |
 | Drag a tab | Put it where you want it in the row |
 | `,` / `.` | Previous / next tab, wrapping at each end |
@@ -1011,6 +1012,22 @@ document that `P` opens; a *peek* is a tab you have not committed to yet.
 A tab with unsaved work carries a `●` and asks before it closes. A tab
 holding only a diff has nothing to lose, so it closes without asking and
 leaves you on the tab beside it.
+
+### Getting a path out of a tab
+
+**Right-click any tab** for the two ways to name the file it holds —
+`Copy relative path` (`r`) and `Copy full path` (`f`) — the same question
+the file panel answers about a row.
+
+This is how you hand a file to a coding agent. It matters most for a file
+pinned from outside the repository: the tab shows it, but nothing else in
+the window does, and the alternative was going and finding it in the
+filesystem again. Such a file gets one line rather than two — it is
+already named by its absolute path, and there is nothing for a relative
+one to be relative to.
+
+The `✕` is part of the tab, so the right button asks there too instead of
+closing the tab by surprise.
 
 ### Pinned files
 

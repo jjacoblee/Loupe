@@ -7722,6 +7722,11 @@ impl App {
                     }
                 }
                 (MouseEventKind::Up(MouseButton::Left), _) => self.tab_drag = None,
+                // The right button asks about the file the tab holds,
+                // the same question the file panel answers.
+                (MouseEventKind::Down(MouseButton::Right), Some(id)) => {
+                    self.open_tab_menu(id, x, y)
+                }
                 // Middle-click closes a tab, as it does in a browser.
                 (MouseEventKind::Down(MouseButton::Middle), Some(ButtonId::PinTab(i)))
                 | (MouseEventKind::Down(MouseButton::Middle), Some(ButtonId::PinClose(i))) => {
@@ -8429,6 +8434,70 @@ impl App {
         self.overlay = Overlay::PathMenu(Box::new(PathMenu {
             path,
             is_dir,
+            items,
+            sel: 0,
+            anchor: (x, y),
+        }));
+    }
+
+    /// The name a tab shows, and the absolute path behind it.
+    ///
+    /// A pin carries both already, because a pinned file can live
+    /// anywhere on the machine. A buffer knows where it was read from. A
+    /// tab holding only a diff is a file of the change, and the change is
+    /// in the repository, so its absolute form is built from the root.
+    fn tab_paths(&self, id: ButtonId) -> Option<(String, Option<PathBuf>)> {
+        match id {
+            ButtonId::PinTab(i) | ButtonId::PinClose(i) => {
+                let pin = self.pins.items.get(i)?;
+                Some((pin.path.clone(), Some(pin.abs_path.clone())))
+            }
+            ButtonId::BufferTab(i) | ButtonId::BufferClose(i) => {
+                let path = self.buffer_tabs().get(i)?.path.clone();
+                let abs = self
+                    .editor_for(&path)
+                    .map(|e| e.abs_path.clone())
+                    .or_else(|| self.abs_path(&path));
+                Some((path, abs))
+            }
+            _ => None,
+        }
+    }
+
+    /// The right-click menu on a tab: the ways to name the file it holds.
+    ///
+    /// The tab is a name, and a name is not something you can hand to a
+    /// coding agent. For a file pinned from outside the repository this
+    /// is the only place its path comes from at all — the alternative was
+    /// going and finding it in the filesystem again.
+    fn open_tab_menu(&mut self, id: ButtonId, x: u16, y: u16) {
+        let Some((shown, abs)) = self.tab_paths(id) else {
+            return;
+        };
+        // A file outside the repository is already shown by its absolute
+        // path, and "relative" would have nothing to be relative to.
+        let outside = Path::new(&shown).is_absolute();
+        let mut items = Vec::new();
+        if !outside {
+            items.push(PathMenuItem {
+                key: 'r',
+                label: "Copy relative path",
+                action: PathAction::Copy(shown.clone()),
+            });
+        }
+        if let Some(abs) = abs {
+            items.push(PathMenuItem {
+                key: 'f',
+                label: "Copy full path",
+                action: PathAction::Copy(abs.to_string_lossy().into_owned()),
+            });
+        }
+        if items.is_empty() {
+            return;
+        }
+        self.overlay = Overlay::PathMenu(Box::new(PathMenu {
+            path: shown,
+            is_dir: false,
             items,
             sel: 0,
             anchor: (x, y),
@@ -19513,6 +19582,90 @@ more
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status_err);
         assert!(app.status.contains("unsaved edits open"), "{}", app.status);
+    }
+
+    // ------------------------------------------ the path behind a tab
+
+    /// The lines a path menu is offering, as (key, label, copied text).
+    fn path_menu_lines(app: &App) -> Vec<(char, &'static str, String)> {
+        let Overlay::PathMenu(menu) = &app.overlay else {
+            panic!("no path menu is open");
+        };
+        menu.items
+            .iter()
+            .map(|it| {
+                let text = match &it.action {
+                    PathAction::Copy(t) => t.clone(),
+                    other => format!("{other:?}"),
+                };
+                (it.key, it.label, text)
+            })
+            .collect()
+    }
+
+    /// A tab is a name, and a name is not something you can hand to a
+    /// coding agent. Right-clicking one asks which form you want.
+    #[test]
+    fn right_clicking_a_tab_offers_both_forms_of_its_path() {
+        let dir = TempDir::new("tabmenu-inside");
+        let mut app = tabs_app(&dir.0);
+        click_row(&mut app, "a.rs");
+
+        app.open_tab_menu(ButtonId::BufferTab(0), 4, 1);
+        let lines = path_menu_lines(&app);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0].0, 'r');
+        assert_eq!(lines[0].2, "a.rs", "the relative form is what git calls it");
+        assert_eq!(lines[1].0, 'f');
+        assert!(
+            lines[1].2.ends_with("a.rs") && lines[1].2.starts_with('/'),
+            "and the full one is absolute: {:?}",
+            lines[1].2
+        );
+    }
+
+    /// The case the feature exists for: a file pinned from somewhere else
+    /// on the machine. Its absolute path is shown nowhere else, and there
+    /// is nothing for a relative one to be relative to.
+    #[test]
+    fn a_tab_from_outside_the_repository_offers_its_full_path() {
+        let dir = TempDir::new("tabmenu-outside");
+        let mut app = tabs_app(&dir.0);
+        let away = std::env::temp_dir().join("loupe-tabmenu-elsewhere");
+        std::fs::create_dir_all(&away).unwrap();
+        let doc = away.join("agent-notes.md");
+        std::fs::write(&doc, "# Notes\n").unwrap();
+        app.pins
+            .add(crate::pins::Pin::new(&app.repo_root, doc.clone()))
+            .expect("room for one pin");
+        assert!(app.pins.items[0].outside);
+
+        app.open_tab_menu(ButtonId::PinTab(0), 4, 1);
+        let lines = path_menu_lines(&app);
+        assert_eq!(
+            lines.len(),
+            1,
+            "one line, and it is the useful one: {lines:?}"
+        );
+        assert_eq!(lines[0].0, 'f');
+        assert!(
+            lines[0].2.ends_with("agent-notes.md") && lines[0].2.starts_with('/'),
+            "{:?}",
+            lines[0].2
+        );
+        std::fs::remove_dir_all(&away).ok();
+    }
+
+    /// The ✕ is part of the tab, so the right button asks about the file
+    /// there too rather than closing it by surprise.
+    #[test]
+    fn the_close_mark_answers_the_same_question() {
+        let dir = TempDir::new("tabmenu-close");
+        let mut app = tabs_app(&dir.0);
+        click_row(&mut app, "a.rs");
+        app.open_tab_menu(ButtonId::BufferClose(0), 4, 1);
+        assert_eq!(path_menu_lines(&app).len(), 2);
+        assert_eq!(app.tab_labels(), ["a.rs"], "and nothing was closed");
     }
 
     /// The key everyone reaches for. `/` still works; Ctrl+F is what a

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Right-click a tab for its path.** `Copy relative path` and `Copy full
+  path`, the same question the file panel answers about a row. It matters
+  most for a file pinned from outside the repository: the tab shows it,
+  nothing else in the window does, and handing one to a coding agent
+  meant going and finding it in the filesystem again.
 - **Diffs open in tabs.** A tab is a file, and the same tab holds its
   diff, its buffer and its rendered document — `e`, `P` and `Esc` move
   between them and the tab stays put. Coming back to one lands you where
