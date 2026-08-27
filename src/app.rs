@@ -1979,6 +1979,19 @@ pub struct App {
     last_click: Option<(Instant, u16, u16)>,
 
     pub editor: Option<Editor>,
+    /// Set by a `q` that was refused for unsaved work; a second `q`
+    /// goes through. Cleared by anything else, so it never carries over
+    /// into a later, unrelated keypress.
+    quit_armed: bool,
+    /// Buffers that are open but not in front of the reader.
+    ///
+    /// `editor` stays what it has always been — the buffer on screen —
+    /// rather than becoming an index into a list. Every one of the 81
+    /// places that reads it still means "the buffer the reader is looking
+    /// at", which is what they all meant before, so none of them had to
+    /// change. Opening another file parks this one here; coming back
+    /// swaps them.
+    pub parked: Vec<Editor>,
     /// The markdown preview, when one is open. It shares the pane with
     /// the diff and the editor, and never coexists with the editor —
     /// `P` swaps one for the other on the same file.
@@ -2209,6 +2222,8 @@ impl App {
             drag_select: false,
             last_click: None,
             editor: None,
+            quit_armed: false,
+            parked: Vec::new(),
             preview: None,
             preview_only: false,
             pins: Pins::default(),
@@ -3024,7 +3039,7 @@ impl App {
         if let Some(line) = d.line {
             editor.jump_to_line(line);
         }
-        self.editor = Some(editor);
+        self.open_buffer(editor);
         // The pane follows the editor: a file outside the changeset has
         // no old side, so only the one blame is read.
         self.spawn_blame_external(d.path.clone(), d.read_only);
@@ -5061,11 +5076,16 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.last_input = Instant::now();
+        // Arming is for the very next key, not for later. Anything but a
+        // second `q` puts the guard back.
+        if self.quit_armed && key.code != KeyCode::Char('q') {
+            self.quit_armed = false;
+        }
         // A foreground job is modal: only cancel/quit get through.
         if self.job.is_some() {
             match key.code {
                 KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Esc => self.cancel_job(),
-                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('q') => self.request_quit(),
                 _ => {}
             }
             return;
@@ -5749,7 +5769,7 @@ impl App {
                     KeyCode::Esc if self.selection.is_some() => self.clear_selection(),
                     KeyCode::Esc if self.find.active() => self.clear_find(),
                     // --- everything that was already bound
-                    KeyCode::Char('q') => self.should_quit = true,
+                    KeyCode::Char('q') => self.request_quit(),
                     KeyCode::Esc | KeyCode::Char('b') => self.back_to_pr_list(),
                     KeyCode::Char('v') => self.toggle_view(),
                     KeyCode::Char('z') => self.toggle_fold(),
@@ -7161,7 +7181,7 @@ impl App {
                 }
             }
             ButtonId::Help => self.overlay = Overlay::Help,
-            ButtonId::Quit => self.should_quit = true,
+            ButtonId::Quit => self.request_quit(),
             ButtonId::EditorSave => self.spawn_save_editor(),
             ButtonId::EditorClose => self.request_close_editor(),
             ButtonId::EditorFormat => {
@@ -8207,8 +8227,13 @@ impl App {
     /// tree belongs to some other branch, so the commit's text is shown
     /// instead and the editor refuses to write it back.
     fn spawn_open_external(&mut self, path: String, line: Option<usize>) {
-        if self.editor.is_some() {
-            self.err("Close the editor first (Ctrl+S saves, Esc closes).");
+        // Already open: come back to it, unsaved edits and all, rather
+        // than reading the file again over the top of them.
+        if self.switch_buffer(&path) {
+            if let (Some(l), Some(ed)) = (line, &mut self.editor) {
+                ed.jump_to_line(l);
+            }
+            self.ok(format!("{path} — already open."));
             return;
         }
         // A preview holds nothing unsaved, so it simply gives way.
@@ -9906,8 +9931,77 @@ impl App {
         if let Some(line) = target {
             editor.jump_to_line(line);
         }
-        self.editor = Some(editor);
+        self.open_buffer(editor);
         self.ok("Editing new side — Ctrl+S saves to your working tree and refreshes the diff.");
+    }
+
+    /// `q` / the ✕ button: leave, unless there is unsaved work.
+    ///
+    /// One buffer guarded itself — Esc armed, Esc again discarded. With
+    /// several open, `q` can reach past every one of those, so the count
+    /// is what answers here rather than the buffer on screen.
+    pub fn request_quit(&mut self) {
+        let dirty = self.dirty_buffers();
+        if dirty == 0 || self.quit_armed {
+            self.should_quit = true;
+            return;
+        }
+        self.quit_armed = true;
+        self.err(format!(
+            "{dirty} unsaved {} — q again to quit and lose {}.",
+            if dirty == 1 { "buffer" } else { "buffers" },
+            if dirty == 1 { "it" } else { "them" }
+        ));
+    }
+
+    /// Every open buffer, the one on screen last.
+    pub fn buffers(&self) -> impl Iterator<Item = &Editor> {
+        self.parked.iter().chain(self.editor.iter())
+    }
+
+    /// How many open buffers hold unsaved work. Every "are you sure"
+    /// counts through this rather than looking at the active buffer, which
+    /// would have quietly stopped being the whole answer.
+    pub fn dirty_buffers(&self) -> usize {
+        self.buffers().filter(|e| e.dirty).count()
+    }
+
+    /// Park the buffer on screen and put `next` in front of the reader.
+    ///
+    /// A file already open is switched to rather than read again, so its
+    /// cursor, its scroll and its unsaved edits all survive.
+    pub fn open_buffer(&mut self, next: Editor) {
+        if let Some(i) = self.parked.iter().position(|e| e.path == next.path) {
+            let existing = self.parked.remove(i);
+            if let Some(cur) = self.editor.take() {
+                self.parked.push(cur);
+            }
+            self.editor = Some(existing);
+            return;
+        }
+        if let Some(cur) = self.editor.take() {
+            if cur.path == next.path {
+                // Re-opening what is already in front: keep the buffer,
+                // unsaved edits and all.
+                self.editor = Some(cur);
+                return;
+            }
+            self.parked.push(cur);
+        }
+        self.editor = Some(next);
+    }
+
+    /// Bring a parked buffer forward by path.
+    pub fn switch_buffer(&mut self, path: &str) -> bool {
+        let Some(i) = self.parked.iter().position(|e| e.path == path) else {
+            return self.editor.as_ref().is_some_and(|e| e.path == path);
+        };
+        let next = self.parked.remove(i);
+        if let Some(cur) = self.editor.take() {
+            self.parked.push(cur);
+        }
+        self.editor = Some(next);
+        true
     }
 
     pub fn request_close_editor(&mut self) {
@@ -9933,6 +10027,16 @@ impl App {
             thread::spawn(move || lsp.close(&root, &path));
         }
         self.editor = None;
+        // Another buffer waiting is what the reader goes back to, not the
+        // diff. Closing one file of several should not close them all.
+        if let Some(prev) = self.parked.pop() {
+            let path = prev.path.clone();
+            let read_only = prev.read_only;
+            self.editor = Some(prev);
+            self.spawn_blame_external(path.clone(), read_only);
+            self.ok(format!("{path} — {} still open.", self.parked.len() + 1));
+            return;
+        }
         if standalone {
             // The review was never disturbed — there is nothing to reload,
             // and reloading would throw away the reader's place. The pane
@@ -12161,6 +12265,77 @@ b2
         highlight::set_theme(before_theme);
         crate::theme::set_appearance(before_appearance);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn buf(path: &str) -> Editor {
+        Editor::new(path, std::path::PathBuf::from(path), "one\ntwo\n")
+    }
+
+    /// Opening a second file parks the first rather than closing it, and
+    /// closing the second comes back to it — with whatever was unsaved
+    /// still there. Re-opening a file already open switches to it instead
+    /// of reading over the top of the edits.
+    #[test]
+    fn a_second_file_parks_the_first_instead_of_replacing_it() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.open_buffer(buf("a.rs"));
+        app.editor.as_mut().unwrap().dirty = true;
+        app.open_buffer(buf("b.rs"));
+
+        assert_eq!(app.editor.as_ref().unwrap().path, "b.rs");
+        assert_eq!(app.parked.len(), 1, "the first is parked, not gone");
+        assert_eq!(app.buffers().count(), 2);
+        assert_eq!(app.dirty_buffers(), 1);
+
+        // Back to the first: the same buffer, still dirty.
+        assert!(app.switch_buffer("a.rs"));
+        assert_eq!(app.editor.as_ref().unwrap().path, "a.rs");
+        assert!(
+            app.editor.as_ref().unwrap().dirty,
+            "switching kept the buffer, so the unsaved edit is still there"
+        );
+
+        // Opening it again is a switch, never a re-read.
+        app.open_buffer(buf("a.rs"));
+        assert_eq!(app.buffers().count(), 2, "no third copy of a.rs");
+        assert!(app.editor.as_ref().unwrap().dirty);
+    }
+
+    /// `q` used to be one keypress from gone. One buffer guarded itself
+    /// with Esc-then-Esc, but `q` reaches past that, and with several
+    /// buffers open it could take unsaved work in files that were not even
+    /// on screen.
+    #[test]
+    fn quitting_with_unsaved_buffers_asks_first() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.open_buffer(buf("a.rs"));
+        app.open_buffer(buf("b.rs"));
+        // The unsaved one is parked, not the one on screen.
+        app.parked[0].dirty = true;
+
+        app.request_quit();
+        assert!(!app.should_quit, "it asked instead of quitting");
+        assert_eq!(app.dirty_buffers(), 1);
+
+        app.request_quit();
+        assert!(app.should_quit, "and a second q goes through");
+    }
+
+    /// The arming lasts for the next key and no longer. Anything else puts
+    /// the guard back, so a `q` typed a minute later still asks.
+    #[test]
+    fn the_quit_guard_rearms_after_any_other_key() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.open_buffer(buf("a.rs"));
+        app.editor.as_mut().unwrap().dirty = true;
+
+        app.request_quit();
+        assert!(!app.should_quit);
+
+        app.handle_key(key(KeyCode::Char('j')));
+        app.request_quit();
+        assert!(!app.should_quit, "the unrelated key disarmed it");
     }
 
     /// `gr` answered in the diff view and did nothing in the editor, so

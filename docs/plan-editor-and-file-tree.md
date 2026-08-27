@@ -575,9 +575,17 @@ Per D6. Land it before the buffer list.
 
 ### STEP 9 — `Vec<Editor>` plus an active index
 
-- Replace `App::editor: Option<Editor>` with `editors: Vec<Editor>` and
-  `active: usize`.
-- Add `editor()` and `editor_mut()` so the 40 call sites keep their shape.
+**Correction found while doing it:** do **not** replace
+`App::editor: Option<Editor>`. There are 81 sites in `app.rs`, not 40, and
+every one of them means "the buffer the reader is looking at" — which is
+exactly what the field already means. Keep it, and add
+`parked: Vec<Editor>` beside it for the buffers that are open but not on
+screen. Opening parks the current one; closing pops the last one forward.
+Same capability, and none of the 81 sites had to change.
+
+The invariant that makes it safe: `editor.is_none()` implies
+`parked.is_empty()`, so every existing "is a buffer open" guard stays
+correct as written.
 - Every "close the editor first" guard (`app.rs:5539`, `7230`, `7607`,
   `9363`, `9486`) must ask about **every** dirty buffer. So must quit.
 - Per D13, drop the highlight cache of a background buffer and rebuild it
