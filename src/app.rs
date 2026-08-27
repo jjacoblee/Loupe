@@ -4572,13 +4572,23 @@ impl App {
     /// to be the thing under review: a PR opened read-only is someone else's
     /// commit, and there is nothing of ours on disk to undo. An open editor
     /// owns the file until it is closed, so it hides the offer too.
-    pub fn can_revert(&self) -> bool {
+    /// Whether this review can put changes back at all.
+    ///
+    /// Separate from [`Self::can_revert`], which also asks whether the
+    /// change bar is on screen to click. The editor covers the diff, so
+    /// there is no bar to draw while it is open — but `u` and `U` and the
+    /// ☰ lines still mean something, and refusing them because a file was
+    /// open was a lockout with no reason behind it.
+    pub fn revert_possible(&self) -> bool {
         self.checked_out
             // A commit already happened. Nothing in its diff is a change
             // anybody can put back from here.
             && self.open_commit.is_none()
             && self.screen == Screen::Review
-            && self.editor.is_none()
+    }
+
+    pub fn can_revert(&self) -> bool {
+        self.revert_possible() && self.editor.is_none()
     }
 
     /// Columns the change bar takes off the left of the diff pane — zero
@@ -5317,11 +5327,26 @@ impl App {
             );
             return false;
         }
-        if self.editor.is_some() {
-            self.err("Close the editor first (Ctrl+S to save, Esc to close) before reverting.");
-            return false;
+        // A revert rewrites the file on disk. An open buffer holding
+        // unsaved edits to that very file would then be a stale copy,
+        // and saving it would quietly undo the revert — so that one case
+        // is refused. Every other buffer is none of this file's business,
+        // and refusing over one is how "close the editor first" came to
+        // block a revert of a file nobody had open.
+        let target = self.files.get(idx).map(|f| f.path.clone());
+        if let Some(path) = target {
+            if self
+                .editor
+                .as_ref()
+                .is_some_and(|e| e.dirty && e.path == path)
+            {
+                self.err(format!(
+                    "{path} has unsaved edits open — save it (Ctrl+S) or discard them (Esc twice) before reverting."
+                ));
+                return false;
+            }
         }
-        if !self.can_revert() {
+        if !self.revert_possible() {
             self.err(
                 "This review is read-only — reopen the PR with “Checkout & review” to change files.",
             );
@@ -10284,10 +10309,10 @@ impl App {
     }
 
     pub fn open_finder(&mut self, mode: FinderMode) {
-        if self.editor.is_some() {
-            self.err("Close the editor first (Ctrl+S saves, Esc closes).");
-            return;
-        }
+        // Opens over the editor. It used to refuse, which meant a reader
+        // in a buffer could not search the repository at all — and
+        // whatever they pick parks the buffer rather than closing it, so
+        // there was never anything to lose by opening it.
         let (symbols, symbol_path) = self.current_symbols();
         let finder = Finder::new(mode, self.changeset_paths(), symbols, symbol_path);
         self.overlay = Overlay::Finder(Box::new(finder));
@@ -13512,10 +13537,11 @@ impl App {
     /// the background (fresh commits on the PR, fresh edits locally), so
     /// there is never a loading screen on the way back.
     pub fn toggle_workspace(&mut self) {
-        if self.editor.is_some() {
-            self.err("Close the editor first (Ctrl+S saves, Esc closes) before swapping views.");
-            return;
-        }
+        // The buffer goes to the row rather than in the way. A file is a
+        // file whichever side of the swap opened it, and parking keeps
+        // its text, its cursor and the dot that says it is unsaved —
+        // there is nothing here to refuse over.
+        self.park_active();
         // Any in-flight silent refresh belonged to the side being left.
         self.quiet = None;
         self.pending_quiet = None;
@@ -13635,10 +13661,10 @@ impl App {
     /// second terminal) has been writing to the tree and the idle re-scan
     /// has not caught up yet.
     pub fn refresh_review(&mut self) {
-        if self.editor.is_some() {
-            self.err("Close the editor first (Ctrl+S saves, Esc closes) before refreshing.");
-            return;
-        }
+        // Refreshing re-reads the change and the diff behind the editor.
+        // The buffer keeps its own text either way, so there is nothing
+        // to close first — and a reader waiting on an agent's edits is
+        // exactly who needs this while a file is open.
         if self.quiet.is_some() {
             self.ok("Already refreshing…");
             return;
@@ -17683,15 +17709,23 @@ b2
         assert_eq!(app.diff_scroll, 3, "the reader keeps their place");
     }
 
-    /// The editor owns the screen: refreshing under it would throw away
-    /// unsaved edits, so it says no instead.
+    /// The editor does not own the window. Refreshing under it re-reads
+    /// the change and leaves the buffer's own text alone — and a reader
+    /// waiting on an agent's edits is exactly who needs this while a file
+    /// is open.
     #[test]
-    fn refresh_review_refuses_with_the_editor_open() {
+    fn refresh_review_works_with_the_editor_open() {
         let mut app = idle_local_app();
-        app.editor = Some(Editor::new("test.rs", PathBuf::from("test.rs"), "x\n"));
+        let mut ed = Editor::new("test.rs", PathBuf::from("test.rs"), "x\n");
+        ed.dirty = true;
+        app.editor = Some(ed);
         app.refresh_review();
-        assert!(!app.refreshing());
-        assert!(app.status_err, "{}", app.status);
+        assert!(app.refreshing(), "the re-scan ran: {}", app.status);
+        assert!(!app.status_err, "{}", app.status);
+        assert!(
+            app.editor.as_ref().is_some_and(|e| e.dirty),
+            "and the unsaved buffer is untouched"
+        );
     }
 
     /// The ☰ menu is built from the state it is opened in: no Comment line
@@ -18934,18 +18968,26 @@ more
         assert!(app.diff.is_some());
     }
 
-    /// The toggle refuses to fire with the editor open — unsaved edits
-    /// must not be silently stashed away.
+    /// The toggle used to refuse with the editor open. It parks the
+    /// buffer instead: a file is a file whichever side opened it, and
+    /// parking keeps its text, its place in the row and the dot that says
+    /// it is unsaved.
     #[test]
-    fn toggle_blocked_while_editing() {
+    fn swapping_parks_the_editor_rather_than_refusing() {
         let mut app = folded_app();
         app.local = true;
         app.stash = Some(Box::new(pr_workspace(7)));
-        app.editor = Some(Editor::new("test.rs", PathBuf::from("test.rs"), "x\n"));
+        let mut ed = Editor::new("test.rs", PathBuf::from("test.rs"), "x\n");
+        ed.dirty = true;
+        app.open_buffer(ed);
+
         app.toggle_workspace();
-        assert!(app.local, "still on the local side");
-        assert!(app.stash.is_some(), "stash untouched");
-        assert!(app.status_err, "{}", app.status);
+        assert!(!app.local, "the swap happened");
+        assert!(app.editor.is_none(), "the buffer is not in the way");
+        assert!(
+            app.buffers().any(|e| e.path == "test.rs" && e.dirty),
+            "and it is still open, still unsaved"
+        );
     }
 
     #[test]
@@ -19425,6 +19467,49 @@ more
         assert!(app.editor.is_none());
         assert_eq!(app.tab_labels(), ["a.rs", "b.rs"]);
         assert_eq!(app.diff_path(), Some("b.rs"), "the diff is back");
+    }
+
+    /// The finder used to refuse with the editor open, so a reader in a
+    /// buffer could not search the repository at all.
+    #[test]
+    fn the_finder_opens_over_the_editor() {
+        let mut app = folded_app();
+        app.local = true;
+        app.checked_out = true;
+        app.open_buffer(buf("test.rs"));
+        app.open_finder(FinderMode::Grep);
+        assert!(
+            matches!(&app.overlay, Overlay::Finder(f) if f.mode == FinderMode::Grep),
+            "the grep opened: {}",
+            app.status
+        );
+        assert!(app.editor.is_some(), "and the buffer is still open");
+    }
+
+    /// Reverting a file nobody has open is nobody's business but that
+    /// file's. It used to refuse whenever any buffer was open at all.
+    #[test]
+    fn reverting_only_stops_for_unsaved_edits_to_that_file() {
+        let mut app = folded_app();
+        app.local = true;
+        app.checked_out = true;
+        app.open_buffer(buf("elsewhere.rs"));
+        app.ask_revert_file(0);
+        assert!(
+            matches!(app.overlay, Overlay::Revert(_)),
+            "another file's buffer does not block it: {}",
+            app.status
+        );
+
+        // The file itself, with unsaved edits, is the one case that does.
+        app.overlay = Overlay::None;
+        let mut ed = buf("test.rs");
+        ed.dirty = true;
+        app.open_buffer(ed);
+        app.ask_revert_file(0);
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status_err);
+        assert!(app.status.contains("unsaved edits open"), "{}", app.status);
     }
 
     /// The key everyone reaches for. `/` still works; Ctrl+F is what a

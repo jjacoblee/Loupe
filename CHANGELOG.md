@@ -151,6 +151,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pull request, going back to the list, the grep, the symbol list, the
   Commits panel, staging and the stash menu all did nothing there — none
   of which is about the pane in front of you.
+- **Four commands refused while a file was open in the editor** — the
+  finder, the PR ⇄ local swap, the refresh, and reverting. Buffers park
+  rather than close, so none of them had anything to protect. Reverting
+  now stops only for unsaved edits to the very file being reverted, which
+  is the one case where it would quietly undo itself.
 - **The second click of a double click went nowhere.** A file loading
   froze the whole window, and a read takes tens of milliseconds against a
   four-hundred-millisecond double click, so every one of them landed
