@@ -1190,6 +1190,34 @@ fn is_symlink(path: &std::path::Path) -> bool {
 
 // ------------------------------------------------------------------ file list
 
+/// What a file row in the panel points at.
+///
+/// A row in the change under review carries an index into [`App::files`],
+/// and the diff, the stage mark, the viewed mark and the revert all key
+/// off it. A row that is only a file in the repository carries an index
+/// into [`App::repo_paths`] and has none of those — asking it for a
+/// `ChangedFile` gives `None`, which is the whole reason this is an enum
+/// rather than the bare index it used to be.
+///
+/// Both arms are indices rather than owned paths on purpose. Rows are
+/// emitted on every collapse toggle, so a `String` here would be one
+/// allocation per visible row per click. The lists already own the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowSrc {
+    Changed(usize),
+    // The file tree that lists the whole repository is the only thing
+    // that builds one of these, and it is not written yet. The tests do
+    // build one, so the attribute is scoped to the binary.
+    //
+    // `expect` rather than `allow`, so it cleans itself up: the day the
+    // tree lands, the expectation goes unfulfilled and the build says so.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "constructed once the file tree lands")
+    )]
+    Path(usize),
+}
+
 /// One row of the file panel (flat list or tree).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileEntry {
@@ -1201,14 +1229,15 @@ pub enum FileEntry {
         depth: u16,
     },
     File {
-        /// Index into `App::files`.
-        idx: usize,
+        src: RowSrc,
         depth: u16,
     },
     /// The heading above the conflicted files, which are listed first in
     /// both the flat and the tree view. A merge conflict blocks the
     /// commit, so it never sits inside a folder the reader has to open.
-    ConflictHeading { count: usize },
+    ConflictHeading {
+        count: usize,
+    },
 }
 
 /// The changeset's directory tree, built once per file list.
@@ -1306,7 +1335,10 @@ fn walk(
         }
     }
     for (_, idx) in &node.files {
-        out.push(FileEntry::File { idx: *idx, depth });
+        out.push(FileEntry::File {
+            src: RowSrc::Changed(*idx),
+            depth,
+        });
     }
 }
 
@@ -1736,6 +1768,10 @@ pub struct App {
     /// The directory tree behind `entries`, cached so a collapse toggle
     /// emits rows without rebuilding it. See [`TreeNodes`].
     tree: TreeNodes,
+    /// Every path in the repository, for rows the change does not touch.
+    /// [`RowSrc::Path`] indexes into it. Empty until the file tree fills
+    /// it.
+    pub repo_paths: Vec<String>,
     /// Width of the file panel in columns; dragged by the divider, seeded
     /// from the `file_panel_width` config key.
     pub file_panel_w: u16,
@@ -1972,6 +2008,7 @@ impl App {
             collapsed_dirs: HashSet::new(),
             entries: Vec::new(),
             tree: TreeNodes::default(),
+            repo_paths: Vec::new(),
             file_panel_w: FILE_PANEL_DEFAULT,
             dragging: Dragging::None,
             diff: None,
@@ -4464,6 +4501,37 @@ impl App {
 
     // ------------------------------------------------------- derived state
 
+    /// The `ChangedFile` behind a row, when the row has one.
+    ///
+    /// A row from the repository tree does not: it names a file the change
+    /// never touched, so there is no diff to open, nothing to stage, and
+    /// nothing to revert. Every caller has to answer for that case, which
+    /// is why this returns an `Option` rather than panicking on a bad
+    /// index the way `files[idx]` did.
+    pub fn changed_of(&self, src: RowSrc) -> Option<&ChangedFile> {
+        match src {
+            RowSrc::Changed(i) => self.files.get(i),
+            RowSrc::Path(_) => None,
+        }
+    }
+
+    /// The index into `files` behind a row, for the callers that need to
+    /// act on the changeset rather than read from it.
+    pub fn changed_idx(&self, src: RowSrc) -> Option<usize> {
+        match src {
+            RowSrc::Changed(i) if i < self.files.len() => Some(i),
+            _ => None,
+        }
+    }
+
+    /// The path a row names, whichever list it came from.
+    pub fn row_path(&self, src: RowSrc) -> Option<&str> {
+        match src {
+            RowSrc::Changed(i) => self.files.get(i).map(|f| f.path.as_str()),
+            RowSrc::Path(i) => self.repo_paths.get(i).map(String::as_str),
+        }
+    }
+
     /// The file list changed: rebuild the directory tree, then the rows.
     ///
     /// Every path that assigns `self.files` ends here. Use
@@ -4500,7 +4568,7 @@ impl App {
                 count: conflicts.len(),
             });
             out.extend(conflicts.iter().map(|idx| FileEntry::File {
-                idx: *idx,
+                src: RowSrc::Changed(*idx),
                 depth: 0,
             }));
         }
@@ -4513,7 +4581,10 @@ impl App {
                     .iter()
                     .enumerate()
                     .filter(|(_, f)| !f.conflicted)
-                    .map(|(idx, _)| FileEntry::File { idx, depth: 0 }),
+                    .map(|(idx, _)| FileEntry::File {
+                        src: RowSrc::Changed(idx),
+                        depth: 0,
+                    }),
             );
         }
         self.entries = out;
@@ -5964,7 +6035,14 @@ impl App {
                 }
                 self.rebuild_entries();
             }
-            FileEntry::File { idx, depth } => {
+            FileEntry::File { src, depth } => {
+                // A row the change does not touch has no diff, nothing to
+                // stage and nothing to put back, so none of the targets
+                // below mean anything. Opening one arrives with the file
+                // tree that produces it.
+                let Some(idx) = self.changed_idx(src) else {
+                    return;
+                };
                 // The icon plus its trailing space: a 4-column target.
                 let cb_start = fl.x + depth;
                 // ↺ at the far right of the row, where the counts end.
@@ -6020,8 +6098,8 @@ impl App {
         };
         let (path, is_dir) = match entry {
             FileEntry::Dir { path, .. } => (path.clone(), true),
-            FileEntry::File { idx, .. } => match self.files.get(*idx) {
-                Some(f) => (f.path.clone(), false),
+            FileEntry::File { src, .. } => match self.row_path(*src) {
+                Some(path) => (path.to_string(), false),
                 None => return,
             },
             // The heading names no path, so there is nothing to copy.
@@ -7219,7 +7297,9 @@ impl App {
         let Some(pos) = self
             .entries
             .iter()
-            .position(|e| matches!(e, FileEntry::File { idx, .. } if *idx == self.file_cursor))
+            .position(|e| {
+                matches!(e, FileEntry::File { src: RowSrc::Changed(i), .. } if *i == self.file_cursor)
+            })
         else {
             return;
         };
@@ -10329,13 +10409,24 @@ keep-four
             );
             assert_eq!(
                 app.entries[1],
-                FileEntry::File { idx: 0, depth: 0 },
+                FileEntry::File {
+                    src: RowSrc::Changed(0),
+                    depth: 0
+                },
                 "the conflict sits under the heading, tree_view = {tree}"
             );
             // …and it is not repeated further down.
             let repeats = app.entries[2..]
                 .iter()
-                .filter(|e| matches!(e, FileEntry::File { idx: 0, .. }))
+                .filter(|e| {
+                    matches!(
+                        e,
+                        FileEntry::File {
+                            src: RowSrc::Changed(0),
+                            ..
+                        }
+                    )
+                })
                 .count();
             assert_eq!(repeats, 0, "no second copy, tree_view = {tree}");
             // The other two files are still all there.
@@ -11673,14 +11764,23 @@ b2
                     path: "src/app".into(),
                     depth: 1
                 },
-                FileEntry::File { idx: 0, depth: 2 },
+                FileEntry::File {
+                    src: RowSrc::Changed(0),
+                    depth: 2
+                },
                 FileEntry::Dir {
                     label: "ui".into(),
                     path: "src/ui".into(),
                     depth: 1
                 },
-                FileEntry::File { idx: 1, depth: 2 },
-                FileEntry::File { idx: 2, depth: 0 },
+                FileEntry::File {
+                    src: RowSrc::Changed(1),
+                    depth: 2
+                },
+                FileEntry::File {
+                    src: RowSrc::Changed(2),
+                    depth: 0
+                },
             ]
         );
     }
@@ -11821,7 +11921,10 @@ b2
                     path: "a/b/c".into(),
                     depth: 0
                 },
-                FileEntry::File { idx: 0, depth: 1 },
+                FileEntry::File {
+                    src: RowSrc::Changed(0),
+                    depth: 1
+                },
             ]
         );
     }
@@ -12691,7 +12794,10 @@ b2
                     path: "src/app".into(),
                     depth: 0
                 },
-                FileEntry::File { idx: 1, depth: 0 },
+                FileEntry::File {
+                    src: RowSrc::Changed(1),
+                    depth: 0
+                },
             ]
         );
     }

@@ -453,8 +453,9 @@ Wide, but mechanical. Change nothing visible.
 
 - Replace `FileEntry::File { idx, depth }` with
   `FileEntry::File { src: RowSrc, depth }`, where
-  `RowSrc = Changed(u32) | Path(u32)`.
-- Add `App::changed_of(&self, src: &RowSrc) -> Option<&ChangedFile>`.
+  `RowSrc = Changed(usize) | Path(usize)`.
+- Add `App::changed_of(&self, src) -> Option<&ChangedFile>`,
+  `changed_idx`, and `row_path`.
 - `ui.rs:934` must stop indexing `app.files` directly.
 
 **Note on speed:** do **not** make `RowSrc::Path` hold a `String`. Rows
@@ -462,9 +463,16 @@ are emitted per toggle, so at 400,000 fully expanded rows that is 410,257
 allocations. Hold an index into the cached path list, which already owns
 the strings.
 
-**Files:** `app.rs` (32 `FileEntry` sites), `ui.rs` (4).
+**Two corrections found while doing it:**
+
+- `usize`, not `u32`. Measured, `FileEntry` is **56 bytes either way** —
+  the `Dir` variant's two `String`s set the size, so a narrower index buys
+  nothing and costs a cast at every site.
+- It is **7 sites, not 32**. The earlier count was every mention of
+  `FileEntry`; only 7 touch `FileEntry::File` outside the tests.
+
 **Done when:** every test passes and the panel is pixel-identical.
-**Size:** 1 day.
+**Size:** half a day.
 **Risk:** low, but wide. Do not mix another change into this commit.
 
 ### STEP 3 — Add the panel mode

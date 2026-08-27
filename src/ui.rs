@@ -930,9 +930,34 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(p.dir),
                 )));
             }
-            FileEntry::File { idx, depth } => {
-                let file = &app.files[*idx];
-                let selected = *idx == app.file_cursor;
+            FileEntry::File { src, depth } => {
+                let (file, idx) = match app.changed_of(*src) {
+                    Some(file) => (file, app.changed_idx(*src).unwrap_or(usize::MAX)),
+                    // A file the change never touched: a name, and none of
+                    // the marks. There is no diff behind it to stage, to
+                    // mark viewed, or to put back, so the columns that say
+                    // so would all be lying.
+                    None => {
+                        let Some(path) = app.row_path(*src) else {
+                            continue;
+                        };
+                        let name = if app.tree_view {
+                            path.rsplit('/').next().unwrap_or(path)
+                        } else {
+                            path
+                        };
+                        let indent = *depth as usize;
+                        let name_w = (inner.width as usize).saturating_sub(indent + 4);
+                        let text =
+                            format!("{}    {}", " ".repeat(indent), tail_truncate(name, name_w));
+                        lines.push(Line::from(Span::styled(
+                            truncate_pad(&text, inner.width as usize),
+                            Style::default().fg(p.dim),
+                        )));
+                        continue;
+                    }
+                };
+                let selected = idx == app.file_cursor;
                 let staged = app.stage_state(&file.path);
                 // Local review has no PR to mark files viewed on; the same
                 // column stages them instead.
@@ -4713,6 +4738,37 @@ mod tests {
 
     /// The file panel width follows `file_panel_w`, and the divider hit-area
     /// tracks it.
+    /// The file panel used to index `app.files` straight from the row, so
+    /// a row that named a file outside the change would have panicked. It
+    /// now asks, gets `None`, and draws a plain name with none of the
+    /// marks — no stage box, no status letter, no counts, because there is
+    /// no diff behind it for any of them to describe.
+    #[test]
+    fn a_row_outside_the_change_draws_without_marks() {
+        let mut app = wide_app();
+        app.repo_paths = vec!["src/untouched.rs".into()];
+        app.entries.push(crate::app::FileEntry::File {
+            src: crate::app::RowSrc::Path(0),
+            depth: 0,
+        });
+
+        let buf = render(&mut app);
+        let row = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .find(|r| r.contains("untouched.rs"))
+            .expect("the row outside the change is drawn");
+
+        let panel: String = row.chars().take(app.file_panel_w as usize).collect();
+        assert!(
+            !panel.contains('['),
+            "no stage or viewed box on a file the change never touched: {panel:?}"
+        );
+        assert!(
+            !panel.contains('+') && !panel.contains('−'),
+            "no line counts either: {panel:?}"
+        );
+    }
+
     #[test]
     fn file_panel_resizes() {
         let mut app = wide_app();
