@@ -613,8 +613,9 @@ If a drop does nothing at all in your terminal, `Ctrl+O` and paste the
 path does the same job.
 
 **They come back.** The tabs are written to `.git/loupe/pins.json` as they
-change, so quitting loupe does not cost you the row. They are per clone,
-never committed. A pin whose file has since been deleted drops out when
+change, so quitting loupe does not cost you the row. In a linked worktree
+that is the worktree's own `.git` directory, so each one keeps its own row
+— the branch you are on decides which tabs you see. Never committed. A pin whose file has since been deleted drops out when
 loupe reads the file back.
 
 ## Theme picker

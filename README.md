@@ -89,7 +89,7 @@ leaving your terminal or touching a browser.
 - **Pin the files you keep coming back to** — a row of tabs under the top
   bar. `=` pins whatever is in front of you, `1`–`9` open a tab, `,` and
   `.` step through them, and `-` unpins the one you are reading. The tabs
-  are per clone and survive quitting loupe, so the plan file you read
+  are per worktree and survive quitting loupe, so the plan file you read
   twenty times a day is one key away every morning.
 - **Drag a file onto loupe and read it** — drop a `.md` file anywhere on
   the window and loupe pins it and renders it, wherever it lives on the
