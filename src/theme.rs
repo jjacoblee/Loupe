@@ -7,7 +7,7 @@
 //! kept in step by resolving the appearance first and then picking the
 //! matching theme.
 //!
-//! The appearance is resolved once at startup, in this order:
+//! The appearance is resolved at startup, in this order:
 //!
 //! 1. `--light` / `--dark` on the command line
 //! 2. `appearance = "light" | "dark"` in the config file
@@ -18,6 +18,12 @@
 //!
 //! Steps 3 and 4 are why the defaults are usually right without any config:
 //! a light terminal gets light diff backgrounds on its own.
+//!
+//! Steps 3 and 4 also run again while loupe is open — every half minute,
+//! and only while the reader is idle — so a system that turns dark in the
+//! evening takes loupe with it rather than leaving it light until the next
+//! restart. Steps 1 and 2 turn that off: pinning an appearance means
+//! pinning it. See [`crate::app::App::wants_appearance_check`].
 
 use ratatui::style::Color;
 use std::sync::atomic::{AtomicU8, Ordering};

@@ -955,11 +955,51 @@ impl Finder {
 /// The picker also owns the light/dark switch (`a`), since the two choices
 /// belong together: the syntax theme and loupe's own colors have to agree
 /// or the diff ends up unreadable, which is the whole reason this exists.
+/// Which syntax theme goes with each appearance.
+///
+/// Kept on the app rather than only in `Startup`, because the appearance
+/// can change while loupe is running — a system that turns dark at seven
+/// takes the terminal with it — and the matching theme has to be
+/// reachable without going back to the config file.
+#[derive(Default, Clone, Copy)]
+pub struct Themes {
+    pub dark: Option<two_face::theme::EmbeddedThemeName>,
+    pub light: Option<two_face::theme::EmbeddedThemeName>,
+    /// `--theme`: overrides both, for this session only.
+    pub session: Option<two_face::theme::EmbeddedThemeName>,
+}
+
+impl Themes {
+    /// The theme to use on `appearance`.
+    ///
+    /// A slot that is set wins. An empty slot takes the counterpart of
+    /// the other one — so Gruvbox stays Gruvbox across the change rather
+    /// than falling back to a default nobody chose — and an empty pair
+    /// takes the default for that appearance.
+    pub fn for_appearance(&self, appearance: Appearance) -> two_face::theme::EmbeddedThemeName {
+        if let Some(theme) = self.session {
+            return theme;
+        }
+        let (own, other) = match appearance {
+            Appearance::Dark => (self.dark, self.light),
+            Appearance::Light => (self.light, self.dark),
+        };
+        own.unwrap_or_else(|| match other {
+            Some(theme) => highlight::for_appearance(theme, appearance),
+            None => highlight::default_theme(appearance),
+        })
+    }
+}
+
 pub struct ThemePicker {
     pub sel: usize,
     pub scroll: usize,
     prev: two_face::theme::EmbeddedThemeName,
     prev_appearance: Appearance,
+    /// What the picker will write for `appearance`: follow the terminal,
+    /// or pin one. It starts on whatever is already in force, so the row
+    /// answers "why is it stuck light?" without anybody going to look.
+    pub auto: bool,
     /// The row that was selected the last time each appearance was active,
     /// as `[dark, light]`. Without this, `a` twice would not come back:
     /// theme pairing is many-to-one (three Catppuccin flavors share Latte),
@@ -971,7 +1011,7 @@ pub struct ThemePicker {
 }
 
 impl ThemePicker {
-    fn new() -> Self {
+    fn new(auto: bool) -> Self {
         let current = highlight::current_theme();
         ThemePicker {
             sel: highlight::THEMES
@@ -981,6 +1021,7 @@ impl ThemePicker {
             scroll: 0,
             prev: current,
             prev_appearance: crate::theme::appearance(),
+            auto,
             remembered: [None, None],
             preview: highlight::highlight("sample.rs", crate::wizard::SAMPLE),
         }
@@ -1015,6 +1056,21 @@ impl ThemePicker {
     /// `appearance` in the config and disable detection everywhere else.
     fn appearance_changed(&self) -> bool {
         crate::theme::appearance() != self.prev_appearance
+    }
+
+    /// Pin the appearance the picker is showing, rather than following
+    /// the terminal.
+    fn pin_appearance(&mut self) {
+        self.auto = false;
+    }
+
+    /// Follow the terminal again, and move the preview to whatever it
+    /// says right now — the whole point is to see the answer.
+    fn follow_terminal(&mut self, found: Appearance) {
+        self.auto = true;
+        if crate::theme::appearance() != found {
+            self.toggle_appearance();
+        }
     }
 }
 
@@ -1076,6 +1132,8 @@ pub enum ButtonId {
     ThemeRow(usize),
     /// The ☀/🌙 light-dark switch in the theme picker.
     AppearanceToggle,
+    /// The Auto switch beside it: follow the terminal instead of pinning.
+    AppearanceAuto,
     /// The PR ⇄ local toggle in the review top bar (also the ` key).
     SwapView,
     /// 🔍 in the review top bar — opens the finder.
@@ -1272,6 +1330,17 @@ pub const SECTION_ACTION_W: u16 = 6;
 /// 16,761-file repository and nothing on screen goes wrong while it is
 /// out of date — a file added a minute ago simply is not listed yet.
 const REPO_LISTING_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// How often the terminal is asked what its background is now.
+///
+/// A reader whose system turns dark in the evening wants loupe to follow
+/// without being restarted. Half a minute is soon enough not to be
+/// noticed and rare enough to cost nothing.
+const APPEARANCE_POLL: Duration = Duration::from_secs(30);
+
+/// How long the reader has to have been idle before that question is
+/// asked. See [`App::wants_appearance_check`].
+const APPEARANCE_IDLE: Duration = Duration::from_secs(5);
 
 /// How old the commit list may get before coming back to the Commits
 /// panel re-reads it. A commit lands when somebody runs `git commit`,
@@ -1498,6 +1567,10 @@ impl StageSection {
 /// selection — or the tab is a bookmark rather than a place.
 pub struct DiffTab {
     pub path: String,
+    /// The [`App::theme_gen`] its highlights were computed under. A tab
+    /// parked before the terminal turned dark comes back in the old
+    /// theme's colours unless it is re-highlighted first.
+    theme_gen: u64,
     /// The commit it came out of, when it came from the Commits panel.
     open_commit: Option<OpenCommit>,
     conflict: Option<ConflictView>,
@@ -2504,6 +2577,22 @@ pub struct App {
     /// change. Opening another file parks this one here; coming back
     /// swaps them.
     pub parked: Vec<Editor>,
+    /// Follow the terminal's own background while loupe runs.
+    ///
+    /// True when nothing pinned the appearance — no `--light`/`--dark`,
+    /// no `appearance = "light" | "dark"` in the config. A system that
+    /// turns dark at seven takes the terminal with it, and the reader
+    /// should not have to restart loupe (or go and change a setting) to
+    /// follow.
+    pub appearance_auto: bool,
+    /// Which syntax theme goes with each appearance.
+    pub themes: Themes,
+    /// When the terminal was last asked about its background.
+    appearance_asked: Instant,
+    /// Bumped every time the appearance changes. A parked diff's
+    /// highlights were computed under the theme of its own generation, so
+    /// one that does not match is re-highlighted when it comes forward.
+    theme_gen: u64,
     /// Diffs the reader has open other than the one on screen.
     ///
     /// The same shape as [`Self::parked`], and for the same reason: the
@@ -2817,6 +2906,10 @@ impl App {
             editor: None,
             quit_armed: false,
             parked: Vec::new(),
+            appearance_auto: false,
+            themes: Themes::default(),
+            appearance_asked: Instant::now(),
+            theme_gen: 0,
             parked_diffs: Vec::new(),
             keep_tab: false,
             tab_order: Vec::new(),
@@ -5764,12 +5857,24 @@ impl App {
     // ------------------------------------------------------- theme picker
 
     pub fn open_theme_picker(&mut self) {
-        self.overlay = Overlay::ThemePicker(ThemePicker::new());
+        self.overlay = Overlay::ThemePicker(ThemePicker::new(self.appearance_auto));
         self.ok("Pick a theme — j/k or click to preview, Enter to keep it, Esc to cancel.");
     }
 
     /// Keep the selected theme: save it to the global config and re-highlight
     /// whatever is open so the whole UI reflects it.
+    /// Hand the appearance back to the terminal, and show what it says.
+    ///
+    /// This is the way out of a pinned appearance. Pinning one is a
+    /// button press; before this, un-pinning it meant knowing the config
+    /// file had an `appearance` key in it and going to delete it.
+    fn pick_auto_appearance(&mut self) {
+        let found = crate::theme::detect().unwrap_or_else(crate::theme::appearance);
+        if let Overlay::ThemePicker(tp) = &mut self.overlay {
+            tp.follow_terminal(found);
+        }
+    }
+
     fn apply_theme_pick(&mut self) {
         let Overlay::ThemePicker(tp) = &self.overlay else {
             return;
@@ -5779,8 +5884,17 @@ impl App {
         // The two appearances have their own theme slot, so saving a light
         // theme never clobbers the dark one (or the other way round).
         let mut pairs = vec![(crate::config::theme_key_for(appearance), name)];
-        let pinned = tp.appearance_changed();
-        if pinned {
+        // Auto is written out too, not just left off: the reader may be
+        // undoing a pin that is already in the file, and leaving the key
+        // alone would leave the pin in place.
+        let auto = tp.auto;
+        let pinned = !auto && tp.appearance_changed();
+        // The live check follows the setting, so choosing Auto starts the
+        // terminal being asked again without a restart.
+        self.appearance_auto = auto;
+        if auto {
+            pairs.push(("appearance", "auto"));
+        } else if pinned {
             pairs.push(("appearance", appearance.key()));
         }
         self.overlay = Overlay::None;
@@ -5789,7 +5903,9 @@ impl App {
         let reload = self.screen == Screen::Review && self.diff.is_some();
         match crate::config::save_global(&pairs) {
             Ok(path) => {
-                let note = if pinned {
+                let note = if auto {
+                    " (following the terminal)".to_string()
+                } else if pinned {
                     format!(" ({} colors pinned)", appearance.key())
                 } else {
                     String::new()
@@ -6848,7 +6964,14 @@ impl App {
                     KeyCode::PageDown => tp.select(tp.sel + 8),
                     KeyCode::Home => tp.select(0),
                     KeyCode::End => tp.select(usize::MAX),
-                    KeyCode::Char('a') => tp.toggle_appearance(),
+                    // `a` pins one appearance; `A` hands it back to the
+                    // terminal, which is the setting that follows a
+                    // system that turns dark in the evening.
+                    KeyCode::Char('a') => {
+                        tp.toggle_appearance();
+                        tp.pin_appearance();
+                    }
+                    KeyCode::Char('A') => self.pick_auto_appearance(),
                     KeyCode::Enter => self.apply_theme_pick(),
                     KeyCode::Esc | KeyCode::Char('q') => self.cancel_theme_pick(),
                     _ => {}
@@ -7563,9 +7686,11 @@ impl App {
                                 tp.select(i);
                             }
                         }
+                        Some(ButtonId::AppearanceAuto) => self.pick_auto_appearance(),
                         Some(ButtonId::AppearanceToggle) => {
                             if let Overlay::ThemePicker(tp) = &mut self.overlay {
                                 tp.toggle_appearance();
+                                tp.pin_appearance();
                             }
                         }
                         Some(ButtonId::ThemeApply) => self.apply_theme_pick(),
@@ -13152,6 +13277,81 @@ impl App {
         self.open_buffer_at(next);
     }
 
+    // ----------------------------------------------------- appearance
+
+    /// Whether now is a moment to ask the terminal what its background is.
+    ///
+    /// The query writes to the terminal and reads the reply straight off
+    /// the tty, so a key pressed inside that window would be eaten by it.
+    /// The window is a millisecond or two — this makes sure it is a
+    /// millisecond or two in which nobody was typing, nothing was
+    /// loading, and no overlay was open to type into.
+    pub fn wants_appearance_check(&self) -> bool {
+        self.appearance_auto
+            && self.job.is_none()
+            && self.editor.is_none()
+            && matches!(self.overlay, Overlay::None)
+            && self.last_input.elapsed() >= APPEARANCE_IDLE
+            && self.appearance_asked.elapsed() >= APPEARANCE_POLL
+    }
+
+    /// The terminal answered. Follow it if it has moved since last time.
+    ///
+    /// True when something changed and the window needs redrawing.
+    pub fn appearance_seen(&mut self, found: Option<Appearance>) -> bool {
+        self.appearance_asked = Instant::now();
+        let Some(found) = found else { return false };
+        if found == crate::theme::appearance() {
+            return false;
+        }
+        self.follow_appearance(found);
+        self.ok(format!(
+            "☀🌙 The terminal turned {} — {} to match.",
+            found.key(),
+            highlight::theme_key(highlight::current_theme())
+        ));
+        true
+    }
+
+    /// Move the whole window to `appearance`: the palette, the syntax
+    /// theme that goes with it, and everything already drawn under the
+    /// old one.
+    pub fn follow_appearance(&mut self, appearance: Appearance) {
+        crate::theme::set_appearance(appearance);
+        highlight::set_theme(self.themes.for_appearance(appearance));
+        self.theme_gen = self.theme_gen.wrapping_add(1);
+        // The preview caches its rendered lines with the colours they
+        // were built from.
+        if let Some(pv) = &mut self.preview {
+            pv.restyle();
+        }
+        // The diff on screen was highlighted under the old theme. Quietly,
+        // because nobody asked for this — the terminal did.
+        if self.diff.is_some() && self.open_commit.is_none() {
+            self.spawn_quiet_file(self.file_cursor, true);
+        }
+    }
+
+    /// Re-highlight a parked diff that was put aside under another theme.
+    ///
+    /// Done when it comes forward rather than when the theme changed:
+    /// re-highlighting every open tab at once would cost the length of a
+    /// read per tab, in the middle of an idle moment nobody asked
+    /// anything of.
+    fn restyle_if_stale(&mut self, tab: &mut DiffTab) {
+        if tab.theme_gen == self.theme_gen {
+            return;
+        }
+        tab.theme_gen = self.theme_gen;
+        let old_path = tab.path.clone();
+        if let Some(text) = tab.old_content.as_deref() {
+            tab.old_hl = highlight::highlight(&old_path, text);
+        }
+        if let Some(text) = tab.new_content.as_deref() {
+            tab.new_hl = highlight::highlight(&tab.path, text);
+        }
+    }
+
     // ------------------------------------------------------ diff tabs
 
     /// The path the diff pane is showing, when it is showing one.
@@ -13172,6 +13372,7 @@ impl App {
         };
         let tab = DiffTab {
             path: path.clone(),
+            theme_gen: self.theme_gen,
             open_commit: self.open_commit.take(),
             conflict: self.conflict.take(),
             diff: self.diff.take(),
@@ -13192,7 +13393,8 @@ impl App {
     }
 
     /// Put a parked diff back on screen, exactly as it was left.
-    fn restore_diff(&mut self, tab: DiffTab) {
+    fn restore_diff(&mut self, mut tab: DiffTab) {
+        self.restyle_if_stale(&mut tab);
         self.open_commit = tab.open_commit;
         self.conflict = tab.conflict;
         self.diff = tab.diff;
@@ -19582,6 +19784,155 @@ more
         assert!(matches!(app.overlay, Overlay::None));
         assert!(app.status_err);
         assert!(app.status.contains("unsaved edits open"), "{}", app.status);
+    }
+
+    // -------------------------------------- following the terminal
+
+    /// An app with nothing pinned, the way it starts when the config says
+    /// nothing about the appearance.
+    fn auto_app() -> App {
+        let mut app = folded_app();
+        app.appearance_auto = true;
+        app.last_input = Instant::now() - Duration::from_secs(60);
+        app.appearance_asked = Instant::now() - Duration::from_secs(60);
+        app
+    }
+
+    /// The terminal is only asked while nobody is using it. The query
+    /// reads the reply straight off the tty, so a key pressed inside that
+    /// window would be eaten by it.
+    #[test]
+    fn the_terminal_is_only_asked_when_nobody_is_typing() {
+        let mut app = auto_app();
+        assert!(app.wants_appearance_check(), "idle, nothing open");
+
+        app.last_input = Instant::now();
+        assert!(!app.wants_appearance_check(), "somebody just typed");
+
+        let mut app = auto_app();
+        app.overlay = Overlay::Help;
+        assert!(!app.wants_appearance_check(), "an overlay is open");
+
+        let mut app = auto_app();
+        app.open_buffer(buf("test.rs"));
+        assert!(!app.wants_appearance_check(), "a buffer is open to type in");
+
+        // And not on a timer faster than the poll interval.
+        let mut app = auto_app();
+        app.appearance_asked = Instant::now();
+        assert!(!app.wants_appearance_check());
+    }
+
+    /// Nothing is asked at all when the appearance is pinned — that is
+    /// what pinning means.
+    #[test]
+    fn a_pinned_appearance_is_never_asked_about() {
+        let mut app = auto_app();
+        app.appearance_auto = false;
+        assert!(!app.wants_appearance_check());
+    }
+
+    /// The whole point: the terminal turns dark and the window follows,
+    /// palette and syntax theme together, without a restart.
+    #[test]
+    fn the_window_follows_the_terminal() {
+        let _guard = crate::highlight::test_theme_lock();
+        let mut app = auto_app();
+        app.themes = Themes {
+            dark: crate::highlight::theme_by_name("catppuccin-mocha"),
+            light: crate::highlight::theme_by_name("catppuccin-latte"),
+            session: None,
+        };
+        crate::theme::set_appearance(Appearance::Light);
+        crate::highlight::set_theme(app.themes.for_appearance(Appearance::Light));
+
+        let moved = app.appearance_seen(Some(Appearance::Dark));
+        assert!(moved, "it followed");
+        assert_eq!(crate::theme::appearance(), Appearance::Dark);
+        assert_eq!(
+            crate::highlight::theme_key(crate::highlight::current_theme()),
+            "catppuccin-mocha",
+            "and took the dark theme with it"
+        );
+        assert!(app.status.contains("turned dark"), "{}", app.status);
+
+        // The same answer twice changes nothing, and says nothing.
+        app.status.clear();
+        assert!(!app.appearance_seen(Some(Appearance::Dark)));
+        assert!(app.status.is_empty());
+
+        // No answer is not an answer.
+        assert!(!app.appearance_seen(None));
+        assert_eq!(crate::theme::appearance(), Appearance::Dark);
+    }
+
+    /// A slot that is set wins; an empty one takes the counterpart of the
+    /// other, so Gruvbox stays Gruvbox across the change.
+    #[test]
+    fn each_appearance_gets_its_own_theme() {
+        let _guard = crate::highlight::test_theme_lock();
+        let both = Themes {
+            dark: crate::highlight::theme_by_name("catppuccin-mocha"),
+            light: crate::highlight::theme_by_name("catppuccin-latte"),
+            session: None,
+        };
+        let key = |t: two_face::theme::EmbeddedThemeName| crate::highlight::theme_key(t);
+        assert_eq!(
+            key(both.for_appearance(Appearance::Dark)),
+            "catppuccin-mocha"
+        );
+        assert_eq!(
+            key(both.for_appearance(Appearance::Light)),
+            "catppuccin-latte"
+        );
+
+        // Only one set: the other appearance takes its counterpart.
+        let one = Themes {
+            dark: crate::highlight::theme_by_name("gruvbox-dark"),
+            light: None,
+            session: None,
+        };
+        assert!(
+            key(one.for_appearance(Appearance::Light)).starts_with("gruvbox"),
+            "got {}",
+            key(one.for_appearance(Appearance::Light))
+        );
+
+        // `--theme` overrides both, for this session.
+        let session = Themes {
+            dark: crate::highlight::theme_by_name("catppuccin-mocha"),
+            light: crate::highlight::theme_by_name("catppuccin-latte"),
+            session: crate::highlight::theme_by_name("nord"),
+        };
+        assert_eq!(key(session.for_appearance(Appearance::Light)), "nord");
+        assert_eq!(key(session.for_appearance(Appearance::Dark)), "nord");
+    }
+
+    /// The way out of a pinned appearance, which before this meant
+    /// knowing the config file had an `appearance` key and deleting it.
+    #[test]
+    fn the_picker_can_hand_the_appearance_back_to_the_terminal() {
+        let _guard = crate::highlight::test_theme_lock();
+        let mut app = folded_app();
+        app.appearance_auto = false;
+        app.open_theme_picker();
+        let Overlay::ThemePicker(tp) = &app.overlay else {
+            panic!("the picker is open");
+        };
+        assert!(!tp.auto, "it starts on what is actually in force");
+
+        app.handle_key(key(KeyCode::Char('A')));
+        let Overlay::ThemePicker(tp) = &app.overlay else {
+            panic!("still open");
+        };
+        assert!(tp.auto, "A hands it back to the terminal");
+
+        // And `a` takes it again.
+        app.handle_key(key(KeyCode::Char('a')));
+        let Overlay::ThemePicker(tp) = &app.overlay else {
+            panic!("still open");
+        };
+        assert!(!tp.auto, "a pins the one on screen");
     }
 
     // ------------------------------------------ the path behind a tab

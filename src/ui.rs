@@ -3484,6 +3484,10 @@ fn draw_theme_picker(f: &mut Frame, app: &mut App, area: Rect) {
         width: inner.width,
         height: 1,
     };
+    // Which appearance this will write, and how. Auto is drawn lit when
+    // it is the one in force, so "why is it stuck light?" is answered on
+    // screen rather than in the config file.
+    let auto = matches!(&app.overlay, Overlay::ThemePicker(tp) if tp.auto);
     let flip = if crate::theme::appearance().is_light() {
         "🌙 Dark (a)"
     } else {
@@ -3495,7 +3499,8 @@ fn draw_theme_picker(f: &mut Frame, app: &mut App, area: Rect) {
         btn_area,
         0,
         &[
-            (flip, ButtonId::AppearanceToggle, false),
+            ("Auto (A)", ButtonId::AppearanceAuto, auto),
+            (flip, ButtonId::AppearanceToggle, !auto),
             (&format!("Use {name} (Enter)"), ButtonId::ThemeApply, true),
             ("Cancel (Esc)", ButtonId::ThemeCancel, false),
         ],

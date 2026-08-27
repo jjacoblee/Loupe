@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Loupe follows the terminal from light to dark and back, while it
+  runs.** The background was asked about once at startup; it is asked
+  again every half minute while you are idle, so a system that turns dark
+  at seven takes Loupe with it — palette and syntax theme together —
+  without a restart.
+- **`Auto` in the theme picker.** The ☀/🌙 button pins an appearance and
+  turns detection off for good; there was no way back from that except
+  knowing the config file had an `appearance` key in it and deleting it.
+  The row now says which of the three is in force, and `A` hands it back
+  to the terminal.
+
 - **The words that changed are painted darker than the line.** A modified
   line keeps its red or green; the characters the two versions do not
   share take a stronger shade of the same colour. A line painted whole

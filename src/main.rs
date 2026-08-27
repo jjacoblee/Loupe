@@ -560,17 +560,12 @@ impl Startup {
     /// other one get adapted — Gruvbox Dark becomes Gruvbox Light rather
     /// than something unrelated.
     fn theme(&self, appearance: Appearance) -> two_face::theme::EmbeddedThemeName {
-        if let Some(theme) = self.session_theme {
-            return theme;
+        app::Themes {
+            dark: self.dark_theme,
+            light: self.light_theme,
+            session: self.session_theme,
         }
-        let (own, other) = match appearance {
-            Appearance::Dark => (self.dark_theme, self.light_theme),
-            Appearance::Light => (self.light_theme, self.dark_theme),
-        };
-        own.unwrap_or_else(|| match other {
-            Some(theme) => highlight::for_appearance(theme, appearance),
-            None => highlight::default_theme(appearance),
-        })
+        .for_appearance(appearance)
     }
 
     /// Light or dark, in precedence order: an explicit setting, then the
@@ -786,6 +781,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal, startup: Startup) -> Result<()> 
     if let Some(w) = startup.blame_width {
         app.blame_w = w.max(app::BLAME_MIN);
     }
+    // Nothing pinned the appearance, so the terminal is the authority on
+    // it — then and later. See `App::wants_appearance_check`.
+    app.appearance_auto = startup.appearance.is_none() && startup.session_theme.is_none();
+    app.themes = app::Themes {
+        dark: startup.dark_theme,
+        light: startup.light_theme,
+        session: startup.session_theme,
+    };
     match &startup.md {
         Some(path) => app.start_preview_only(path),
         None => app.start(),
@@ -867,6 +870,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal, startup: Startup) -> Result<()> 
             }
             app.handle_events(batch);
             dirty = true;
+        } else if app.wants_appearance_check() {
+            // Nothing is pending — `poll` just said so — which is the
+            // same window the startup query runs in: the tty queue is
+            // empty, so the reply cannot be mistaken for a keystroke and
+            // no keystroke is waiting to be eaten by the read. The app
+            // only asks for this after the reader has been idle a while
+            // (see `App::wants_appearance_check`).
+            dirty |= app.appearance_seen(theme::detect());
         }
     }
 }

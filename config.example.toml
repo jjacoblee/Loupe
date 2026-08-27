@@ -20,10 +20,17 @@
 #mode = "auto"
 
 # Light or dark colors. On "auto" (the default) loupe asks the terminal
-# for its background color at startup and tunes the diff greens and reds,
-# the gutters, and the chrome to match. Set this to skip detection, or
-# pass --light / --dark for one session. `loupe appearance` reports what
-# your terminal actually said.
+# for its background color and tunes the diff greens and reds, the
+# gutters, and the chrome to match — at startup, and again every half
+# minute while you are idle. A system that turns dark in the evening
+# therefore takes loupe with it, without a restart, and picks up the
+# matching syntax theme below on the way.
+#
+# Setting this to "light" or "dark" pins it and turns detection off for
+# good. The theme picker's `Auto` button (press `t`, then `A`) is the way
+# back if you ever pin one by accident. `loupe appearance` reports what
+# your terminal actually said, and --light / --dark pin it for one
+# session.
 #appearance = "auto"
 
 # Syntax-highlighting themes, one per appearance — a theme is only

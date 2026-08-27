@@ -99,9 +99,29 @@ behind it as a sentinel, so a terminal that doesn't implement OSC 11
 costs a millisecond rather than a timeout, and the worst case — a
 terminal that answers nothing at all — is 120 ms, once, at startup.
 
-Set `light` or `dark` to skip detection entirely. `--light` / `--dark`
-do the same for one session, and pressing `a` in the theme picker flips
-it live and saves it.
+**It keeps asking.** The terminal is asked again every half minute while
+you are idle — no key pressed for five seconds, nothing loading, no
+editor or overlay open. A system that turns dark at seven in the evening
+therefore takes Loupe with it, without a restart, and picks up the
+matching `light_theme` / `theme` on the way. The question is only asked
+in a moment when nothing is pending, because the reply is read straight
+off the terminal and a keystroke in that window would be eaten by it.
+
+Set `light` or `dark` to skip detection entirely — **and note that this
+turns off the following as well.** `--light` / `--dark` do the same for
+one session.
+
+In the theme picker (`t`) the button row says which one is in force:
+
+| Button | Key | What it writes |
+| --- | --- | --- |
+| `Auto` | `A` | `appearance = "auto"` — follow the terminal |
+| `☀ Light` / `🌙 Dark` | `a` | Pins that one, and stops the following |
+
+If Loupe seems stuck on one appearance, that is what to look at: press
+`t`, then `A`, then `Enter`. Pinning is one button press, and before
+`Auto` existed, undoing it meant knowing the config file had an
+`appearance` key in it and going to delete it.
 
 To see what your terminal reports:
 
