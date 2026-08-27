@@ -3917,12 +3917,12 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(Span::styled("Find", head)),
         row(
-            ("/", "search this file, as you type"),
+            ("Ctrl+F  or  /", "find in this file, as you type"),
             ("n / N", "next / previous match"),
         ),
         row(
+            ("Ctrl+Shift+F  or  #", "find in every file (grep)"),
             ("Ctrl+P", "go to file (fuzzy)"),
-            ("#", "find in files (grep)"),
         ),
         row(
             ("@", "definitions in this file"),
@@ -4099,10 +4099,20 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     // The `/` prompt lives in the status line, vim-style: it is a mode,
-    // not a dialog, so it must not cover the text being searched.
-    if app.find.typing {
-        let n = app.find.rows.len();
-        let count = if app.find.query.is_empty() {
+    // not a dialog, so it must not cover the text being searched. The
+    // preview has its own search over its own rows, and one prompt draws
+    // for both.
+    let pv_find = app
+        .preview
+        .as_ref()
+        .filter(|pv| pv.find.typing)
+        .map(|pv| (pv.find.query.clone(), pv.find.rows.len()));
+    if app.find.typing || pv_find.is_some() {
+        let (query, n) = match &pv_find {
+            Some((q, n)) => (q.clone(), *n),
+            None => (app.find.query.clone(), app.find.rows.len()),
+        };
+        let count = if query.is_empty() {
             String::new()
         } else if n == 0 {
             "  no matches".to_string()
@@ -4111,7 +4121,7 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let line = Line::from(vec![
             Span::styled(
-                format!("/{}", app.find.query),
+                format!("/{query}"),
                 Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -4120,7 +4130,7 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             Span::styled(
                 count,
-                Style::default().fg(if n == 0 && !app.find.query.is_empty() {
+                Style::default().fg(if n == 0 && !query.is_empty() {
                     p.err
                 } else {
                     p.faint
@@ -4233,10 +4243,14 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
         Screen::PrList => "l local changes · r refresh · m menu · q quit".into(),
         Screen::Review => {
             if app.previewing() {
-                if app.preview_only {
-                    "j/k scroll · } { sections · P source · r reload · q quit".into()
+                // Mid-search the row says how to walk the matches: it is
+                // the one thing the reader is doing.
+                if app.preview.as_ref().is_some_and(|pv| pv.find.active()) {
+                    "n/N matches · Ctrl+F search · Esc clears them".into()
+                } else if app.preview_only {
+                    "j/k scroll · } { sections · Ctrl+F find · P source · q quit".into()
                 } else {
-                    "j/k scroll · } { sections · P source · e edit · Esc diff".into()
+                    "j/k scroll · Ctrl+F find · P source · e edit · Esc diff".into()
                 }
             } else if app.editor.is_some() {
                 if markdown_buffer(app) {
@@ -4245,7 +4259,7 @@ fn draw_status(f: &mut Frame, app: &mut App, area: Rect) {
                     "Ctrl+S save · Esc close · ? help".into()
                 }
             } else if app.find.active() {
-                format!("n/N matches · / search · y copy{undo} · ? help")
+                format!("n/N matches · Ctrl+F search · y copy{undo} · ? help")
             } else if app.review.focused {
                 "Ctrl+S submit · Tab changes the verdict · Esc leaves the box".into()
             } else if !app.pending.is_empty() {
@@ -5084,6 +5098,173 @@ mod tests {
         assert!(screen.contains("☐ todo"), "and unticked ones: {screen}");
         assert!(screen.contains("PLAN.md"), "the file panel is still there");
         assert!(screen.contains("P source"), "the way back is offered");
+    }
+
+    /// Find in the preview: the prompt draws in the status line, the
+    /// matches count, and the matched characters actually take the
+    /// search background in the rendered document.
+    #[test]
+    fn the_preview_highlights_what_it_finds() {
+        let _guard = highlight::test_theme_lock();
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.preview = Some(crate::preview::Preview::new(
+            "PLAN.md",
+            "/repo/PLAN.md".into(),
+            "# The parser
+
+Rewrite the parser so it stops guessing.
+
+## Index
+
+Build it once.
+",
+        ));
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        // One draw first: the rows a search walks only exist once the
+        // pane knows how wide it is.
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        app.start_preview_find();
+        for c in "parser".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+
+        let status = row_text(buf, buf.area.height - 1);
+        assert!(status.contains("/parser"), "the prompt shows: {status:?}");
+        assert!(
+            status.contains("2 matches"),
+            "and counts them — the heading and the sentence: {status:?}"
+        );
+
+        // The highlight is a background, so it is asserted as one.
+        let hit = crate::theme::palette().matched;
+        let lit: usize = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buf[(*x, *y)].style().bg == Some(hit))
+            .count();
+        assert_eq!(
+            lit,
+            "parser".len() * 2,
+            "every character of both matches is lit, and nothing else"
+        );
+    }
+
+    /// n and N walk the matches; Esc puts the highlight away and leaves
+    /// the reader where they are.
+    #[test]
+    fn the_preview_walks_and_clears_its_matches() {
+        let _guard = highlight::test_theme_lock();
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        // Long enough that walking to a later match has to scroll.
+        // Each line is its own paragraph: consecutive lines are one
+        // paragraph in markdown, and would re-wrap into a few rows.
+        let body: String = (1..=60)
+            .map(|i| {
+                if i % 20 == 0 {
+                    format!(
+                        "line {i} needle
+
+"
+                    )
+                } else {
+                    format!(
+                        "line {i}
+
+"
+                    )
+                }
+            })
+            .collect();
+        app.preview = Some(crate::preview::Preview::new(
+            "PLAN.md",
+            "/repo/PLAN.md".into(),
+            &body,
+        ));
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        app.start_preview_find();
+        for c in "needle".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let pv = app.preview.as_ref().unwrap();
+        assert_eq!(pv.find.rows.len(), 3, "three lines carry it");
+        assert!(
+            !pv.find.typing,
+            "Enter closed the prompt and kept the query"
+        );
+        let first = pv.scroll;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        let pv = app.preview.as_ref().unwrap();
+        assert_eq!(pv.find.at, 1);
+        assert!(pv.scroll > first, "the next match is further down");
+
+        // Wrapping: from the last match, n comes back to the first.
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(app.preview.as_ref().unwrap().find.at, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let pv = app.preview.as_ref().unwrap();
+        assert!(!pv.find.active(), "Esc cleared the search");
+        assert!(app.preview.is_some(), "and did not close the document");
+    }
+
+    /// Esc while typing puts the reader back where they were reading —
+    /// the incremental jumping around is undone, not kept.
+    #[test]
+    fn cancelling_the_preview_search_puts_the_reader_back() {
+        let _guard = highlight::test_theme_lock();
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new(crate::app::LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        let body: String = (1..=60)
+            .map(|i| {
+                if i == 50 {
+                    "line 50 needle
+
+"
+                    .to_string()
+                } else {
+                    format!(
+                        "line {i}
+
+"
+                    )
+                }
+            })
+            .collect();
+        app.preview = Some(crate::preview::Preview::new(
+            "PLAN.md",
+            "/repo/PLAN.md".into(),
+            &body,
+        ));
+        let mut term = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        app.start_preview_find();
+        for c in "needle".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(
+            app.preview.as_ref().unwrap().scroll > 0,
+            "typing walked the document to the match"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let pv = app.preview.as_ref().unwrap();
+        assert_eq!(pv.scroll, 0, "and Esc walked it back");
+        assert!(!pv.find.active());
     }
 
     /// End-to-end guard for "editor colors in the diff": highlight a Rust
@@ -5928,7 +6109,7 @@ mod tests {
 
         assert!(all.contains("VIEW"), "headings are drawn: {all:?}");
         assert!(all.contains("ACTIONS"), "headings are drawn: {all:?}");
-        assert!(all.contains("Search the repository"));
+        assert!(all.contains("Find in every file"));
         // The switches say what they are set to.
         assert!(all.contains("Fold unchanged lines"), "{all:?}");
         assert!(all.contains("●"), "a switch shows its state: {all:?}");

@@ -512,16 +512,46 @@ while it waits.
 
 ## Find
 
+### Find in this file
+
+**`Ctrl+F`** searches whatever you are reading, wherever you are reading
+it. It is the same search in all three panes, and `/` opens it too:
+
+| Where | What it searches |
+| --- | --- |
+| The diff | Both sides of the open file, as you type |
+| The markdown preview | The rendered document — what is on the page, not the `##` and `[]` behind it |
+| The editor | The buffer, with a replacement field behind `Tab` |
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+F`, or `/` | Open the search |
+| `n` / `N`, or `F3` / `Shift+F3` | Next / previous match (wraps, and says when it wrapped) |
+| `Esc` (while typing) | Cancel, putting you back where you were reading |
+| `Esc` (after) | Clear the highlight, leaving you where you are |
+
+`Cmd+F` does the same where your terminal forwards it. Most do not:
+Terminal.app and iTerm2 both keep `Cmd+F` for their own find bar and it
+never reaches Loupe. `Ctrl+F` always arrives.
+
+> `Ctrl+F` used to page forward, vim-style. `PageDown` and `Ctrl+D` still
+> do, and in the preview so does `Space`.
+
+### Find in every file
+
+**`Ctrl+Shift+F`**, or `#`, runs one `git grep` across the repository with
+definitions sorted first. Some terminals cannot tell `Ctrl+Shift+F` from
+`Ctrl+F` and send the same thing for both; `#` always works.
+
+### The finder
+
 One overlay answers three questions; a prefix character in the input
 picks which. Open it with `Ctrl+P` or the `🔍 Find` button.
 
 | Key / mouse | Action |
 | --- | --- |
-| `/` | Search the open diff, incrementally — matches highlight as you type |
-| `n` / `N`, or `F3` / `Shift+F3` | Next / previous match (wraps, and says when it wrapped) |
-| `Esc` | Cancel the search (restoring your place), then clear the highlight |
 | `Ctrl+P` or `🔍 Find` | Fuzzy-match a file by path |
-| `#` | Find text in files — one `git grep`, definitions sorted first |
+| `#` or `Ctrl+Shift+F` | Find text in files — one `git grep`, definitions sorted first |
 | `@` | Definitions in the open file |
 | `Tab` (in the finder) | Widen from the changed files to the whole repository |
 | `Ctrl+R` (in the finder) | Treat the query as a regular expression |
@@ -589,7 +619,7 @@ Set `language_servers = false` in your config to switch all of this off.
 | `Ctrl+X` / `Ctrl+Y` | Cut / paste, through the editor's own buffer |
 | `Ctrl+Z` or `Ctrl+U` | Undo (`Ctrl+U` is tui-textarea's own binding; `Ctrl+Z` is an alias) |
 | `Ctrl+R` | Redo |
-| `Alt+F` | Find and replace in this file |
+| `Ctrl+F`, or `Alt+F` | Find and replace in this file |
 | `Alt+C` | Comment or uncomment the line, or the selection |
 | `Alt+P` | Preview the buffer as markdown, saved or not (`.md` files) |
 | `PgUp` / `PgDn`, or `Ctrl+V` / `Alt+V` | Page through the file |
@@ -655,8 +685,9 @@ switches to it rather than reading the file over the top of your edits.
 
 ### Find and replace
 
-`Alt+F` puts the prompt in the editor's border, where the file name goes,
-so nothing on screen moves while you search.
+`Ctrl+F` — or `Alt+F`, which is the modifier the rest of the editor's
+own commands use — puts the prompt in the editor's border, where the file
+name goes, so nothing on screen moves while you search.
 
 | Key | Action |
 | --- | --- |
@@ -894,15 +925,24 @@ Loupe for another app.
 | --- | --- |
 | `P` | Preview the markdown file, and from the preview open its source |
 | `Alt+P` | The same, from inside the editor (plain `P` is text in there) |
+| `Ctrl+F`, or `/` | Find in the document |
+| `n` / `N` | Next / previous match |
 | `j` / `k`, `↑` / `↓`, wheel | Scroll |
-| `Ctrl+D` / `Ctrl+U`, `Ctrl+F` / `Ctrl+B`, `PgUp` / `PgDn` | Half page / full page |
+| `Ctrl+D` / `Ctrl+U`, `Space` / `Ctrl+B`, `PgUp` / `PgDn` | Half page / full page |
 | `gg` / `G`, `Home` / `End` | First / last row |
 | `}` / `{`, `Tab` / `Shift+Tab` | Next / previous heading |
 | `e` or `i` | Open the source in the editor |
 | `r` | Re-read the file now |
 | `]` / `[` | Next / previous file |
-| `Esc` | Back to the diff |
+| `Esc` | Clear the search, then back to the diff |
 | Click the file panel | Switch files, the way the diff does |
+
+**Search reads the document, not the markdown.** A heading's `##` and a
+link's brackets are not on the page, so they are not in what you search
+either — you look for what you can see. Matches light up in place and
+keep their own colors around them, so a hit inside a heading still reads
+as a heading. `Esc` while typing puts you back where you were reading;
+`Esc` after keeps your place and clears the highlight.
 
 **The preview and the source are two views of one file.** `P` moves
 between them and both keep their place: from the preview you land in the

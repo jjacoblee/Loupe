@@ -1215,6 +1215,29 @@ impl HitAreas {
     }
 }
 
+/// Whether this key means "find in what I am reading".
+///
+/// `Ctrl+F` is the one that always arrives. `Cmd+F` is what a mac reader
+/// reaches for, so it is accepted too — but most terminals keep Cmd+F for
+/// their own find bar and never forward it, and none report it at all
+/// without the kitty keyboard protocol. It costs one line to honour the
+/// ones that do.
+pub fn is_find_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F'))
+        && (key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER))
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// The same key with shift: find across every file, rather than in this
+/// one. It is the other half of the pair every editor has.
+pub fn is_find_all_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('F') | KeyCode::Char('f'))
+        && (key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER))
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
 pub fn contains(r: Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
@@ -6794,6 +6817,12 @@ impl App {
         if self.preview.is_some() {
             let page = self.preview.as_ref().map(|p| p.page()).unwrap_or(10);
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            // The prompt is a mode: while it is open every key is part of
+            // the query, so it is asked first and nothing below it runs.
+            if self.preview.as_ref().is_some_and(|pv| pv.find.typing) {
+                self.preview_find_key(key);
+                return;
+            }
             if self.pending_g {
                 self.pending_g = false;
                 if let (KeyCode::Char('g'), Some(pv)) = (key.code, &mut self.preview) {
@@ -6801,7 +6830,25 @@ impl App {
                     return;
                 }
             }
+            let searching = self.preview_find_active();
             match key.code {
+                // Find in this file, on the two keys the rest of loupe
+                // puts it on. Ctrl+F was vim's forward-page here;
+                // PageDown, Space and Ctrl+D all still are.
+                _ if is_find_key(key) => self.start_preview_find(),
+                _ if is_find_all_key(key) => self.open_finder(FinderMode::Grep),
+                KeyCode::Char('/') => self.start_preview_find(),
+                KeyCode::Char('n') if searching => self.step_preview_match(true),
+                KeyCode::Char('N') if searching => self.step_preview_match(false),
+                // Esc clears the search before it closes the pane: the
+                // first one puts the highlight away, the second puts the
+                // document away.
+                KeyCode::Esc if searching => {
+                    if let Some(pv) = &mut self.preview {
+                        pv.clear_find();
+                    }
+                    self.ok("Search cleared.");
+                }
                 KeyCode::Char('P') | KeyCode::Char('e') | KeyCode::Char('i') => {
                     self.toggle_preview();
                 }
@@ -6825,7 +6872,6 @@ impl App {
                         KeyCode::Up | KeyCode::Char('k') => pv.scroll_rows(-1),
                         KeyCode::Char('d') if ctrl => pv.scroll_rows(page / 2),
                         KeyCode::Char('u') if ctrl => pv.scroll_rows(-page / 2),
-                        KeyCode::Char('f') if ctrl => pv.scroll_rows(page),
                         KeyCode::Char('b') if ctrl => pv.scroll_rows(-page),
                         KeyCode::PageDown | KeyCode::Char(' ') => pv.scroll_rows(page),
                         KeyCode::PageUp => pv.scroll_rows(-page),
@@ -6990,12 +7036,19 @@ impl App {
                 | (KeyCode::Char('S'), KeyModifiers::ALT) => {
                     self.spawn_editor_request(EditorRequest::SignatureHelp);
                 }
-                // Find and replace inside the buffer.
+                // Find and replace inside the buffer. Ctrl+F is the key
+                // every other editor puts it on; Alt+F stays because it
+                // is the one the rest of loupe's editor commands use.
                 (KeyCode::Char('f'), KeyModifiers::ALT)
                 | (KeyCode::Char('F'), KeyModifiers::ALT) => {
                     editor.open_find();
                     self.ok("Find in this file — Tab adds a replacement, Esc cancels.");
                 }
+                _ if is_find_key(key) => {
+                    editor.open_find();
+                    self.ok("Find in this file — Tab adds a replacement, Esc cancels.");
+                }
+                _ if is_find_all_key(key) => self.open_finder(FinderMode::Grep),
                 (KeyCode::Char('n'), KeyModifiers::ALT)
                 | (KeyCode::Char('N'), KeyModifiers::ALT) => editor.step_match(1),
                 (KeyCode::Char('b'), KeyModifiers::ALT)
@@ -7143,7 +7196,6 @@ impl App {
                     KeyCode::Down | KeyCode::Char('j') => self.cursor_by(1),
                     KeyCode::Char('d') if ctrl => self.cursor_by(page / 2),
                     KeyCode::Char('u') if ctrl => self.cursor_by(-page / 2),
-                    KeyCode::Char('f') if ctrl => self.cursor_by(page),
                     KeyCode::Char('b') if ctrl => self.cursor_by(-page),
                     KeyCode::PageDown => self.cursor_by(page),
                     KeyCode::PageUp => self.cursor_by(-page),
@@ -7164,7 +7216,13 @@ impl App {
                     KeyCode::Char('}') => self.jump_hunk(true),
                     KeyCode::Char('{') => self.jump_hunk(false),
                     // --- search
+                    //
+                    // Ctrl+F is what everyone else's find is on, so it is
+                    // what loupe's is on. vim's forward-page keeps
+                    // PageDown and Ctrl+D; the search had only `/`.
                     KeyCode::Char('/') => self.start_find(),
+                    _ if is_find_key(key) => self.start_find(),
+                    _ if is_find_all_key(key) => self.open_finder(FinderMode::Grep),
                     // vim's "what is this?" key.
                     KeyCode::Char('K') => self.lsp_action(LspAction::Hover),
                     // The same function keys the editor uses, so one set
@@ -8559,8 +8617,8 @@ impl App {
             rows.push(item("💾 Save".into(), "Ctrl+S", ButtonId::EditorSave));
             rows.push(item("⇥  Format".into(), "Ctrl+T", ButtonId::EditorFormat));
             rows.push(item(
-                "🔍 Find and replace".into(),
-                "Alt+F",
+                "🔍 Find and replace in this file".into(),
+                "Ctrl+F",
                 ButtonId::EditorFind,
             ));
             if !read_only {
@@ -8718,18 +8776,22 @@ impl App {
         ));
 
         rows.push(MenuRow::Heading("FIND"));
-        rows.push(item("Go to a file".into(), "Ctrl+P", ButtonId::Find));
         rows.push(item(
-            "Search the repository".into(),
-            "#",
+            "🔍 Find in this file".into(),
+            "Ctrl+F",
+            ButtonId::FindInDiff,
+        ));
+        rows.push(item(
+            "🔍 Find in every file".into(),
+            "Ctrl+Shift+F",
             ButtonId::FindGrep,
         ));
+        rows.push(item("Go to a file".into(), "Ctrl+P", ButtonId::Find));
         rows.push(item(
             "Symbols in this file".into(),
             "@",
             ButtonId::FindSymbols,
         ));
-        rows.push(item("Search this diff".into(), "/", ButtonId::FindInDiff));
 
         rows.push(MenuRow::Heading("ACTIONS"));
         rows.push(item("✎  Edit this file".into(), "e", ButtonId::Edit));
@@ -9010,8 +9072,8 @@ impl App {
             ));
         }
         rows.push(item(
-            "🔍 Find and replace".into(),
-            "Alt+F",
+            "🔍 Find and replace in this file".into(),
+            "Ctrl+F",
             ButtonId::EditorFind,
             true,
         ));
@@ -11339,6 +11401,68 @@ impl App {
     }
 
     // -------------------------------------------------- in-diff search (`/`)
+
+    /// Whether the preview is holding a search, which changes what `n`,
+    /// `N` and Esc mean while it is.
+    fn preview_find_active(&self) -> bool {
+        self.preview.as_ref().is_some_and(|pv| pv.find.active())
+    }
+
+    /// `n` and `N` in the preview.
+    fn step_preview_match(&mut self, forward: bool) {
+        let stepped = self
+            .preview
+            .as_mut()
+            .is_some_and(|pv| pv.step_match(forward));
+        if !stepped {
+            self.err("No matches.");
+        }
+    }
+
+    /// `/` and Ctrl+F in the preview: open the prompt over the document.
+    pub fn start_preview_find(&mut self) {
+        let Some(pv) = &mut self.preview else { return };
+        pv.open_find();
+        self.ok("/");
+    }
+
+    /// Keystrokes while the preview's prompt is open.
+    ///
+    /// The same shape as the diff's: the query re-runs on every character,
+    /// Enter keeps it and the highlight, Esc puts the reader back where
+    /// they started reading.
+    fn preview_find_key(&mut self, key: KeyEvent) {
+        let Some(pv) = &mut self.preview else { return };
+        match key.code {
+            KeyCode::Esc => {
+                pv.cancel_find();
+                self.ok("Search cancelled.");
+            }
+            KeyCode::Enter => {
+                pv.find.typing = false;
+                let (empty, none) = (pv.find.query.is_empty(), pv.find.rows.is_empty());
+                let query = pv.find.query.clone();
+                if empty {
+                    self.ok("Search cleared.");
+                } else if none {
+                    self.err(format!(
+                        "No match for “{query}” in this document — # searches every file."
+                    ));
+                } else {
+                    self.ok("n and N walk the matches · Esc clears them.");
+                }
+            }
+            KeyCode::Backspace => {
+                pv.find.query.pop();
+                pv.refresh_find();
+            }
+            KeyCode::Char(c) => {
+                pv.find.query.push(c);
+                pv.refresh_find();
+            }
+            _ => {}
+        }
+    }
 
     pub fn start_find(&mut self) {
         if self.diff.is_none() {
@@ -15999,7 +16123,7 @@ b2
             .collect();
 
         for want in [
-            "Ctrl+S", "Ctrl+T", "Alt+F", "Alt+C", "F12", "F10", "Ctrl+G", "Alt+S", "F2", "Alt+.",
+            "Ctrl+S", "Ctrl+T", "Ctrl+F", "Alt+C", "F12", "F10", "Ctrl+G", "Alt+S", "F2", "Alt+.",
             "Alt+]", "Alt+[",
         ] {
             assert!(hints.contains(&want), "☰ has no line for {want}: {hints:?}");
@@ -18645,6 +18769,49 @@ more
             other => panic!("cursor should be on a line, got {other:?}"),
         };
         assert_eq!(app.diff.as_ref().unwrap().rows[row].new_ln, Some(3));
+    }
+
+    /// The key everyone reaches for. `/` still works; Ctrl+F is what a
+    /// reader who has never opened vim will try first.
+    #[test]
+    fn ctrl_f_opens_the_search_in_every_pane() {
+        // The diff.
+        let mut app = folded_app();
+        app.handle_key(ctrl(KeyCode::Char('f')));
+        assert!(app.find.typing, "Ctrl+F opened the diff search");
+        assert_eq!(app.status, "/");
+
+        // Cmd+F, where the terminal reports it at all.
+        app.find.typing = false;
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::SUPER));
+        assert!(app.find.typing, "Cmd+F does the same");
+
+        // And with shift it is the repository, not this file.
+        app.find.typing = false;
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('F'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(!app.find.typing, "shift did not open the file search");
+        assert!(
+            matches!(&app.overlay, Overlay::Finder(f) if f.mode == FinderMode::Grep),
+            "it opened the grep instead"
+        );
+    }
+
+    /// Ctrl+F no longer pages forward in the diff. Everything else that
+    /// did still does, which is what makes the trade payable.
+    #[test]
+    fn the_other_paging_keys_survive_ctrl_f() {
+        let mut app = folded_app();
+        let page = app.diff_page();
+        assert!(page > 1, "the fixture has a pane to page");
+
+        for k in [ctrl(KeyCode::Char('d')), key(KeyCode::PageDown)] {
+            app.diff_cursor = 0;
+            app.handle_key(k);
+            assert!(app.diff_cursor > 0, "{k:?} still moves the cursor down");
+        }
     }
 
     #[test]

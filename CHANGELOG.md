@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Ctrl+F` finds in whatever you are reading.** The diff, the markdown
+  preview and the editor all answer the same key, and `/` still opens the
+  first two. `Ctrl+Shift+F` runs the repository-wide `git grep` that `#`
+  has always run. `Cmd+F` works where the terminal forwards it — most keep
+  it for their own find bar.
+- **The markdown preview can be searched.** It had no search at all, which
+  is the one pane where a long plan file is read end to end. It matches on
+  the rendered document rather than on the markdown behind it, so you look
+  for what is on the page; `n` and `N` walk the matches, and each one
+  lights up keeping the colors around it.
+
 - **Staged and unstaged, told apart.** The local file panel is now in two
   halves: `STAGED` at the top — what `git commit` would take — and
   `UNSTAGED` below it. Stage a file and its row moves up; unstage it and
@@ -114,6 +125,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `Ctrl+F` no longer pages forward in the diff and the preview — it opens
+  the search. `PageDown` and `Ctrl+D` still page, and in the preview so
+  does `Space`.
 - `j` and `k` in the file panel now walk the rows on screen rather than
   the file list. The staging sections make row order and list order
   different things, and the cursor has to follow what you can see.

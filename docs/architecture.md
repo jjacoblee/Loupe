@@ -514,6 +514,26 @@ borrows the `pre_format` trick that keeps one undo meaning one press.
 
 ## Finding things
 
+`Ctrl+F` is one key over three different searches, because "this file"
+means three different things depending on which pane is in front of the
+reader. `app::is_find_key` is the single answer to "was that the find
+key", so the three panes cannot drift apart on which modifiers count, and
+`is_find_all_key` is the shifted half that reaches the repository grep.
+Cmd is accepted alongside Ctrl and almost never arrives: terminals keep
+Cmd+F for their own find bar, and none report Super at all without the
+kitty keyboard protocol, which loupe does not ask for.
+
+The preview's search is its own, in `preview::Find`, because the diff's
+searches display rows of a `FileDiff` and the preview has none. It
+matches the **rendered** text — `Line`s the markdown renderer already
+produced — rather than the source, so the reader searches for what is on
+the page. Highlighting that means walking the spans and the match ranges
+together: a match can straddle two spans (bold in the middle of a
+sentence) and one span can hold several, so `preview::highlight` splits
+spans rather than replacing their style, and a hit inside a heading still
+reads as a heading.
+
+
 Three tiers, in rising order of cost and falling order of availability:
 
 1. **Fuzzy path matching and the definition scanner** (`search.rs`) — in

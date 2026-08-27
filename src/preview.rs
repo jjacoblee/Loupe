@@ -54,6 +54,36 @@ pub struct Preview {
     /// is. Where the rendered rows fall depends on the width, so a jump
     /// asked for before the first draw has to wait for it.
     pending_line: Option<usize>,
+    /// Find in this file. The preview is where a long plan file is read,
+    /// which is exactly where searching it matters.
+    pub find: Find,
+}
+
+/// The preview's search: what was typed, which rendered rows hold it, and
+/// which of those the reader is on.
+///
+/// It matches on the **rendered** text rather than on the markdown source.
+/// The reader is looking at a document, and searching for what they can
+/// see is what they mean — a heading's `##` and a link's brackets are not
+/// on screen, so they are not in the haystack either.
+#[derive(Default)]
+pub struct Find {
+    pub query: String,
+    /// True while the prompt is open and taking keystrokes.
+    pub typing: bool,
+    /// Rendered rows holding a match, ascending.
+    pub rows: Vec<usize>,
+    /// Index into `rows` of the row the reader is on.
+    pub at: usize,
+    /// Scroll position when the prompt opened, so Esc can undo the
+    /// jumping around that typing does.
+    origin: usize,
+}
+
+impl Find {
+    pub fn active(&self) -> bool {
+        !self.query.is_empty()
+    }
 }
 
 impl Preview {
@@ -70,6 +100,7 @@ impl Preview {
             mtime: None,
             from_buffer: false,
             pending_line: None,
+            find: Find::default(),
         }
     }
 
@@ -147,6 +178,83 @@ impl Preview {
         self.pending_line = Some(line);
     }
 
+    // -------------------------------------------------------- find
+
+    /// Open the prompt, remembering where to put the reader back.
+    pub fn open_find(&mut self) {
+        self.find.typing = true;
+        self.find.origin = self.scroll;
+        self.find.query.clear();
+        self.find.rows.clear();
+        self.find.at = 0;
+    }
+
+    /// Put the pane back the way it was and forget the search.
+    pub fn cancel_find(&mut self) {
+        self.scroll = self.find.origin.min(self.max_scroll());
+        self.clear_find();
+    }
+
+    /// Keep the reader where they are and forget the search.
+    pub fn clear_find(&mut self) {
+        self.find.typing = false;
+        self.find.query.clear();
+        self.find.rows.clear();
+        self.find.at = 0;
+    }
+
+    /// Re-scan the rendered rows and go to the first match at or after
+    /// where the search started, so the view follows the query as it is
+    /// typed.
+    ///
+    /// The layout has to be current for this to mean anything, and it is:
+    /// the prompt can only be opened from a pane that has been drawn.
+    pub fn refresh_find(&mut self) {
+        self.find.rows.clear();
+        self.find.at = 0;
+        if self.find.query.is_empty() {
+            return;
+        }
+        for (row, line) in self.doc.lines().iter().enumerate() {
+            if !crate::search::find_ranges(&row_text(line), &self.find.query).is_empty() {
+                self.find.rows.push(row);
+            }
+        }
+        self.find.at = self
+            .find
+            .rows
+            .iter()
+            .position(|r| *r >= self.find.origin)
+            .unwrap_or(0);
+        self.go_to_match();
+    }
+
+    /// Walk to the next or previous match, wrapping at both ends. False
+    /// when there is nothing to walk.
+    pub fn step_match(&mut self, forward: bool) -> bool {
+        let n = self.find.rows.len();
+        if n == 0 {
+            return false;
+        }
+        self.find.at = if forward {
+            (self.find.at + 1) % n
+        } else {
+            (self.find.at + n - 1) % n
+        };
+        self.go_to_match();
+        true
+    }
+
+    /// Scroll the current match into view, a third of the way down the
+    /// pane so there is something above it to read it in context.
+    fn go_to_match(&mut self) {
+        let Some(row) = self.find.rows.get(self.find.at).copied() else {
+            return;
+        };
+        let lead = (self.inner.height / 3) as usize;
+        self.scroll = row.saturating_sub(lead).min(self.max_scroll());
+    }
+
     /// A click positions the reader without selecting: the pane is for
     /// reading, and the source view is one key away for anything else.
     pub fn on_click(&mut self, _x: u16, y: u16) {
@@ -187,8 +295,15 @@ impl Preview {
         let h = self.inner.height as usize;
         let mut out: Vec<Line> = Vec::with_capacity(h);
         let lines = self.doc.lines();
+        // The row the reader is on, drawn brighter than the others so a
+        // page with four matches on it still says which one is current.
+        let here = self.find.rows.get(self.find.at).copied();
         for i in 0..h {
-            match lines.get(self.scroll + i) {
+            let row = self.scroll + i;
+            match lines.get(row) {
+                Some(l) if self.find.active() => {
+                    out.push(highlight(l, &self.find.query, Some(row) == here, p))
+                }
                 Some(l) => out.push(l.clone()),
                 None => out.push(Line::default()),
             }
@@ -232,6 +347,69 @@ impl Preview {
             );
         }
     }
+}
+
+/// The plain text of a rendered line, which is what the search reads.
+fn row_text(line: &Line) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// Re-style one rendered line so the query stands out inside it.
+///
+/// Every span keeps its own color for the text around the match — a
+/// heading stays a heading, code stays code — and only the matched
+/// characters take the search background. That means walking the spans
+/// and the match ranges together, because a match can straddle two spans
+/// (bold in the middle of a sentence) and a span can hold several.
+fn highlight<'a>(
+    line: &Line<'a>,
+    query: &str,
+    current: bool,
+    p: &crate::theme::Palette,
+) -> Line<'a> {
+    let text = row_text(line);
+    let ranges = crate::search::find_ranges(&text, query);
+    if ranges.is_empty() {
+        return line.clone();
+    }
+    let hit = if current {
+        Style::default().bg(p.matched).fg(p.text)
+    } else {
+        Style::default().bg(p.matched)
+    };
+    let mut out: Vec<Span> = Vec::with_capacity(line.spans.len() + ranges.len() * 2);
+    let mut at = 0usize;
+    for span in &line.spans {
+        let mut run = String::new();
+        let mut on = false;
+        for ch in span.content.chars() {
+            let is_hit = ranges.iter().any(|(a, b)| at >= *a && at < *b);
+            if is_hit != on && !run.is_empty() {
+                out.push(Span::styled(
+                    std::mem::take(&mut run),
+                    if on {
+                        span.style.patch(hit)
+                    } else {
+                        span.style
+                    },
+                ));
+            }
+            on = is_hit;
+            run.push(ch);
+            at += 1;
+        }
+        if !run.is_empty() {
+            out.push(Span::styled(
+                run,
+                if on {
+                    span.style.patch(hit)
+                } else {
+                    span.style
+                },
+            ));
+        }
+    }
+    Line::from(out)
 }
 
 /// The modification time of a file, or None when it cannot be read.
