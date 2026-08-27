@@ -15,7 +15,7 @@ threading model, and the invariants that are easy to break by accident.
 | `conflict.rs` | Merge conflict markers: parsing them into hunks, building the two sides, writing a resolution back |
 | — | Reviews live in `github.rs` (the request) and `app.rs` (the held batch and the composer) |
 | `blame.rs` | `git blame --porcelain` parsing, the age heat ramp, the change set |
-| `editor.rs` | The in-place editor: a custom renderer over `tui-textarea` |
+| `editor.rs` | The editor buffers: a custom renderer over `tui-textarea`, find and replace, the comment toggle |
 | `markdown.rs` | Markdown → styled lines: the block/inline parser and the width-dependent layout |
 | `preview.rs` | The preview pane: scrolling, the source-line map, reload, and the scrollbar |
 | `pins.rs` | Pinned files: the tab list, the state file, and reading a dropped path out of a paste |
@@ -127,6 +127,79 @@ asked about is never asked again, so a repository full of direct pushes
 costs one call and then nothing. The number is **never truncated to fit**:
 a shortened number is a link to a real but wrong pull request, so a number
 too wide for the column renders as `#…`.
+
+## The file panel
+
+The panel shows one of two lists, chosen by `App::panel`: the files the
+change touches, or every file in the repository. They are separate all the
+way down — their own `TreeNodes`, their own collapse set — because a folder
+closed in one is a folder the reader never touched in the other.
+
+**The split that matters is build against emit.** `TreeNodes::build` walks
+every path into a `BTreeMap` tree; `TreeNodes::emit` walks that tree and
+produces the visible rows. Measured, the build is 99% of the cost:
+
+| Paths | Build | Emit, collapsed | Emit, expanded |
+| --- | --- | --- | --- |
+| 16,761 | 3.95 ms | 500 ns | 724 µs |
+| 400,000 | 48.25 ms | 1.29 µs | 9.72 ms |
+
+**Invariant:** `rebuild_entries` emits and nothing else. It is on the click
+path for every collapse and expand. `rebuild_files` is the one that builds,
+and every path that assigns `App::files` has to call it — a debug assertion
+on the file count fails a test rather than letting a stale tree draw the
+previous change's rows. `app::tests::emitting_rows_does_not_rebuild_the_tree`
+asserts ten emits cost less than one build, as a ratio rather than a
+wall-clock bound so a slow machine does not fail the suite.
+
+Files mode opens with every directory collapsed. That is not a nicety:
+expanded, a 400,000-path tree allocates a 410,257-entry `Vec` on every
+toggle, and collapsed it allocates seven. The collapse set comes from the
+same walk that emits the rows, because single-child directory chains are
+compressed into one row with a joined label and a set built from raw path
+prefixes would match none of them.
+
+### Two `git ls-files` calls
+
+The listing runs both on a worker thread:
+
+- `--cached --others --exclude-standard` — tracked and untracked files.
+- `--others --ignored --exclude-standard --directory` — the ignored ones.
+
+`--directory` is what makes the second affordable. Without it git walks
+into every ignored directory: on one real repository that is 17,504 entries
+and 147 ms, nearly all of it `node_modules`. With it git stops at a
+directory whose whole contents are ignored and names the directory — 10
+entries and 14 ms. Which is also the useful split: an ignored *file* like
+`.env` is something a developer opens, and an ignored *directory* is noise
+until asked for.
+
+Git also reports a directory it would not walk into for a nested repository
+or a linked worktree inside the clone. Both arrive as a path with a
+trailing slash, which `search::list_files` returns separately from the
+files — mixed in, the tree builder pops an empty last component and draws a
+file row with no name.
+
+Those become **stubs**: a `Node` with `stub: true` and nothing under it.
+Expanding one reads that directory, one level, on a worker thread. A
+subdirectory found inside becomes a stub of its own, and a symlinked
+directory counts as a file, because following one that points at an
+ancestor draws a tree with no bottom.
+
+**Invariant:** paths are only ever appended to `App::repo_paths`. Every
+`RowSrc::Path` on screen holds an index into it, so inserting or removing
+in the middle repoints rows at the wrong file. A deleted file keeps its
+slot; only the tree forgets it.
+
+Whether a path is ignored is a flag per path, not a split point, because
+everything inside `node_modules` is ignored wherever it lands in the list
+after a read. Which of the two kinds a stub is matters for the same reason:
+a nested worktree holds ordinary files, and inheriting "ignored" from every
+stub would draw a whole worktree as if it were `node_modules`.
+
+Above `MAX_EAGER_PATHS` the tree keeps the top level only and stubs every
+directory. The build is not what forces that — 48 ms is affordable on a
+worker — the memory is.
 
 ## The diff pipeline
 
@@ -310,6 +383,27 @@ network call so the first file open doesn't pay for it.
 
 ## The editor
 
+`App::editor` is the buffer on screen and `App::parked` holds the rest.
+Opening a file parks the current one; closing pops the last one forward.
+The field kept its meaning deliberately: 81 places read it, every one of
+them means "the buffer the reader is looking at", and an index into a
+vector would have changed all of them to say the same thing.
+
+**Invariant:** `editor.is_none()` implies `parked.is_empty()`. Every "close
+the editor first" guard depends on it.
+
+`q` counts through `dirty_buffers()` rather than looking at the active
+buffer. One buffer guarded itself — Esc armed, Esc again discarded — but
+`q` reaches past that, and with several open it could take unsaved work in
+files that were not on screen.
+
+A `WorkspaceEdit` from a rename or a code action is applied to buffers,
+never to disk. Files it touches that are not open are opened as unsaved
+buffers; a file already open is edited where it stands, so unsaved work in
+it is never read over. The reader lands back where they started.
+
+### The renderer
+
 `tui-textarea` owns editing state (buffer, cursor, selection, undo), but
 its widget rendering is replaced entirely: `editor.rs` renders the buffer
 itself to get per-token syntax colors, selection highlighting, and the
@@ -326,6 +420,28 @@ Replacing the whole buffer (which is what formatting does) costs *two* of
 undo would leave the file looking empty. `Editor::pre_format` holds the
 previous text and `undo_format` puts it back whole, which is what the
 message on screen promises.
+
+### Find and replace
+
+`Editor::find` is its own state, not a second user of `App::find`. That one
+searches the diff and counts in display rows, which fold and pair two sides
+together; this counts in buffer lines, and sharing would have meant one of
+them lying about what a number means.
+
+`tui-textarea` has a search of its own. It is behind a feature that pulls
+in `regex`, it has no replace at all, and its match colors are painted by
+its own widget render — which this editor replaces, so they would never
+reach the screen. `search::find_ranges` does the matching instead, and
+`render_row` paints it.
+
+**Replace-all runs back to front.** Every match after the one being
+replaced sits at a column the replacement is about to move, so going
+forwards writes the second one into the wrong place as soon as the
+replacement is a different length.
+
+The comment toggle replaces the buffer whole, which costs two of
+`tui-textarea`'s history entries — the delete and the insert — so it
+borrows the `pre_format` trick that keeps one undo meaning one press.
 
 ## Finding things
 
@@ -349,6 +465,27 @@ quiet: no server for Kotlin means `@` still lists definitions, from
 patterns.
 
 ## Language servers
+
+**Every write to a server goes through a thread that owns its pipe.**
+`Client::send` frames the message and pushes it to a channel. Writing on
+the caller's thread would block: a pipe holds 64 KB on macOS, a
+`didChange` carrying a 536 KB buffer is 553 KB of escaped JSON, and
+`sync_open` is called from the idle tick on the drawing thread. A channel
+rather than a thread per message, because the protocol is ordered —
+`didOpen` before the `didChange` that builds on it, version 2 before
+version 3 — and two threads racing on one pipe corrupt the stream.
+
+A broken pipe surfaces one message late: the writer thread ends, dropping
+the receiver, which fails the next send.
+
+`didClose` goes out when a buffer closes, and takes the document's
+diagnostics with it. Without it every file opened in a session stays open
+and the server keeps analysing files nobody is reading.
+
+The `SERVERS` table is `BUILT_IN` plus whatever `[[server]]` tables the
+config file holds, installed once at startup by `lsp::configure` and
+leaked. A `ServerSpec` is `&'static` through `spec_for`, the registry and
+the UI, and the table lives for the process.
 
 Hand-rolled JSON-RPC over stdio (`Content-Length` framing, `serde_json`
 for the bodies) rather than a protocol crate — it is about two hundred
@@ -481,6 +618,17 @@ never a copy. It is named relative to the repository root when it lives
 inside one, and by its whole path when it does not — the `outside` flag
 that the `↗` on the tab draws from.
 
+The row also carries the open editor buffers, after the pins and a
+divider. Drawn together and addressed apart: the pins are index-coupled
+through `open_pin`, `PinTab`, `open_pin_number`, `active_pin` and
+`Pins::step`, and folding the buffers into that numbering would renumber a
+reader's pins every time a file was opened. A pin is a bookmark somebody
+chose; a buffer is a file that happens to be open.
+
+The state file lives under `git_dir`, which `rev-parse --absolute-git-dir`
+resolves to `<main>/.git/worktrees/<name>` in a linked worktree. So the row
+is per worktree, not per clone.
+
 **Which tab is open is derived, not stored.** `App::active_pin` asks what
 file is on screen — the preview's, the editor's, or the one under the file
 panel cursor — and looks it up in the row. A reader leaves a document by a
@@ -578,3 +726,11 @@ Measured baselines live in the commit history; the standing rules:
 - Idle means idle: don't add periodic redraws; respect the dirty flag.
 - Renderers coalesce same-style runs into single spans — no per-character
   `Span` allocation in hot paths.
+- Nothing that walks the whole repository runs on a toggle. Building the
+  file tree costs 48 ms at 400,000 paths and emitting its rows costs about
+  2 µs, so the build belongs to the job that loads the list and the emit
+  belongs to the click. `app::tests::the_tree_stays_inside_its_budget`
+  holds the bound.
+- A timing test is a ratio or a loose absolute, never a tight wall-clock
+  number. A shared CI runner is not a laptop, and a test that fails for
+  being slow gets deleted rather than fixed.

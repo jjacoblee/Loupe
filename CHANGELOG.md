@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The whole repository in the file panel.** `F` swaps the panel between
+  the files the change touches and every file in the repository, each with
+  its own tree and its own collapse state. Ignored files are listed and
+  drawn dim; an ignored directory costs one row until it is opened, and
+  then is read one level at a time. A file the change touches keeps its
+  stage, viewed and conflict marks in both lists and opens its diff.
+  Right-click to create, rename or delete a file — delete asks first.
+- **More than one file open at once.** Opening a second file parks the
+  first rather than closing it; both show in the tab row with a `●` on any
+  that is unsaved. `Alt+]` and `Alt+[` step between them, and `q` counts
+  the unsaved buffers before it takes them.
+- **Find and replace in the editor** (`Alt+F`), with the prompt in the
+  border so nothing on screen moves while you search.
+- **Find every use from the editor** (`Alt+R`) — the list `gr` has always
+  given in the diff, which the editor could not reach.
+- **Rename a symbol** (`Alt+M`), **fixes and refactors** (`Alt+.`) and
+  **signature help** (`Alt+S`). A rename opens every file it touched as an
+  unsaved buffer to read before saving; nothing is written behind you.
+- **Comment toggle** (`Alt+C`), an `Enter` that keeps your indent, and the
+  bracket under the cursor matched with its partner.
+- **Language servers from the config file.** A `[[server]]` table adds a
+  language or replaces a built-in one. `loupe --lsp` reports yours too.
+
+### Fixed
+
+- A nested worktree or repository made `Ctrl+P` show a blank row: `git
+  ls-files` reports such a directory instead of its contents, and the entry
+  was read as a file with no name.
+- Editing a large file could freeze the window. `didChange` was written to
+  the language server's pipe from the drawing thread, and a buffer bigger
+  than the pipe waited there on a server busy indexing. Each server has a
+  writer thread now.
+- Loupe never sent `textDocument/didClose`, so every file opened in a
+  session stayed open on the server for the rest of it.
+- The pinned tab row is per worktree, not per clone. Both pages said clone.
+
 - **Loupe tells your coding agent what you are reading.** Loupe is the
   only process on the machine that knows which lines a human has on
   screen and is judging. An agent in the next pane has to guess, and it

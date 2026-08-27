@@ -131,9 +131,50 @@ buffer belongs to the side you are leaving.
 | Click `[!]` on a conflicted row | Open its resolve menu (see [Merge conflicts](#merge-conflicts)) |
 | Click `↺` at the end of a row | Revert every change in that file (asks first) |
 | `Tree` / `Flat` buttons | Switch between tree and flat list |
+| `F` or the `Change` / `Files` buttons | Swap between the change and every file in the repository |
 | Drag the divider | Resize the panel |
 | Double-click the divider | Reset the panel width (34 columns) |
 | `<` / `>` | Narrow / widen the panel |
+
+### Every file in the repository
+
+`F` swaps the panel between the files this change touches and every file
+in the repository. The two keep their own trees and their own collapse
+state, so a folder you closed in one is a folder you never touched in the
+other, and swapping back lands where you left off.
+
+The list comes from `git ls-files`, so it holds what git tracks plus what
+it does not yet — and, deliberately, the files git is **ignoring**:
+
+- An ignored **file** is listed and drawn dim. `.env` is worth opening,
+  and worth knowing is not committed.
+- An ignored **directory** costs one row. `node_modules` stays a single
+  folder until you open it, and only then does loupe read what is inside —
+  one level, never a walk.
+
+A file the change touches keeps its marks here: its stage box, its viewed
+box, its conflict mark. Clicking it opens the diff, not the plain file.
+Clicking a file the change does not touch opens it in the editor, or
+renders it when it is markdown.
+
+Reading is refreshed when you come back to the panel after a minute, and
+whenever you press `r`. Not on a timer: `git ls-files` costs about 90
+milliseconds on a repository of seventeen thousand files.
+
+**Right-click a row** for the file operations, in this panel only:
+
+| Line | Action |
+| --- | --- |
+| `New file here…` | Create an empty file beside the row, or in the folder, and open it |
+| `Rename…` | Give the file a new name |
+| `Delete…` | Delete it — asks first, and this cannot be undone from loupe |
+
+In the change under review the same row means "part of this diff", so
+offering to delete it there would read as an offer to drop it from the
+change. That is why these lines only appear in `Files`.
+
+A very large repository — more than two hundred thousand files — is read
+one directory at a time instead, so the panel is usable at once.
 
 ## Diff view — move
 
@@ -454,6 +495,11 @@ the line holds several, loupe asks rather than guessing.
 | Go | `gopls` | `go install golang.org/x/tools/gopls@latest` |
 | Rust | `rust-analyzer` | `rustup component add rust-analyzer` |
 
+Those three are built in. A `[[server]]` table in your config adds another
+language, or replaces one of these with a server you prefer — see
+[configuration](configuration.md#server--a-language-loupe-does-not-know).
+`loupe --lsp` lists what it found, yours included.
+
 `tsserver` on its own is not enough: it speaks its own protocol, not LSP.
 `typescript-language-server` is the wrapper that does — loupe finds the
 `tsserver.js` to pair it with, preferring the copy in your project's
@@ -473,9 +519,52 @@ Set `language_servers = false` in your config to switch all of this off.
 | `Ctrl+X` / `Ctrl+Y` | Cut / paste, through the editor's own buffer |
 | `Ctrl+Z` or `Ctrl+U` | Undo (`Ctrl+U` is tui-textarea's own binding; `Ctrl+Z` is an alias) |
 | `Ctrl+R` | Redo |
+| `Alt+F` | Find and replace in this file |
+| `Alt+C` | Comment or uncomment the line, or the selection |
 | `Alt+P` | Preview the buffer as markdown, saved or not (`.md` files) |
 | `PgUp` / `PgDn`, or `Ctrl+V` / `Alt+V` | Page through the file |
 | `Esc` | Close (press twice to discard unsaved changes) |
+
+Every one of these is in the `☰` menu as well, which matters: some
+terminals never send Alt, and the menu is the way in when yours does not.
+
+### More than one file open
+
+Opening a second file parks the first rather than closing it. Both show in
+the tab row under the top bar, after any pinned files, and a `●` marks one
+with unsaved work.
+
+| Key / mouse | Action |
+| --- | --- |
+| `Alt+]` / `Alt+[` | Next / previous open file |
+| Click a tab | Go to that file |
+| `Esc` | Close this one and go back to the last |
+| `q` | Quit — asks once, and says how many files are unsaved |
+
+Coming back to a file keeps the buffer: the cursor, the scroll and any
+unsaved edits are where you left them. Opening a file that is already open
+switches to it rather than reading the file over the top of your edits.
+
+### Find and replace
+
+`Alt+F` puts the prompt in the editor's border, where the file name goes,
+so nothing on screen moves while you search.
+
+| Key | Action |
+| --- | --- |
+| `Tab` | Switch between what to find and what to put in its place |
+| `Enter` | Next match |
+| `Alt+N` / `Alt+B` | Next / previous match, without the prompt open |
+| `Alt+R` | Replace this one |
+| `Alt+A` | Replace all of them |
+| `Esc` | Cancel — the cursor goes back where the search started |
+
+`Alt+R` means two things, and which one depends on whether the prompt is
+open: while you are typing in it, it replaces the match under the cursor;
+the rest of the time it finds every use of the symbol you are on.
+
+Matching follows the same rule as everywhere else in loupe: an
+all-lowercase query ignores case, and a capital means that capital.
 
 ### In the editor, with a language server
 
@@ -488,7 +577,23 @@ text — so these are on Ctrl keys that `tui-textarea` leaves free.
 | `Tab` / `Enter` | Accept the highlighted suggestion · `↑` `↓` to move · `Esc` to dismiss |
 | `Ctrl+G` | What is this? — the type and docs for the symbol at the cursor |
 | `Ctrl+]` | Go to the definition (vi's jump-to-tag key) |
+| `Alt+R` | Find every use — the same list `gr` gives in the diff |
+| `Alt+S` | The signature of the call the cursor is inside |
+| `Alt+M` | Rename this symbol everywhere |
+| `Alt+.` | Fixes and refactors on offer here |
 | `Ctrl+T` | Format the file, or the `⇥ Format` button |
+
+**A rename does not save anything.** Every file it touches opens as an
+unsaved buffer with a `●` in the tab row, so you read what changed before
+it reaches disk, and `Ctrl+S` each one you accept. A file already open is
+edited where it stands, so unsaved work in it is never read over, and you
+land back in the buffer you started in. A rename reaching outside the
+repository — into a dependency, or the standard library — is dropped.
+
+**Fixes and refactors** open as a list, each line saying how many files it
+touches: "extract function" over one file and over nine are different
+decisions. An action a server wants to run itself rather than describe as
+edits is not offered, because there would be nothing to show you first.
 
 **Diagnostics** appear as you type, without saving: a `●` (error) or `▲`
 (warning) in the gutter, the offending span colored, and the message in

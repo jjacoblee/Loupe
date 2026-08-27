@@ -157,12 +157,34 @@ leaving your terminal or touching a browser.
   disk — which matters when the working tree is on another branch.
   Nothing is bundled or installed; `loupe --lsp` says what it found, and
   a language without a server falls back to pattern matching.
+- **The whole repository, not just the change** — `F` swaps the file
+  panel between the files this change touches and every file in the
+  repository. Ignored *files* are listed and drawn dim, because `.env`
+  is worth opening and worth knowing is not committed; ignored
+  *directories* cost one row, so `node_modules` stays a single folder
+  until you open it. A file the change touches keeps its stage and
+  viewed marks in both lists, and opens its diff rather than the plain
+  file. Right-click to make, rename or delete one.
 - **Edit in place, with the language server attached** — double-click a
   new-side line to open an editor with live incremental highlighting,
   completion (`Ctrl+Space`), type-and-docs at the cursor (`Ctrl+G`),
-  go-to-definition (`Ctrl+]`), formatting (`Ctrl+T`), and diagnostics
-  that appear as you type rather than after you push. `Ctrl+S` refreshes
-  the diff; you commit when you're ready.
+  go-to-definition (`Ctrl+]`), find-every-use (`Alt+R`), the signature
+  of the call you are in (`Alt+S`), formatting (`Ctrl+T`), and
+  diagnostics that appear as you type rather than after you push.
+  `Alt+F` finds and replaces, `Alt+C` comments a line or a selection,
+  and `Enter` keeps your indent. `Ctrl+S` refreshes the diff; you commit
+  when you're ready.
+- **Rename a symbol and read every file it touched** — `Alt+M` renames
+  it everywhere the server knows about, and `Alt+.` offers the fixes and
+  refactors on hand. Neither writes to disk. Every file the change
+  reaches opens as an unsaved buffer with a `●` in the tab row, so you
+  read what happened before it lands and save the ones you accept. A
+  tool that silently rewrites twelve files is a tool nobody can review.
+- **More than one file at a time** — opening a second file parks the
+  first instead of closing it. Both sit in the tab row, `Alt+]` and
+  `Alt+[` step between them, and coming back to one finds the cursor,
+  the scroll and any unsaved edits exactly where you left them. `q` says
+  how many are unsaved before it takes them.
 - **Fast and non-blocking** — every fetch runs in the background with a
   cancellable spinner; idle CPU is ~zero; PR content is treated as
   untrusted input throughout.

@@ -195,6 +195,42 @@ Set this to `false` and Loupe never starts a subprocess for any of it;
 `@` (symbols in this file) keeps working from pattern matching, and
 `gd` / `gr` / `K` say why they can't.
 
+### `[[server]]` — a language Loupe does not know
+
+Those three are built in. A `[[server]]` table adds another, or replaces
+one of them with a server you prefer:
+
+```toml
+[[server]]
+lang = "Python"                       # what to call it in messages
+extensions = ["py", "pyi"]            # no dot
+command = "pyright-langserver"        # looked for on your PATH
+args = ["--stdio"]                    # optional
+install = "npm install -g pyright"    # optional: what to tell you if it is missing
+
+[[server]]
+lang = "Ruby"
+extensions = ["rb", "rake"]
+command = "ruby-lsp"
+install = "gem install ruby-lsp"
+```
+
+Nothing is downloaded or installed. Loupe looks for `command` on your
+`PATH` and starts it the first time you ask a question about a file it
+handles, exactly as it does for the built-in three.
+
+An extension a built-in also claims goes to the table here, so a
+`[[server]]` for `ts` replaces `typescript-language-server` rather than
+competing with it.
+
+`loupe --lsp` lists what it found, yours included. An entry missing its
+`lang`, its `command` or its `extensions` is skipped — Loupe cannot name,
+run or match a file to it.
+
+A repository config replaces the global list rather than adding to it.
+Two files each naming a Python server would otherwise leave which one
+starts up to chance.
+
 ### `format_on_save` — run the formatter when the editor saves
 
 ```toml
