@@ -5770,6 +5770,21 @@ impl App {
                 }
                 // The find prompt, when it has the keyboard.
                 _ if editor.find.typing.is_some() && editor.find_key(key) => {}
+                // Comment or uncomment the line, or the selection.
+                (KeyCode::Char('c'), KeyModifiers::ALT)
+                | (KeyCode::Char('C'), KeyModifiers::ALT) => {
+                    if !editor.toggle_comment() {
+                        self.err("Loupe does not know how this language writes a comment.");
+                    }
+                }
+                // A newline that keeps the indent.
+                (KeyCode::Enter, m) if m.is_empty() && editor.completion.is_none() => {
+                    editor.newline_with_indent();
+                    editor.dirty = true;
+                    editor.discard_armed = false;
+                    editor.touched();
+                    self.editor_touched = Some(Instant::now());
+                }
                 // Rename the symbol under the cursor, everywhere.
                 (KeyCode::Char('m'), KeyModifiers::ALT)
                 | (KeyCode::Char('M'), KeyModifiers::ALT) => {

@@ -122,6 +122,42 @@ impl BufferFind {
     }
 }
 
+/// The line-comment marker for a file, by extension.
+///
+/// Only the languages loupe already colors and only line comments: a
+/// block comment has to be closed, and a toggle that has to decide where
+/// to close it is a toggle that gets it wrong on the awkward line.
+/// A file whose language has none is left alone rather than guessed at.
+fn comment_marker(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "rs" | "go" | "ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs" | "c" | "h"
+        | "cpp" | "hpp" | "java" | "kt" | "swift" | "scala" | "cs" | "php" | "dart" | "zig" => "//",
+        "py" | "rb" | "sh" | "bash" | "zsh" | "toml" | "yaml" | "yml" | "conf" | "cfg" | "nix"
+        | "pl" | "r" | "ex" | "exs" | "jl" => "#",
+        "sql" | "lua" | "hs" | "elm" => "--",
+        "vim" => "\"",
+        "lisp" | "clj" | "cljs" | "el" => ";",
+        _ => return None,
+    })
+}
+
+/// The brackets that pair, for the match highlight.
+fn bracket_pair(c: char) -> Option<(char, bool)> {
+    match c {
+        '(' => Some((')', true)),
+        '[' => Some((']', true)),
+        '{' => Some(('}', true)),
+        ')' => Some(('(', false)),
+        ']' => Some(('[', false)),
+        '}' => Some(('{', false)),
+        _ => None,
+    }
+}
+
 /// Rows of suggestions on screen at once.
 pub const COMPLETION_ROWS: usize = 8;
 
@@ -689,6 +725,160 @@ impl Editor {
         n
     }
 
+    /// Comment or uncomment the cursor line, or every line a selection
+    /// touches.
+    ///
+    /// Commenting inserts at the shallowest indent of the lines involved,
+    /// so a block keeps its shape instead of having its markers stagger
+    /// down the left edge. Uncommenting only happens when *every* line is
+    /// already commented — a mixed block gets commented, which is what a
+    /// second press then undoes.
+    pub fn toggle_comment(&mut self) -> bool {
+        let Some(marker) = comment_marker(&self.path) else {
+            return false;
+        };
+        let (first, last) = match self.textarea.selection_range() {
+            Some(((a, _), (b, col))) => (a, if col == 0 && b > a { b - 1 } else { b }),
+            None => {
+                let (row, _) = self.textarea.cursor();
+                (row, row)
+            }
+        };
+        let lines = self.textarea.lines();
+        let rows: Vec<usize> = (first..=last)
+            .filter(|r| lines.get(*r).is_some_and(|l| !l.trim().is_empty()))
+            .collect();
+        if rows.is_empty() {
+            return false;
+        }
+        let all_commented = rows
+            .iter()
+            .all(|r| lines[*r].trim_start().starts_with(marker));
+        let indent = rows
+            .iter()
+            .map(|r| lines[*r].len() - lines[*r].trim_start().len())
+            .min()
+            .unwrap_or(0);
+
+        let (cur_row, cur_col) = self.textarea.cursor();
+        let mut edited: Vec<String> = lines.to_vec();
+        for r in &rows {
+            let line = &edited[*r];
+            edited[*r] = if all_commented {
+                let at = line.len() - line.trim_start().len();
+                let rest = &line[at + marker.len()..];
+                // The space this put in when commenting comes back out.
+                let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                format!("{}{rest}", &line[..at])
+            } else {
+                format!("{}{marker} {}", &line[..indent], &line[indent..])
+            };
+        }
+        self.replace_all_lines(edited);
+        let shift = marker.len() + 1;
+        let col = if all_commented {
+            cur_col.saturating_sub(shift)
+        } else {
+            cur_col + shift
+        };
+        self.textarea
+            .move_cursor(CursorMove::Jump(cur_row as u16, col as u16));
+        self.dirty = true;
+        self.touched();
+        true
+    }
+
+    /// Swap the whole buffer, in one undo step.
+    ///
+    /// Replacing the text costs two of `tui-textarea`'s history entries —
+    /// the delete, then the insert — which is why `pre_format` exists for
+    /// the formatter. The same trick serves here.
+    fn replace_all_lines(&mut self, lines: Vec<String>) {
+        self.pre_format = Some(self.content());
+        self.textarea.select_all();
+        self.textarea.cut();
+        self.textarea.insert_str(lines.join("\n"));
+    }
+
+    /// A newline that keeps the indent, and adds one level after a line
+    /// that opens a block.
+    ///
+    /// `tui-textarea` inserts a bare newline, which puts the cursor in
+    /// column zero of a file that is indented four levels deep.
+    pub fn newline_with_indent(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let line = self.textarea.lines().get(row).cloned().unwrap_or_default();
+        let indent: String = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        // Only what is left of the cursor decides: pressing Enter in the
+        // middle of a line should not indent by a brace further along it.
+        let before: String = line.chars().take(col).collect();
+        let opens =
+            before.trim_end().ends_with(['{', '(', '[', ':']) || before.trim_end().ends_with("=>");
+        self.textarea.insert_newline();
+        if !indent.is_empty() {
+            self.textarea.insert_str(indent);
+        }
+        if opens {
+            // Bound first: `indent()` borrows the textarea and
+            // `insert_str` needs it mutably.
+            let step = self.textarea.indent();
+            self.textarea.insert_str(step);
+        }
+    }
+
+    /// The bracket matching the one under the cursor, when there is one.
+    ///
+    /// Counts depth rather than looking for the next of the same kind, so
+    /// a nested pair does not steal the match. Bounded, because an unmatched
+    /// brace at the top of a large file should cost a screenful of scanning
+    /// rather than the whole buffer on every keystroke.
+    fn matching_bracket(&self, row: usize, col: usize) -> Option<(usize, usize)> {
+        const SCAN_LIMIT: usize = 5_000;
+        let lines = self.textarea.lines();
+        let here = lines.get(row)?.chars().nth(col)?;
+        let (want, forward) = bracket_pair(here)?;
+        let mut depth = 0i32;
+        let mut seen = 0usize;
+        let mut r = row;
+        let mut c = col;
+        loop {
+            let chars: Vec<char> = lines.get(r)?.chars().collect();
+            if let Some(ch) = chars.get(c) {
+                if *ch == here {
+                    depth += 1;
+                } else if *ch == want {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((r, c));
+                    }
+                }
+            }
+            seen += 1;
+            if seen > SCAN_LIMIT {
+                return None;
+            }
+            if forward {
+                if c + 1 < chars.len() {
+                    c += 1;
+                } else {
+                    r += 1;
+                    if r >= lines.len() {
+                        return None;
+                    }
+                    c = 0;
+                }
+            } else if c > 0 {
+                c -= 1;
+            } else {
+                r = r.checked_sub(1)?;
+                c = lines.get(r)?.chars().count().saturating_sub(1);
+            }
+        }
+    }
+
     pub fn scroll_top(&self) -> usize {
         self.top.0 as usize
     }
@@ -879,6 +1069,13 @@ impl Editor {
             Some((start, end)) => (row, ci) >= start && (row, ci) < end,
             None => false,
         };
+        // The bracket under the cursor and its partner, so the shape of a
+        // block is visible without counting braces.
+        let brackets: Option<((usize, usize), (usize, usize))> = self
+            .matching_bracket(cur_row, cur_col)
+            .map(|other| ((cur_row, cur_col), other));
+        let is_bracket =
+            |ci: usize| brackets.is_some_and(|(a, b)| (row, ci) == a || (row, ci) == b);
         // Search matches on this row, and which of them the cursor is on.
         // Painted here rather than through `tui-textarea`'s own search
         // colors: this renderer builds its own spans, so those colors
@@ -948,6 +1145,11 @@ impl Editor {
                 } else {
                     p.stage_partial
                 });
+            }
+            // The matched pair, under the search colors: a bracket that is
+            // also a search hit is a search hit first.
+            if is_bracket(ci) {
+                st = st.fg(p.accent).add_modifier(Modifier::BOLD);
             }
             // A search match, under a live selection: dragging over a
             // match should still look like dragging.
@@ -1166,7 +1368,91 @@ mod tests {
         }
     }
 
-    /// Replacing has to work back to front. Every match after the one
+    /// Commenting a block inserts at the shallowest indent of the lines
+    /// involved, so the markers line up instead of staggering down the
+    /// left edge with the code.
+    #[test]
+    fn commenting_a_block_keeps_its_shape() {
+        let mut ed = Editor::new(
+            "a.rs",
+            std::path::PathBuf::from("a.rs"),
+            "    let a = 1;\n        let b = 2;\n",
+        );
+        ed.textarea.move_cursor(CursorMove::Jump(0, 0));
+        ed.textarea.start_selection();
+        ed.textarea.move_cursor(CursorMove::Jump(1, 10));
+
+        assert!(ed.toggle_comment());
+        assert_eq!(
+            ed.content(),
+            "    // let a = 1;\n    //     let b = 2;\n",
+            "both markers at the shallower indent"
+        );
+
+        // And back again, exactly.
+        ed.textarea.move_cursor(CursorMove::Jump(0, 0));
+        ed.textarea.start_selection();
+        ed.textarea.move_cursor(CursorMove::Jump(1, 10));
+        assert!(ed.toggle_comment());
+        assert_eq!(ed.content(), "    let a = 1;\n        let b = 2;\n");
+    }
+
+    /// A block where only some lines are commented gets commented, not
+    /// half-uncommented. A second press then undoes the lot.
+    #[test]
+    fn a_half_commented_block_is_commented() {
+        let mut ed = Editor::new("a.py", std::path::PathBuf::from("a.py"), "# one\ntwo\n");
+        ed.textarea.move_cursor(CursorMove::Jump(0, 0));
+        ed.textarea.start_selection();
+        ed.textarea.move_cursor(CursorMove::Jump(1, 3));
+        assert!(ed.toggle_comment());
+        assert_eq!(ed.content(), "# # one\n# two\n");
+    }
+
+    /// A language loupe has no marker for is left alone rather than
+    /// guessed at.
+    #[test]
+    fn an_unknown_language_is_not_commented() {
+        let mut ed = Editor::new("data.bin", std::path::PathBuf::from("data.bin"), "x\n");
+        assert!(!ed.toggle_comment());
+        assert_eq!(ed.content(), "x\n");
+    }
+
+    /// Enter keeps the indent, and adds a level after a line that opens a
+    /// block — but only for a brace left of the cursor.
+    #[test]
+    fn a_newline_keeps_the_indent() {
+        let mut open = ed("    fn main() {\n");
+        open.textarea.move_cursor(CursorMove::Jump(0, 16));
+        open.newline_with_indent();
+        assert_eq!(
+            open.content(),
+            "    fn main() {\n        \n",
+            "four spaces kept, four more added for the brace"
+        );
+
+        // Splitting before the brace must not indent by it.
+        let mut mid = ed("    let x = 1; {\n");
+        mid.textarea.move_cursor(CursorMove::Jump(0, 15));
+        mid.newline_with_indent();
+        assert_eq!(mid.content(), "    let x = 1; \n    {\n");
+    }
+
+    /// The matching bracket is found by depth, so a nested pair does not
+    /// steal it.
+    #[test]
+    fn the_matching_bracket_counts_depth() {
+        let call = ed("f(g(x), y)\n");
+        assert_eq!(call.matching_bracket(0, 1), Some((0, 9)), "the outer pair");
+        assert_eq!(call.matching_bracket(0, 3), Some((0, 5)), "the inner one");
+        assert_eq!(call.matching_bracket(0, 9), Some((0, 1)), "and backwards");
+        assert_eq!(call.matching_bracket(0, 0), None, "not a bracket");
+
+        let open = ed("f(x\n");
+        assert_eq!(open.matching_bracket(0, 1), None);
+    }
+
+    /// Replacing has to work back to front.    /// Replacing has to work back to front. Every match after the one
     /// being replaced sits at a column the replacement is about to move,
     /// so replacing forwards would write the second one into the wrong
     /// place as soon as the replacement is a different length.
