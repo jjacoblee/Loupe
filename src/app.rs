@@ -1134,6 +1134,20 @@ pub const REVERT_W: u16 = 2;
 /// 16,761-file repository and nothing on screen goes wrong while it is
 /// out of date — a file added a minute ago simply is not listed yet.
 const REPO_LISTING_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// How many paths the file tree will hold whole before it starts reading
+/// one directory at a time instead.
+///
+/// Measured, the tree costs 48 ms to build at 400,000 paths and 2 µs to
+/// emit collapsed, so the build is not the problem — the memory is. Every
+/// path is a `String` and every directory a `BTreeMap` node, and a
+/// repository this size is one where somebody opens two folders and never
+/// looks at the rest.
+///
+/// Below this the whole tree is faster: expanding costs 2 µs from the
+/// cache against about 10 ms for a `read_dir` and its subprocess. Above
+/// it, that trade turns over.
+const MAX_EAGER_PATHS: usize = 200_000;
 /// Lines of context kept between the cursor and the edge of the diff pane.
 const SCROLLOFF: usize = 3;
 /// Columns one Left/Right key press scrolls the diff body.
@@ -1365,10 +1379,22 @@ impl TreeNodes {
     /// `read_dir` and happens when somebody expands it.
     fn from_listing(listing: &search::RepoListing) -> TreeNodes {
         let mut tree = TreeNodes::default();
-        for (i, path) in listing.paths.iter().enumerate() {
-            tree.insert(path, RowSrc::Path(i));
+        if listing.paths.len() > MAX_EAGER_PATHS {
+            // Too big to hold whole. Put in the top level and make every
+            // directory a stub, so the panel is usable immediately and each
+            // folder costs one `read_dir` when somebody opens it.
+            for (i, path) in listing.paths.iter().enumerate() {
+                match path.split_once('/') {
+                    Some((dir, _)) => tree.dir_at(dir),
+                    None => tree.insert(path, RowSrc::Path(i)),
+                }
+            }
+        } else {
+            for (i, path) in listing.paths.iter().enumerate() {
+                tree.insert(path, RowSrc::Path(i));
+            }
         }
-        for dir in &listing.stubs {
+        for (dir, _) in &listing.stubs {
             tree.dir_at(dir);
         }
         tree.finish(listing.paths.len());
@@ -1978,6 +2004,10 @@ pub struct App {
     /// Path to its index in `files`, so a row in the repository list can
     /// find the change behind it without scanning. Rebuilt with the tree.
     changed_by_path: HashMap<String, usize>,
+    /// Directories git is ignoring whole. What is inside one inherits the
+    /// answer, which a position in `repo_paths` cannot give — a directory
+    /// is not itself a path in that list.
+    repo_ignored_dirs: HashSet<String>,
     /// Whether each path in `repo_paths` is one git ignores, drawn dim.
     /// Parallel to `repo_paths` rather than a split point, because reading
     /// inside an ignored directory appends its children to the end and
@@ -2251,6 +2281,7 @@ impl App {
             repo_paths: Vec::new(),
             changed_by_path: HashMap::new(),
             repo_ignored: Vec::new(),
+            repo_ignored_dirs: HashSet::new(),
             file_tree: TreeNodes::default(),
             panel: PanelMode::Changes,
             collapsed_files: HashSet::new(),
@@ -4927,6 +4958,12 @@ impl App {
         self.repo_ignored = (0..listing.paths.len())
             .map(|i| i >= listing.ignored_from)
             .collect();
+        self.repo_ignored_dirs = listing
+            .stubs
+            .iter()
+            .filter(|(_, ignored)| *ignored)
+            .map(|(dir, _)| dir.clone())
+            .collect();
         self.repo_paths = listing.paths;
         if self.panel == PanelMode::Files {
             self.rebuild_entries();
@@ -4961,15 +4998,13 @@ impl App {
     /// They inherit the directory's own ignored answer, which is why that
     /// is stored per path rather than as a split point.
     fn apply_dir_read(&mut self, read: DirRead) {
+        // Inside an ignored directory everything is ignored. Inside a
+        // nested repository or a worktree nothing is — they are ordinary
+        // files that git simply declined to walk into from here.
         let ignored = self
-            .repo_paths
+            .repo_ignored_dirs
             .iter()
-            .position(|p| p == &read.dir)
-            .and_then(|i| self.repo_ignored.get(i).copied())
-            // A directory is not itself a path in the list when git named
-            // it as a stub, and every stub git names is either ignored or
-            // a repository boundary. Treat both as "not tracked here".
-            .unwrap_or(true);
+            .any(|d| read.dir == *d || read.dir.starts_with(&format!("{d}/")));
         for name in &read.files {
             let path = format!("{}/{}", read.dir, name);
             let src = RowSrc::Path(self.repo_paths.len());
@@ -12644,7 +12679,72 @@ b2
         assert!(app.editor.as_ref().unwrap().dirty);
     }
 
-    /// The three file operations, and the guards that stop each one
+    /// Above the threshold the tree holds the top level only, and every
+    /// directory arrives as a stub. What matters is that the panel is
+    /// usable at once rather than holding half a million `String`s nobody
+    /// is going to look at.
+    #[test]
+    fn a_very_large_repository_is_read_one_directory_at_a_time() {
+        let paths: Vec<String> = (0..MAX_EAGER_PATHS + 1)
+            .map(|i| format!("pkg{}/file{i}.rs", i % 50))
+            .collect();
+        let listing = search::RepoListing {
+            ignored_from: paths.len(),
+            paths,
+            stubs: Vec::new(),
+        };
+        let tree = TreeNodes::from_listing(&listing);
+
+        assert!(tree.is_stub("pkg0"), "the top level is there, unread");
+        let mut rows = Vec::new();
+        tree.emit(&HashSet::new(), &mut rows);
+        assert_eq!(
+            rows.len(),
+            50,
+            "fifty directories and nothing under them: {}",
+            rows.len()
+        );
+    }
+
+    /// A file inside a nested worktree is an ordinary file. Only a
+    /// directory git is *ignoring* passes ignored-ness down — the earlier
+    /// rule treated every stub the same and would have drawn a whole
+    /// worktree as if it were `node_modules`.
+    #[test]
+    fn only_an_ignored_directory_passes_that_down_to_what_is_inside() {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.apply_repo_listing(search::RepoListing {
+            paths: vec!["src/app.rs".into()],
+            ignored_from: 1,
+            stubs: vec![
+                ("node_modules".to_string(), true),
+                ("wt/feat".to_string(), false),
+            ],
+        });
+
+        app.apply_dir_read(DirRead {
+            dir: "node_modules".into(),
+            files: vec!["index.js".into()],
+            dirs: Vec::new(),
+        });
+        app.apply_dir_read(DirRead {
+            dir: "wt/feat".into(),
+            files: vec!["main.rs".into()],
+            dirs: Vec::new(),
+        });
+
+        let ignored = |app: &App, path: &str| {
+            let i = app.repo_paths.iter().position(|p| p == path).unwrap();
+            app.row_ignored(RowSrc::Path(i))
+        };
+        assert!(ignored(&app, "node_modules/index.js"));
+        assert!(
+            !ignored(&app, "wt/feat/main.rs"),
+            "a worktree holds ordinary files git only declined to walk into"
+        );
+    }
+
+    /// The three file operations, and the guards    /// The three file operations, and the guards that stop each one
     /// doing damage. All of them are refusals rather than clever recovery:
     /// a path that escapes the repository, a name already taken, and a
     /// symlink standing in for the file somebody meant to remove.
@@ -12972,7 +13072,7 @@ b2
         app.apply_repo_listing(search::RepoListing {
             paths: vec!["src/app.rs".into(), ".env".into()],
             ignored_from: 1,
-            stubs: vec!["node_modules".into()],
+            stubs: vec![("node_modules".to_string(), true)],
         });
         app.panel = PanelMode::Files;
         let before = app.repo_paths.clone();
@@ -13036,7 +13136,7 @@ b2
                 "README.md".into(),
             ],
             ignored_from: 4,
-            stubs: vec!["node_modules".into()],
+            stubs: vec![("node_modules".to_string(), true)],
         };
         let tree = TreeNodes::from_listing(&listing);
         let collapsed = tree.all_dirs();

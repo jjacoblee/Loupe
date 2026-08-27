@@ -290,10 +290,12 @@ pub struct RepoListing {
     /// index are drawn dim: git is ignoring them, and a reader should see
     /// that before opening one.
     pub ignored_from: usize,
-    /// Directories git would not walk into — a nested repository, a linked
-    /// worktree inside the clone, or a directory whose contents are all
-    /// ignored. Each costs one row until it is expanded.
-    pub stubs: Vec<String>,
+    /// Directories git would not walk into, and whether each is one it is
+    /// ignoring. A nested repository or a linked worktree inside the clone
+    /// is *not* ignored — its contents are ordinary files — while
+    /// `node_modules` is. The row that reads a stub needs to know which,
+    /// or everything inside a worktree comes back drawn as ignored.
+    pub stubs: Vec<(String, bool)>,
 }
 
 /// Both halves of the listing, for the file tree.
@@ -307,10 +309,10 @@ pub fn list_repo(root: &Path) -> Result<RepoListing> {
     let mut paths = tracked.files;
     let ignored_from = paths.len();
     paths.extend(ignored.files);
-    let mut stubs = tracked.stubs;
-    stubs.extend(ignored.stubs);
+    let mut stubs: Vec<(String, bool)> = tracked.stubs.into_iter().map(|d| (d, false)).collect();
+    stubs.extend(ignored.stubs.into_iter().map(|d| (d, true)));
     stubs.sort();
-    stubs.dedup();
+    stubs.dedup_by(|a, b| a.0 == b.0);
     Ok(RepoListing {
         paths,
         ignored_from,
@@ -1097,8 +1099,11 @@ mod tests {
             listing.paths
         );
         assert!(
-            listing.stubs.contains(&"node_modules".to_string()),
-            "it came back as one directory instead: {:?}",
+            listing
+                .stubs
+                .iter()
+                .any(|(d, ignored)| d == "node_modules" && *ignored),
+            "it came back as one ignored directory instead: {:?}",
             listing.stubs
         );
 
