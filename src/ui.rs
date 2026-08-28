@@ -4124,6 +4124,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             ("click a tab / its ✕", "open it / unpin it"),
             ("Alt+ the same keys", "from inside the editor"),
         ),
+        row(
+            ("Ctrl+-", "back to the file you were reading"),
+            ("Ctrl+=", "forward again"),
+        ),
         Line::from(""),
         Line::from(Span::styled("Find", head)),
         row(

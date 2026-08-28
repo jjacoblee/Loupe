@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A tab clicked from a rendered document dropped to the diff.** The
+  file panel has always followed one rule — switch to another markdown
+  file while a document is on screen and you get that file's document —
+  and a pinned tab followed it too. The tab row did not: it put the diff
+  up instead, so reading a set of plan files meant pressing `P` again
+  between every pair, or leaving the tab row alone and using the file
+  panel. All three doors now answer the same way, and a file loupe
+  cannot render still drops to its diff, because there is nothing to
+  render. The document also stays up while the next file is read, so the
+  pane no longer blinks between them.
+
 - **A narrow file panel could not get back to the change.** The panel's
   button row drops buttons it has no room for, and it drops them from the
   left — where `Change` sits, the one section everybody comes back to. At
@@ -21,6 +32,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one place, so a fifth section cannot reintroduce the gap.
 
 ### Added
+
+- **Back to the file you were reading, on `Ctrl+-`.** `Ctrl+-` steps back
+  through the files you have read and `Ctrl+=` steps forward again, from
+  the diff, the editor, a rendered document or the review box. A place
+  is a file *and* how you were reading it, so `P` and then `Ctrl+-` puts
+  the diff back under the document rather than leaving the file. The
+  trail is written from what the pane is showing rather than by each
+  door, so a file that arrives by a tab, a pin, the file panel, the
+  finder, a jump to a definition or a drop on the window is on it the
+  same way. Opening a file that is not the one the forward step held
+  throws the forward half away, the way a browser does, and a step onto
+  a file that is no longer open steps past it instead of stopping there.
+
+  Loupe now asks the terminal to report the modifier on a key that is
+  not a letter (the kitty keyboard protocol, disambiguation only).
+  Without it `Ctrl+-` arrives as one byte that says nothing about the
+  minus and `Ctrl+=` does not arrive at all. A terminal that does not
+  know the request ignores it and keeps reading keys the way it did.
 
 - **Stacked pull requests, drawn as the ladder they are.** GitHub's
   stacked pull requests chain small changes onto each other, each

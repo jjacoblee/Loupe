@@ -237,6 +237,12 @@ leaving your terminal or touching a browser.
   `Alt+[` step between them, and coming back to one finds the cursor,
   the scroll and any unsaved edits exactly where you left them. `q` says
   how many are unsaved before it takes them.
+- **Back to the file you were reading** — `Ctrl+-` walks back through
+  the files you have read and `Ctrl+=` walks forward again, from the
+  diff, the editor or a rendered document. Loupe remembers the door you
+  came through and the way you were reading the file, so a step back
+  from a document lands on the diff under it rather than on another
+  file.
 - **Fast and non-blocking** — every fetch runs in the background with a
   cancellable spinner; idle CPU is ~zero; PR content is treated as
   untrusted input throughout.

@@ -1346,6 +1346,27 @@ pub fn is_find_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
+/// Whether this key means "back to the file I was reading", or "forward
+/// again".
+///
+/// `Ctrl+-` and `Ctrl+=` are the keys, and a terminal has more than one
+/// way of spelling them. One that speaks the kitty keyboard protocol
+/// sends the character with the modifier still on it. One that does not
+/// sends `Ctrl+-` as the single byte `0x1F`, which crossterm reads as
+/// `Ctrl+7`, and has no way at all to say `Ctrl+=` — which is why loupe
+/// asks for the protocol at startup. Shift is ignored, because `Ctrl++`
+/// is `Ctrl+Shift+=` on most keyboards.
+pub fn history_key(key: KeyEvent) -> Option<bool> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Char('7') => Some(true),
+        KeyCode::Char('=') | KeyCode::Char('+') => Some(false),
+        _ => None,
+    }
+}
+
 /// The same key with shift: find across every file, rather than in this
 /// one. It is the other half of the pair every editor has.
 pub fn is_find_all_key(key: KeyEvent) -> bool {
@@ -2279,6 +2300,29 @@ pub struct BufferTab {
     pub peek: bool,
 }
 
+/// One of the three ways loupe can show a file.
+///
+/// The reader's trail is a trail of these rather than of paths: the same
+/// file read as a diff and read as a document are two different places,
+/// and stepping back from one has to land on the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisitView {
+    Diff,
+    Source,
+    Document,
+}
+
+/// One place the pane has been: a file, and how it was shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Visit {
+    pub path: String,
+    pub view: VisitView,
+}
+
+/// How many places back the trail remembers. Long enough to walk a whole
+/// review and come back, short enough that it costs nothing.
+const HISTORY_MAX: usize = 100;
+
 /// One place a symbol is used, with the source line to show for it.
 pub struct Place {
     loc: lsp::Loc,
@@ -2755,6 +2799,16 @@ pub struct App {
     /// Set while a pinned tab loads a file the change touches: the tab
     /// wants the rendered document, and the file has to land first.
     pin_wants_preview: bool,
+    /// Every place the pane has been, oldest first, and where in it the
+    /// reader is standing. `Ctrl+-` walks back along it and `Ctrl+=`
+    /// walks forward again; opening a file that is not the next one
+    /// throws the forward half away, the way a browser does.
+    history: Vec<Visit>,
+    history_at: usize,
+    /// The place a back or forward step asked for, while the file it
+    /// names is still being read. Nothing is recorded until it lands:
+    /// the pane is still showing where the reader stepped from.
+    history_want: Option<Visit>,
     pub overlay: Overlay,
 
     pub status: String,
@@ -3021,6 +3075,9 @@ impl App {
             preview_only: false,
             pins: Pins::default(),
             pin_wants_preview: false,
+            history: Vec::new(),
+            history_at: 0,
+            history_want: None,
             overlay: Overlay::None,
             status: String::new(),
             status_err: false,
@@ -3449,6 +3506,12 @@ impl App {
     /// Apply any finished background work. Called every main-loop tick.
     /// Returns true when something was applied and a redraw is needed.
     pub fn poll_jobs(&mut self) -> bool {
+        let changed = self.take_results();
+        self.note_visit();
+        changed
+    }
+
+    fn take_results(&mut self) -> bool {
         let mut changed = false;
         // Viewed-state syncs: report failures, revert the optimistic flip.
         let mut i = 0;
@@ -7093,7 +7156,17 @@ impl App {
 
     // ----------------------------------------------------------------- keys
 
+    /// One key, and then a note of where it left the reader.
+    ///
+    /// The trail is written here rather than by each door, so a file that
+    /// arrives through a door nobody thought about is still on it. See
+    /// [`Self::note_visit`].
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.key_pressed(key);
+        self.note_visit();
+    }
+
+    fn key_pressed(&mut self, key: KeyEvent) {
         self.last_input = Instant::now();
         // Arming is for the very next key, not for later. Anything but a
         // second `q` puts the guard back.
@@ -7425,6 +7498,14 @@ impl App {
                 return;
             }
             Overlay::None => {}
+        }
+
+        // Back and forward along the trail, from anywhere — a text box
+        // included, for the reason the tab row is answered here: the keys
+        // hold a modifier, so no letter is taken away from anybody.
+        if let Some(back) = history_key(key) {
+            self.step_history(back);
+            return;
         }
 
         // The tab row, from anywhere — a text box included, which is why
@@ -8072,6 +8153,11 @@ impl App {
     // ---------------------------------------------------------------- mouse
 
     pub fn handle_mouse(&mut self, m: MouseEvent) {
+        self.mouse_event(m);
+        self.note_visit();
+    }
+
+    fn mouse_event(&mut self, m: MouseEvent) {
         self.last_input = Instant::now();
         let (x, y) = (m.column, m.row);
 
@@ -13146,6 +13232,11 @@ impl App {
     /// every token is an absolute path to a file that exists is a drop,
     /// and anything else is text (see [`crate::pins::dropped_paths`]).
     pub fn handle_paste(&mut self, text: String) {
+        self.pasted(text);
+        self.note_visit();
+    }
+
+    fn pasted(&mut self, text: String) {
         self.last_input = Instant::now();
         // A drop is answered even while a job is running. Pinning costs
         // nothing, and a file dropped on the window must not vanish
@@ -13742,8 +13833,20 @@ impl App {
         let Some(path) = self.buffer_tabs().get(i).map(|t| t.path.clone()) else {
             return;
         };
+        // A tab clicked while a document is on screen means "read that
+        // one", when the file it names is one loupe can render. The file
+        // panel has always followed that rule and a pinned tab follows it
+        // too; the tab row dropped to the diff instead, which made it the
+        // one door out of a document that did not do what it was asked.
+        let doc = self.preview.is_some() && markdown::is_markdown(&path);
         if self.switch_buffer(&path) {
             self.preview = None;
+            if doc {
+                // Rendered from the buffer's own text, so unsaved work is
+                // what the reader sees rather than the older file on disk.
+                self.source_to_preview();
+                return;
+            }
             self.ok(format!("{path} — {} open.", self.tab_order.len()));
             return;
         }
@@ -13752,6 +13855,10 @@ impl App {
             // document over it stand down.
             self.editor = None;
             self.preview = None;
+            if doc {
+                self.preview_current_file();
+                return;
+            }
             self.ok(format!("{path} — {} open.", self.tab_order.len()));
             return;
         }
@@ -13760,7 +13867,12 @@ impl App {
         // between the wrong two versions. Read this one again.
         if let Some(idx) = self.files.iter().position(|f| f.path == path) {
             self.editor = None;
-            self.preview = None;
+            // The document stays up while the file is read — the pane
+            // never blinks — and `Outcome::FileLoaded` keeps it only when
+            // the file that lands can be rendered too.
+            if !doc {
+                self.preview = None;
+            }
             self.spawn_load_file(idx);
         }
     }
@@ -13830,6 +13942,175 @@ impl App {
             .unwrap_or(0) as i32;
         let next = (at + delta).rem_euclid(n as i32) as usize;
         self.open_buffer_at(next);
+    }
+
+    // ------------------------------------------------- back and forward
+
+    /// What the pane is showing now, as the trail remembers it.
+    ///
+    /// Derived rather than stored, and for the reason [`Self::peek_path`]
+    /// is: a file arrives in front of the reader through two dozen
+    /// different doors — a tab, a pin, the file panel, the finder, a
+    /// drop, a jump to a definition — and a trail every one of them had
+    /// to remember to write to would be a trail with holes in it.
+    fn here(&self) -> Option<Visit> {
+        if let Some(pv) = &self.preview {
+            return Some(Visit {
+                path: pv.path.clone(),
+                view: VisitView::Document,
+            });
+        }
+        if let Some(ed) = &self.editor {
+            return Some(Visit {
+                path: ed.path.clone(),
+                view: VisitView::Source,
+            });
+        }
+        self.diff_path().map(|p| Visit {
+            path: p.to_string(),
+            view: VisitView::Diff,
+        })
+    }
+
+    /// Write down where the reader is, if they have moved since last time.
+    ///
+    /// Called after every event and after every job lands, so no door has
+    /// to know the trail exists.
+    fn note_visit(&mut self) {
+        let Some(here) = self.here() else { return };
+        if let Some(want) = &self.history_want {
+            if *want == here {
+                // The step landed. This is already the place the trail
+                // says the reader is standing on, so nothing is written.
+                self.history_want = None;
+                return;
+            }
+            // The file the step asked for is still being read; the pane
+            // is showing where the reader came from.
+            if self.job.is_some() || self.quiet.is_some() {
+                return;
+            }
+            // It never arrived, and the reader is somewhere else. Take
+            // the trail from where they actually are.
+            self.history_want = None;
+        }
+        if self.history.get(self.history_at) == Some(&here) {
+            return;
+        }
+        // Somewhere new: everything ahead of here is a road not taken.
+        self.history.truncate(self.history_at + 1);
+        self.history.push(here);
+        if self.history.len() > HISTORY_MAX {
+            self.history.drain(..self.history.len() - HISTORY_MAX);
+        }
+        self.history_at = self.history.len() - 1;
+    }
+
+    /// `Ctrl+-` and `Ctrl+=`: one step back along the trail, or forward
+    /// again.
+    ///
+    /// A place whose file is no longer reachable — closed, unpinned, or
+    /// dropped by a re-scan — is taken out of the trail and stepped past,
+    /// so one dead file never blocks the way back.
+    pub fn step_history(&mut self, back: bool) {
+        loop {
+            let next = if back {
+                if self.history_at == 0 {
+                    break;
+                }
+                self.history_at - 1
+            } else {
+                if self.history_at + 1 >= self.history.len() {
+                    break;
+                }
+                self.history_at + 1
+            };
+            let want = self.history[next].clone();
+            if self.open_visit(&want) {
+                self.history_at = next;
+                self.history_want = Some(want);
+                return;
+            }
+            self.history.remove(next);
+            if self.history_at > next {
+                self.history_at -= 1;
+            }
+        }
+        if back {
+            self.err("Nothing further back — Ctrl+- walks the files you have read.");
+        } else {
+            self.err("Nothing further forward — Ctrl+- goes back first.");
+        }
+    }
+
+    /// Put one place back in front of the reader. False when the file it
+    /// names cannot be reached any more.
+    ///
+    /// Every arm goes through a door that already exists, so a step back
+    /// costs the reader nothing they would not have got by opening the
+    /// file themselves: a parked diff keeps its scroll and its folds, and
+    /// a parked buffer keeps its unsaved text.
+    fn open_visit(&mut self, want: &Visit) -> bool {
+        match want.view {
+            VisitView::Document => self.open_visit_document(want),
+            VisitView::Source => {
+                if !self.switch_buffer(&want.path) {
+                    return false;
+                }
+                self.preview = None;
+                self.ok(format!("✎ {}", want.path));
+                true
+            }
+            VisitView::Diff => {
+                // Nothing on screen changes until there is something to
+                // put in its place: a step that cannot be taken has to
+                // leave the reader where they were, not in an empty pane.
+                if self.switch_diff(&want.path) {
+                    self.editor = None;
+                    self.preview = None;
+                    self.ok(want.path.clone());
+                    return true;
+                }
+                let Some(i) = self.files.iter().position(|f| f.path == want.path) else {
+                    return false;
+                };
+                self.editor = None;
+                self.preview = None;
+                self.spawn_load_file(i);
+                true
+            }
+        }
+    }
+
+    /// The document half of [`Self::open_visit`], which has three doors
+    /// of its own: a file in the change, a pinned file, and a buffer.
+    fn open_visit_document(&mut self, want: &Visit) -> bool {
+        if let Some(i) = self.files.iter().position(|f| f.path == want.path) {
+            self.park_active();
+            // Its diff is in hand — it is the file under the cursor, or a
+            // parked tab — so the document is built here and now.
+            if self.switch_diff(&want.path) {
+                self.preview = None;
+                self.preview_current_file();
+                return self.preview.is_some();
+            }
+            // It has to be read. The flag is what makes the pane come
+            // back as a document rather than as a diff, and it is read
+            // when the file lands.
+            self.pin_wants_preview = true;
+            self.spawn_load_file(i);
+            return true;
+        }
+        if let Some(i) = self.pinned_at(&want.path) {
+            self.open_pin(i);
+            return self.preview.is_some();
+        }
+        if self.switch_buffer(&want.path) {
+            self.preview = None;
+            self.source_to_preview();
+            return self.preview.is_some();
+        }
+        false
     }
 
     // ----------------------------------------------------- appearance
@@ -16004,6 +16285,260 @@ b2
         );
         assert_eq!(app.active_pin(), Some(0));
         std::fs::remove_dir_all(doc.parent().unwrap()).ok();
+    }
+
+    // ------------------------------------------- back and forward
+
+    /// A file with its diff already read, parked the way switching away
+    /// from it would have parked it.
+    fn park_read(app: &mut App, path: &str, text: &str) {
+        app.parked_diffs.push(DiffTab {
+            path: path.to_string(),
+            theme_gen: app.theme_gen,
+            open_commit: None,
+            conflict: None,
+            diff: Some(FileDiff::compute(Some(text), Some(text))),
+            expanded_folds: HashSet::new(),
+            old_content: Some(text.to_string()),
+            new_content: Some(text.to_string()),
+            old_hl: Vec::new(),
+            new_hl: Vec::new(),
+            differs_from_head: false,
+            diff_scroll: 0,
+            diff_cursor: 0,
+            diff_hscroll: 0,
+            selection: None,
+        });
+    }
+
+    const TRAIL_PLAN: &str = "# The plan\n\nin the changeset\n";
+    const TRAIL_NOTES: &str = "# Notes\n\nbeside it\n";
+    const TRAIL_SRC: &str = "fn main() {}\n";
+
+    /// A local review of three changed files with every diff already in
+    /// hand, so stepping between them is a swap rather than a read.
+    /// PLAN.md is the file on screen and the other two are parked tabs.
+    fn trail_app(dir: &std::path::Path) -> App {
+        let mut app = App::new(LaunchMode::Local, None);
+        app.screen = Screen::Review;
+        app.local = true;
+        app.checked_out = true;
+        app.repo_root = dir.to_path_buf();
+        app.files = vec![cf("PLAN.md"), cf("NOTES.md"), cf("src/main.rs")];
+        app.rebuild_files();
+        std::fs::create_dir_all(dir.join("src")).expect("scratch src");
+        std::fs::write(dir.join("PLAN.md"), TRAIL_PLAN).expect("fixture written");
+        std::fs::write(dir.join("NOTES.md"), TRAIL_NOTES).expect("fixture written");
+        std::fs::write(dir.join("src/main.rs"), TRAIL_SRC).expect("fixture written");
+        app.new_content = Some(TRAIL_PLAN.to_string());
+        app.diff = Some(FileDiff::compute(Some(TRAIL_PLAN), Some(TRAIL_PLAN)));
+        app.file_cursor = 0;
+        app.rebuild_display();
+        app.tab_order = vec!["PLAN.md".into(), "NOTES.md".into(), "src/main.rs".into()];
+        park_read(&mut app, "NOTES.md", TRAIL_NOTES);
+        park_read(&mut app, "src/main.rs", TRAIL_SRC);
+        // The loop notes where the reader is standing before it reads a
+        // key, so the first place is on the trail like every other.
+        app.poll_jobs();
+        app
+    }
+
+    /// Click the tab that holds `path`, the way the reader does: draw the
+    /// row, read the click target the draw recorded, press the mouse on
+    /// it. The row is rebuilt on every draw, so this is the only honest
+    /// way to say "the reader clicked that tab".
+    fn click_tab(app: &mut App, path: &str) {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let i = app
+            .buffer_tabs()
+            .iter()
+            .position(|t| t.path == path)
+            .unwrap_or_else(|| panic!("no tab for {path}"));
+        let mut term = Terminal::new(TestBackend::new(120, 24)).expect("a test terminal");
+        term.draw(|f| crate::ui::draw(f, app)).expect("a frame");
+        let (rect, _) = app
+            .layout
+            .buttons
+            .iter()
+            .find(|(_, id)| matches!(id, ButtonId::BufferTab(n) if *n == i))
+            .cloned()
+            .unwrap_or_else(|| panic!("no click target for {path}"));
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    /// Walk three files, then walk back along them. `Ctrl+-` is the step
+    /// back and `Ctrl+=` is the step forward again.
+    #[test]
+    fn ctrl_minus_walks_back_along_the_files_read() {
+        let dir = TempDir::new("trail-back");
+        let mut app = trail_app(&dir.0);
+        assert_eq!(app.diff_path(), Some("PLAN.md"));
+
+        click_tab(&mut app, "NOTES.md");
+        assert_eq!(app.diff_path(), Some("NOTES.md"));
+        click_tab(&mut app, "src/main.rs");
+        assert_eq!(app.diff_path(), Some("src/main.rs"));
+
+        app.handle_key(ctrl(KeyCode::Char('-')));
+        assert_eq!(app.diff_path(), Some("NOTES.md"), "one step back");
+        app.handle_key(ctrl(KeyCode::Char('-')));
+        assert_eq!(app.diff_path(), Some("PLAN.md"), "and one more");
+
+        app.handle_key(ctrl(KeyCode::Char('=')));
+        assert_eq!(app.diff_path(), Some("NOTES.md"), "forward again");
+    }
+
+    /// Each end of the trail says so rather than doing nothing.
+    #[test]
+    fn the_ends_of_the_trail_say_so() {
+        let dir = TempDir::new("trail-ends");
+        let mut app = trail_app(&dir.0);
+
+        app.handle_key(ctrl(KeyCode::Char('-')));
+        assert!(app.status_err, "the start of the trail: {}", app.status);
+        assert!(app.status.contains("Nothing further back"));
+        assert_eq!(app.diff_path(), Some("PLAN.md"), "and nothing moved");
+
+        app.handle_key(ctrl(KeyCode::Char('=')));
+        assert!(
+            app.status.contains("Nothing further forward"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// A file opened after stepping back throws the forward half of the
+    /// trail away, the way a browser does.
+    #[test]
+    fn a_new_file_throws_the_forward_half_away() {
+        let dir = TempDir::new("trail-fork");
+        let mut app = trail_app(&dir.0);
+        click_tab(&mut app, "NOTES.md");
+        assert_eq!(app.diff_path(), Some("NOTES.md"));
+        app.handle_key(ctrl(KeyCode::Char('-')));
+        assert_eq!(app.diff_path(), Some("PLAN.md"));
+
+        // Somewhere that is not the file the forward step held.
+        click_tab(&mut app, "src/main.rs");
+        assert_eq!(app.diff_path(), Some("src/main.rs"));
+
+        app.handle_key(ctrl(KeyCode::Char('=')));
+        assert!(
+            app.status.contains("Nothing further forward"),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.diff_path(), Some("src/main.rs"), "and nothing moved");
+
+        // The way back is the road actually taken.
+        app.handle_key(ctrl(KeyCode::Char('-')));
+        assert_eq!(app.diff_path(), Some("PLAN.md"));
+    }
+
+    /// One file read as a diff and read as a document is two places, so
+    /// the step back from the document lands on the diff of the same file.
+    #[test]
+    fn the_trail_tells_a_document_from_its_diff() {
+        let dir = TempDir::new("trail-doc");
+        let mut app = trail_app(&dir.0);
+        app.handle_key(key(KeyCode::Char('P')));
+        assert!(app.previewing(), "the document is on screen");
+
+        app.handle_key(ctrl(KeyCode::Char('-')));
+        assert!(!app.previewing(), "back to the diff");
+        assert_eq!(app.diff_path(), Some("PLAN.md"), "of the same file");
+
+        app.handle_key(ctrl(KeyCode::Char('=')));
+        assert!(app.previewing(), "and forward to the document again");
+    }
+
+    /// A step back onto a document whose diff is a parked tab rebuilds
+    /// the document rather than putting the parked diff up.
+    #[test]
+    fn a_step_back_onto_a_document_rebuilds_it() {
+        let dir = TempDir::new("trail-doc-parked");
+        let mut app = trail_app(&dir.0);
+        click_tab(&mut app, "NOTES.md");
+        app.handle_key(key(KeyCode::Char('P')));
+        let pv = app.preview.as_ref().expect("the notes as a document");
+        assert!(pv.src.contains("beside it"));
+
+        click_tab(&mut app, "PLAN.md");
+        let pv = app.preview.as_ref().expect("still a document");
+        assert!(pv.src.contains("in the changeset"), "{}", pv.src);
+
+        app.handle_key(ctrl(KeyCode::Char('-')));
+
+        let pv = app.preview.as_ref().expect("a document again");
+        assert!(
+            pv.src.contains("beside it"),
+            "and the one the step named: {}",
+            pv.src
+        );
+    }
+
+    /// The spellings a terminal has for the two keys. `Ctrl+-` arrives as
+    /// `Ctrl+7` on a terminal that does not speak the kitty protocol, and
+    /// `Ctrl++` is `Ctrl+Shift+=` on most keyboards.
+    #[test]
+    fn the_trail_keys_are_read_in_every_spelling() {
+        for c in ['-', '_', '7'] {
+            assert_eq!(history_key(ctrl(KeyCode::Char(c))), Some(true), "Ctrl+{c}");
+        }
+        for c in ['=', '+'] {
+            assert_eq!(history_key(ctrl(KeyCode::Char(c))), Some(false), "Ctrl+{c}");
+        }
+        let shifted = KeyEvent::new(
+            KeyCode::Char('+'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(history_key(shifted), Some(false), "shift is ignored");
+        // Bare, they belong to the tab row.
+        assert_eq!(history_key(key(KeyCode::Char('-'))), None);
+        assert_eq!(history_key(key(KeyCode::Char('='))), None);
+    }
+
+    /// Reading one document and clicking the tab of another markdown file
+    /// gives that file's document. The tab dropped to the diff instead,
+    /// which left the file panel as the only way to walk a set of plan
+    /// files without leaving the reading view between each pair.
+    #[test]
+    fn a_tab_from_a_document_opens_the_next_document() {
+        let dir = TempDir::new("tab-doc-to-doc");
+        let mut app = trail_app(&dir.0);
+        app.handle_key(key(KeyCode::Char('P')));
+        let pv = app.preview.as_ref().expect("a document");
+        assert!(pv.src.contains("in the changeset"));
+
+        click_tab(&mut app, "NOTES.md");
+
+        let pv = app.preview.as_ref().expect("still a document");
+        assert!(
+            pv.src.contains("beside it"),
+            "and the one the tab named: {}",
+            pv.src
+        );
+    }
+
+    /// The same click on a file loupe cannot render drops to its diff,
+    /// which is the rule the file panel already follows.
+    #[test]
+    fn a_tab_for_a_source_file_leaves_the_document() {
+        let dir = TempDir::new("tab-doc-to-diff");
+        let mut app = trail_app(&dir.0);
+        app.handle_key(key(KeyCode::Char('P')));
+        assert!(app.previewing());
+
+        click_tab(&mut app, "src/main.rs");
+
+        assert!(!app.previewing(), "the document made way for the diff");
+        assert_eq!(app.diff_path(), Some("src/main.rs"));
     }
 
     /// Every character of `text` as its own key event — what a terminal

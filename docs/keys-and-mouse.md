@@ -22,6 +22,8 @@ for the built-in help overlay.
 | `P` | Render the open markdown file as a document (see [Markdown preview](#markdown-preview)) |
 | `=` | Pin the file in front of you to the tab row, or unpin it (see [Pinned files](#pinned-files)) |
 | `1` … `9` | Open that tab |
+| `Ctrl+-` | Back to the file you were reading before this one (see [Back and forward](#back-and-forward)) |
+| `Ctrl+=` | Forward again |
 | `Ctrl+O` | Open a file by path, from anywhere on the machine |
 | `t` or `☰ → Theme` | Open the theme picker — live preview; Enter keeps & saves, Esc reverts; `a` switches light ⇄ dark |
 | `c` | Cancel a cancellable background load |
@@ -854,6 +856,7 @@ file shows in the tab row under the top bar, after any pinned files.
 | Key / mouse | Action |
 | --- | --- |
 | `Alt+]` / `Alt+[` | Next / previous open file |
+| `Ctrl+-` / `Ctrl+=` | Back / forward through the files you have read (see [Back and forward](#back-and-forward)) |
 | Click a tab | Go to that file |
 | Double-click the peek tab | Keep it, so the next click peeks in its own tab |
 | Drag a tab along the row | Put it where you want it |
@@ -864,6 +867,29 @@ file shows in the tab row under the top bar, after any pinned files.
 A file you have pinned draws no tab here — its pin *is* its tab, and one
 file in the row twice is one file too many. Unpin it and the tab comes
 back.
+
+### Back and forward
+
+`Ctrl+-` goes back to the file you were reading before this one, and
+`Ctrl+=` goes forward again. Both work from anywhere: the diff, the
+editor, a rendered document, and the review box.
+
+Loupe writes down every place the pane has been, whichever door took you
+there — a tab, a pin, the file panel, the finder, a jump to a definition,
+a file dropped on the window. A place is a file *and* how you were
+reading it, so `P` and then `Ctrl+-` puts the diff back under the
+document rather than leaving the file.
+
+Opening a file that is not the one `Ctrl+=` held throws the forward half
+away, the way a browser does. A step back onto a file that is no longer
+open steps past it rather than stopping there, and each end of the trail
+says so in the status line.
+
+> **Note:** `Ctrl+-` and `Ctrl+=` need a terminal that reports the
+> modifier on a key that is not a letter. Loupe asks for that at startup
+> (the kitty keyboard protocol), and every current terminal answers.
+> On one that does not, `Ctrl+-` still goes back and `Ctrl+=` does
+> nothing, because such a terminal has no way to say `Ctrl+=` at all.
 
 **The row keeps the order you opened them in.** Clicking a tab opens that
 file and moves nothing. A drag is the only thing that reorders the row,
@@ -1135,6 +1161,7 @@ Loupe for another app.
 | `]` / `[` | Next / previous file |
 | `Esc` | Clear the search, then back to the diff |
 | Click the file panel | Switch files, the way the diff does |
+| Click a tab | The same — another markdown file opens as a document too |
 
 **Search reads the document, not the markdown.** A heading's `##` and a
 link's brackets are not on the page, so they are not in what you search
@@ -1155,6 +1182,13 @@ idle and re-renders when something else rewrites it, keeping your place
 by source line rather than by row. That is a plan file updating on screen
 as an agent writes it. Unsaved text in the source view is never
 overwritten this way.
+
+**Switching files keeps the document.** Click another markdown file — in
+the file panel or in the tab row — and you get its document, not its
+diff. Click a file loupe cannot render and the pane drops to the diff,
+because there is nothing to render. That is one rule for both doors, so
+you can read a set of plan files end to end without pressing `P` between
+each pair.
 
 The blame pane stands down while the preview is open — one source line is
 any number of rendered rows there, or none — and comes back with the

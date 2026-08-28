@@ -25,6 +25,7 @@ use anyhow::Result;
 use app::{App, LaunchMode, Layers};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use std::io::stdout;
@@ -734,7 +735,12 @@ fn run_tui(startup: Startup) -> Result<()> {
     // mouse capture on top and make sure it is torn down too.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
+        let _ = execute!(
+            stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         default_hook(info);
     }));
 
@@ -752,6 +758,24 @@ fn run_tui(startup: Startup) -> Result<()> {
     // A terminal that does not support it simply ignores the request, and
     // `Ctrl+O` is the way in for the reader who lands there.
     let _ = execute!(stdout(), EnableBracketedPaste);
+    // Ask the terminal to report the modifier on a key that is not a
+    // letter. Without it `Ctrl+-` arrives as one byte that says nothing
+    // about the minus, and `Ctrl+=` does not arrive at all — so `Ctrl+-`
+    // and `Ctrl+=`, which walk back and forward through the files the
+    // reader has read, would work on no terminal at all.
+    //
+    // Only the one flag. Reporting key *releases* as well would double
+    // every keystroke, and reporting the text of a key would change what
+    // every other binding sees.
+    //
+    // Asked for rather than negotiated: a terminal that does not know
+    // this sequence ignores it and loupe reads keys the way it always
+    // did, while asking the terminal whether it knows it costs two
+    // seconds of startup on every terminal that answers nothing.
+    let _ = execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
 
     let result = (|| {
         if startup.wizard {
@@ -763,7 +787,12 @@ fn run_tui(startup: Startup) -> Result<()> {
         run(&mut terminal, startup)
     })();
 
-    let _ = execute!(stdout(), DisableMouseCapture, DisableBracketedPaste);
+    let _ = execute!(
+        stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     result
 }
