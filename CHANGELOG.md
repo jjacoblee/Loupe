@@ -7,7 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A narrow file panel could not get back to the change.** The panel's
+  button row drops buttons it has no room for, and it drops them from the
+  left — where `Change` sits, the one section everybody comes back to. At
+  the default width of 34 columns a fourth button (the stack) is one
+  column too many, so `Change` went, and the `☰` menu had no line for it
+  either: its three panel lines were Files, Commits and Stack. There was
+  no way back to the change but `F`. Now a row with no room for a button
+  each collapses into one `▾` that names where you are and opens every
+  section, and the `☰` menu carries the same list. Both are built from
+  one place, so a fifth section cannot reintroduce the gap.
+
 ### Added
+
+- **Stacked pull requests, drawn as the ladder they are.** GitHub's
+  stacked pull requests chain small changes onto each other, each
+  targeting the branch below it. Open one and the badge says which rung
+  you are on — `PR #43 · 2/3` — and a click on it turns the file panel
+  into the chain: newest on top, the trunk at the foot, `▶` on the one
+  you are reading, and a mark per link for merged, closed, draft,
+  approved or changes-requested. Click a rung to review it, through the
+  same *check out / review only* prompt the pull request list uses,
+  or walk the chain from the diff with `Alt+↑` and `Alt+↓` — the two
+  directions `gh stack up` and `gh stack down` name,
+  because moving up a stack usually rewrites the working tree. The status
+  line names what the open link rests on, which is both the branch its
+  diff is read against and the pull request that has to land first. The
+  chain is re-read on every refresh — a stack changes under you when
+  somebody merges the link below yours — and the panel hands itself back
+  if the chain goes away. Read straight from the GitHub API rather than
+  from the `gh stack` extension, so it is there whether or not that is
+  installed; a server that has never heard of stacks answers "not
+  stacked" and nothing else changes. Each link's diff was already its own
+  work rather than the chain's: loupe reads every diff between the two
+  refs the pull request names, and for a stacked one the base is the
+  branch below.
 
 - **Three layers of your own change, in three colours (`s`).** A branch
   has two steps in it, not one: what the remote already has, and what you

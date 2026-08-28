@@ -20,7 +20,7 @@ threading model, and the invariants that are easy to break by accident.
 | `preview.rs` | The preview pane: scrolling, the source-line map, reload, and the scrollbar |
 | `pins.rs` | Pinned files: the tab list, the state file, and reading a dropped path out of a paste |
 | `gitops.rs` | Everything that shells out to `git`: local scans, staging, stashes, commits, refs, file content |
-| `github.rs` | Everything that shells out to `gh`: PR lists, details, comments, viewed sync |
+| `github.rs` | Everything that shells out to `gh`: PR lists, details, comments, viewed sync, stacks |
 | `highlight.rs` | Syntax highlighting via syntect + two-face: themes, caching, incremental editor highlighting |
 | `theme.rs` | Light/dark appearance: terminal background detection and the two UI color palettes |
 | `config.rs` | TOML config discovery, parsing, and merging (global + per-repo) |

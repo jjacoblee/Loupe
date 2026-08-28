@@ -52,6 +52,22 @@ The panel is resizable: drag the divider, press `<` / `>`, or
 double-click the divider to reset. A starting width can be set with the
 `file_panel_width` config key.
 
+## Stacked pull requests
+
+A pull request in a [stack](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs)
+shows its rung in the badge — `PR #43 · 2/3` — and the file panel gains a
+`Stack` button that draws the whole chain. Click a rung to review that
+one. The chain is read from the GitHub API, so it works without the
+`gh stack` extension.
+
+A stacked pull request targets the branch below it rather than the
+trunk, so its diff is its own work with everything under it already
+applied. Loupe needed nothing new for that: it reads every diff between
+the two refs the pull request names.
+
+See [the stack panel](keys-and-mouse.md#the-stack) for the ladder, the
+marks, and what Loupe does and does not do to a stack.
+
 ## The diff view
 
 - **Layouts**: side-by-side or inline stacked. Press `v`, or pick

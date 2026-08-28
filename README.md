@@ -61,6 +61,20 @@ leaving your terminal or touching a browser.
   rewrites only that conflict; the last one resolved stages the file so
   git knows it is settled. A conflict git could not write markers for
   (one side deleted the file) resolves whole from the index instead.
+- **Stacked pull requests, as the ladder they are** — GitHub's
+  [stacked PRs](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs)
+  chain small pull requests onto each other. Open one and the badge says
+  which rung you are on — `PR #43 · 2/3` — and a click on it draws the
+  whole chain: newest on top, the trunk at the foot, `▶` on the one you
+  are reading, and a mark per link for merged, closed, draft, approved or
+  changes-requested. Click any rung to review it — or walk the chain from
+  the diff with `Alt+↑` and `Alt+↓`, the two directions `gh stack up` and
+  `gh stack down` name — through the same *check out / review only*
+  prompt the PR list uses. Each link's diff is
+  its own work rather than the chain's, because Loupe already reads every
+  diff between the two refs GitHub names. **No extension required** — the
+  chain is read straight from the API, so it is there whether or not you
+  have `gh stack` installed.
 - **Three layers of your own change, in three colors** — `s` stops the
   diff pretending your branch happened all at once. It reads three
   versions of the file — the base branch, the branch as the remote has it

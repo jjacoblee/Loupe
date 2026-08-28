@@ -677,7 +677,15 @@ fn draw_topbar_review(f: &mut Frame, app: &mut App, area: Rect) {
             .as_ref()
             .map(|p| (p.number, p.title.clone()))
             .unwrap_or((0, String::new()));
-        (format!(" PR #{num} "), p.badge_pr, title, String::new())
+        // In a stack the badge carries the rung: which of how many.
+        // It is the first thing a reviewer needs to know about a stacked
+        // pull request, and the badge is already where they look for
+        // "which pull request is this".
+        let badge = match &app.stack {
+            Some(st) => format!(" PR #{num} · {}/{} ", st.position, st.size),
+            None => format!(" PR #{num} "),
+        };
+        (badge, p.badge_pr, title, String::new())
     };
     // How far the branch has drifted from the branch it tracks. Two short
     // counts, next to the name they are about.
@@ -1005,6 +1013,14 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
             (n, Some(base)) => format!(" Commits ↑{n} {base} "),
             (n, None) => format!(" Commits ↑{n} "),
         }
+    } else if app.panel == crate::app::PanelMode::Stack {
+        match &app.stack {
+            Some(st) => format!(
+                " Stack #{} {}/{} → {} ",
+                st.number, st.position, st.size, st.base_ref_name
+            ),
+            None => " Stack ".to_string(),
+        }
     } else if app.local {
         format!(" Files {viewed_n}/{n} staged ")
     } else {
@@ -1015,6 +1031,11 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
     } else if app.panel == crate::app::PanelMode::Commits {
         // The change's file count would be about the other panel.
         format!(" ◷ {} ", app.commits.len())
+    } else if app.panel == crate::app::PanelMode::Stack {
+        match &app.stack {
+            Some(st) => format!(" {}/{} ", st.position, st.size),
+            None => " Stack ".to_string(),
+        }
     } else {
         format!(" {viewed_n}/{n} ")
     };
@@ -1062,29 +1083,52 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
             width: area.width.saturating_sub(2),
             height: 1,
         };
-        buttons_right(
-            f,
-            app,
-            mode_area,
-            0,
-            &[
-                (
-                    "Change",
-                    ButtonId::PanelChanges,
-                    app.panel == crate::app::PanelMode::Changes,
-                ),
-                (
-                    "Files",
-                    ButtonId::PanelFiles,
-                    app.panel == crate::app::PanelMode::Files,
-                ),
-                (
-                    "Commits",
-                    ButtonId::PanelCommits,
-                    app.panel == crate::app::PanelMode::Commits,
-                ),
-            ],
-        );
+        // The Stack button only exists where there is a stack. Most
+        // pull requests are not in one, and a fourth button that never
+        // does anything would cost every reader the columns.
+        let mut modes = vec![
+            (
+                "Change",
+                ButtonId::PanelChanges,
+                app.panel == crate::app::PanelMode::Changes,
+            ),
+            (
+                "Files",
+                ButtonId::PanelFiles,
+                app.panel == crate::app::PanelMode::Files,
+            ),
+            (
+                "Commits",
+                ButtonId::PanelCommits,
+                app.panel == crate::app::PanelMode::Commits,
+            ),
+        ];
+        if app.stack.is_some() {
+            modes.push((
+                "Stack",
+                ButtonId::PanelStack,
+                app.panel == crate::app::PanelMode::Stack,
+            ));
+        }
+        // `buttons_right` drops what it has no room for, and it drops
+        // from the left — where the change sits, which is the one section
+        // everybody comes back to. A narrow panel could reach every other
+        // section and not that one. So rather than lose a button, the
+        // whole row collapses into one ▾ naming where you are, and that
+        // opens the sections menu, which cannot run out of room.
+        let need: usize = modes.iter().map(|(l, _, _)| disp_width(l) + 3).sum();
+        if need <= mode_area.width as usize {
+            buttons_right(f, app, mode_area, 0, &modes);
+        } else {
+            let label = format!("{} ▾", app.section_label());
+            buttons_right(
+                f,
+                app,
+                mode_area,
+                0,
+                &[(label.as_str(), ButtonId::PanelMenu, true)],
+            );
+        }
     }
 
     let h = inner.height as usize;
@@ -1135,6 +1179,59 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::styled(sub, Style::default().fg(p.text)),
                     Span::styled(when, Style::default().fg(p.dim)),
                 ]));
+            }
+            FileEntry::StackRow { idx } => {
+                let Some(st) = &app.stack else { continue };
+                let Some(e) = st.entries.get(*idx) else {
+                    continue;
+                };
+                // Where the reader is. The row takes the same background
+                // the selected file row does, so "you are here" reads the
+                // same way in every panel.
+                let here = e.position == st.position;
+                let base = if here {
+                    Style::default().bg(p.row).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                // The spine draws the chain: each pull request rests on
+                // the one under it, down to the trunk at the foot.
+                let spine = if here { "▶ " } else { "│ " };
+                let (mark, mark_fg) = stack_mark(e);
+                let num = format!("#{} ", e.number);
+                let head_w = disp_width(spine) + disp_width(&num) + 2;
+                let title_w = (inner.width as usize).saturating_sub(head_w);
+                let title = truncate_pad(&e.title, title_w);
+                // A pull request that has landed is no longer anybody's
+                // work, so it steps back the way a viewed file does.
+                let title_fg = if here {
+                    p.text
+                } else if e.done() {
+                    p.viewed
+                } else {
+                    p.text
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(spine, base.fg(if here { p.accent } else { p.divider })),
+                    Span::styled(num, base.fg(if e.done() { p.viewed } else { p.dim })),
+                    Span::styled(format!("{mark} "), base.fg(mark_fg)),
+                    Span::styled(title, base.fg(title_fg)),
+                ]));
+            }
+            FileEntry::StackTrunk => {
+                let name = app
+                    .stack
+                    .as_ref()
+                    .map(|st| st.base_ref_name.as_str())
+                    .unwrap_or_default();
+                let text = truncate_pad(&format!("└ {name}"), inner.width as usize);
+                lines.push(Line::from(Span::styled(text, Style::default().fg(p.dim))));
+            }
+            FileEntry::StackNote(note) => {
+                lines.push(Line::from(Span::styled(
+                    truncate_pad(note, inner.width as usize),
+                    Style::default().fg(p.dim),
+                )));
             }
             FileEntry::CommitFileRow { commit, file } => {
                 let Some(f) = app.files_of_commit(*commit).and_then(|fs| fs.get(*file)) else {
@@ -2260,6 +2357,24 @@ fn layer_note(layers: Layers, d: &FileDiff) -> String {
         0 => format!(" · {what} · nothing written twice"),
         1 => format!(" · {what} · ‡ 1 line written twice"),
         n => format!(" · {what} · ‡ {n} lines written twice"),
+    }
+}
+
+/// The one glyph that says where a stacked pull request stands.
+///
+/// Read in the order that decides what the reader does next: one that
+/// has landed or been dropped is no longer their problem, a draft is not
+/// asking for anything yet, and only then does the review verdict
+/// matter.
+fn stack_mark(e: &crate::github::StackPr) -> (&'static str, Color) {
+    let p = palette();
+    match (e.state.as_str(), e.is_draft, e.review_decision.as_deref()) {
+        ("MERGED", ..) => ("✔", p.viewed),
+        ("CLOSED", ..) => ("✕", p.dim),
+        (_, true, _) => ("◷", p.dim),
+        (_, _, Some("APPROVED")) => ("✓", p.ok),
+        (_, _, Some("CHANGES_REQUESTED")) => ("✗", p.err),
+        _ => (" ", p.dim),
     }
 }
 
@@ -4094,6 +4209,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             ("‡ in the change bar", "you changed this line before"),
         ),
         row(
+            ("Alt+↑ / Alt+↓", "up / down a stacked PR chain"),
+            ("click the PR badge", "the whole stack"),
+        ),
+        row(
             ("t then a", "switch light / dark"),
             ("?", "this help"),
         ),
@@ -5197,6 +5316,215 @@ mod tests {
         assert!(screen.contains("☐ todo"), "and unticked ones: {screen}");
         assert!(screen.contains("PLAN.md"), "the file panel is still there");
         assert!(screen.contains("P source"), "the way back is offered");
+    }
+
+    /// A pull request review with a three-deep stack under it, ready to
+    /// draw. The reader is on #43, the middle one; #42 below has landed
+    /// and #44 above is still in review.
+    fn stacked_pr_app() -> App {
+        let mut app = App::new(crate::app::LaunchMode::Pr, None);
+        app.screen = Screen::Review;
+        app.local = false;
+        app.checked_out = true;
+        app.pr = Some(crate::github::PrDetail {
+            id: "node".into(),
+            number: 43,
+            title: "Extract the parser".into(),
+            head_ref_oid: "a".repeat(40),
+            base_ref_oid: "b".repeat(40),
+            base_ref_name: "branch-42".into(),
+            head_ref_name: "branch-43".into(),
+            url: "https://github.com/o/r/pull/43".into(),
+        });
+        let pr = |position: u32,
+                  number: u64,
+                  title: &str,
+                  state: &str,
+                  draft: bool,
+                  dec: Option<&str>| {
+            crate::github::StackPr {
+                position,
+                number,
+                title: title.into(),
+                state: state.into(),
+                is_draft: draft,
+                review_decision: dec.map(str::to_string),
+                head_ref_name: format!("branch-{number}"),
+                base_ref_name: "x".into(),
+                url: String::new(),
+            }
+        };
+        app.stack = Some(crate::github::Stack {
+            number: 7,
+            size: 3,
+            base_ref_name: "main".into(),
+            entries: vec![
+                pr(1, 42, "Add the lexer", "MERGED", false, Some("APPROVED")),
+                pr(2, 43, "Extract the parser", "OPEN", false, None),
+                pr(3, 44, "Wire it up", "OPEN", true, None),
+            ],
+            position: 2,
+        });
+        app.set_panel(crate::app::PanelMode::Stack);
+        app
+    }
+
+    /// The ladder, as the reader sees it: newest on top, the trunk at the
+    /// foot, and a mark on the rung they are standing on.
+    #[test]
+    fn the_stack_panel_draws_the_chain() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = stacked_pr_app();
+        let buf = render(&mut app);
+        let screen: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("#44 ◷ Wire it up"),
+            "the draft on top: {screen}"
+        );
+        assert!(
+            screen.contains("▶ #43   Extract the parser"),
+            "the one under review is marked: {screen}"
+        );
+        assert!(
+            screen.contains("│ #42 ✔ Add the lexer"),
+            "the merged one below it: {screen}"
+        );
+        assert!(screen.contains("└ main"), "the trunk at the foot: {screen}");
+        assert!(
+            screen.contains("Stack #7 — 2 of 3"),
+            "the status line says where you are: {screen}"
+        );
+    }
+
+    /// The panel title names the stack, the rung and the trunk. It falls
+    /// back to the rung alone on a panel too narrow to hold all three,
+    /// the way every other panel title does.
+    #[test]
+    fn the_stack_panel_title_names_the_trunk_when_it_fits() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = stacked_pr_app();
+        let narrow = render(&mut app);
+        assert!(
+            row_text(&narrow, 1).contains(" 2/3 "),
+            "narrow keeps the rung: {}",
+            row_text(&narrow, 1)
+        );
+
+        app.file_panel_w = 44;
+        let wide = render(&mut app);
+        assert!(
+            row_text(&wide, 1).contains("Stack #7 2/3 → main"),
+            "wide names the whole thing: {}",
+            row_text(&wide, 1)
+        );
+    }
+
+    /// The badge is where a reviewer looks for "which pull request is
+    /// this", so it is where the rung goes.
+    #[test]
+    fn the_badge_carries_the_rung() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = stacked_pr_app();
+        let buf = render(&mut app);
+        assert!(
+            row_text(&buf, 0).contains("PR #43 · 2/3"),
+            "{}",
+            row_text(&buf, 0)
+        );
+    }
+
+    /// The bug the sections menu exists for. With four sections, a panel
+    /// at its usual width has no room for a button each — and the row
+    /// drops from the left, where the change is. It collapses into one ▾
+    /// instead, so nothing is unreachable.
+    #[test]
+    fn a_narrow_panel_collapses_the_toggle_row_into_one_button() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = stacked_pr_app();
+        app.set_panel(crate::app::PanelMode::Changes);
+        let buf = render(&mut app);
+        let screen: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("Change ▾"),
+            "one button, naming where you are: {screen}"
+        );
+        assert!(
+            !screen.contains("Commits"),
+            "and not four that would not fit: {screen}"
+        );
+
+        // Wide enough for all four, and they come back.
+        app.file_panel_w = 44;
+        let buf = render(&mut app);
+        let screen: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Change"), "{screen}");
+        assert!(screen.contains("Files"), "{screen}");
+        assert!(screen.contains("Commits"), "{screen}");
+        assert!(screen.contains("Stack"), "{screen}");
+        // The review box has a ▾ of its own, so this asks about the
+        // panel's button rather than about the screen.
+        assert!(
+            !screen.contains("Change ▾"),
+            "no need for the menu: {screen}"
+        );
+    }
+
+    /// …and the menu it opens lists every section, however narrow the
+    /// panel is.
+    #[test]
+    fn the_sections_menu_draws_every_section() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = stacked_pr_app();
+        app.set_panel(crate::app::PanelMode::Changes);
+        // Draw once so the ▾ button has a rect to hang from.
+        render(&mut app);
+        app.open_section_menu_from_button();
+        let buf = render(&mut app);
+        let screen: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Show in this panel"), "{screen}");
+        assert!(screen.contains("The change"), "{screen}");
+        assert!(screen.contains("Every file in the repository"), "{screen}");
+        assert!(screen.contains("Commits not pushed yet"), "{screen}");
+        assert!(screen.contains("Stack #7"), "{screen}");
+    }
+
+    /// The fourth toggle button only exists where there is a stack.
+    #[test]
+    fn the_stack_button_appears_only_with_a_stack() {
+        let _guard = highlight::test_theme_lock();
+        let mut app = stacked_pr_app();
+        let buf = render(&mut app);
+        let screen: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Stack"), "the button is there: {screen}");
+
+        let mut plain = stacked_pr_app();
+        plain.stack = None;
+        plain.set_panel(crate::app::PanelMode::Changes);
+        let buf = render(&mut plain);
+        let screen: String = (0..buf.area.height)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Commits"), "the other three stay: {screen}");
+        assert!(
+            !screen.contains("Stack"),
+            "and the fourth is not drawn: {screen}"
+        );
     }
 
     /// A one-file local review of a three-version stack, with the layers

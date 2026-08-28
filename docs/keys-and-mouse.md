@@ -136,10 +136,42 @@ buffer belongs to the side you are leaving.
 | Click `[!]` on a conflicted row | Open its resolve menu (see [Merge conflicts](#merge-conflicts)) |
 | Click `↺` at the end of a row | Revert every change in that file (asks first) |
 | `Tree` / `Flat` buttons | Switch between tree and flat list |
-| `F` or the `Change` / `Files` / `Commits` buttons | Walk the three panels |
+| `F`, the section buttons, or the `▾` | Walk the sections (see [Sections](#sections)) |
 | Drag the divider | Resize the panel |
 | Double-click the divider | Reset the panel width (34 columns) |
 | `<` / `>` | Narrow / widen the panel |
+
+### Sections
+
+The file panel shows one of four things. The buttons along its bottom
+border switch between them, and `F` walks them in order:
+
+| Section | What it lists |
+| --- | --- |
+| `Change` | The files this change touches. The panel Loupe opens on |
+| `Files` | Every file in the repository |
+| `Commits` | The commits this branch has that the upstream does not |
+| `Stack` | The stacked pull request chain — only where there is one |
+
+**A panel too narrow for a button each collapses the row into one `▾`**
+that names where you are — `Change ▾` — and opens the whole list:
+
+```
+└───────────────────── Change ▾  ┘
+┌ Show in this panel ───────────────────┐
+│● ◈  The change                      F │
+│○ 📁 Every file in the repository     F │
+│○ ◷  Commits not pushed yet          F │
+│○ ⑃  Stack #7 — 3 pull requests      F │
+└───────────────────────────────────────┘
+```
+
+The default panel is 34 columns, which is one short of what four buttons
+need — so with a stack open you get the `▾`. Widen the panel with `>` or
+by dragging the divider and the four buttons come back.
+
+The `☰` menu carries the same four lines, so there are always two ways
+to any section.
 
 ### Commits not pushed yet
 
@@ -178,6 +210,87 @@ the change to do any of those.
 The list is read again when you come back to the panel after thirty
 seconds, and capped at 200 commits — a branch that forked long ago is a
 panel nobody reads.
+
+### The stack
+
+A [stacked pull request](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs)
+is one link of a chain: each pull request targets the branch of the one
+below it, and the whole chain lands on a trunk together. GitHub tracks
+the chain, so Loupe reads it from the API — you do not need the
+`gh stack` extension installed to see it.
+
+Where the open pull request is in a stack, the badge says so and the
+panel gains a fourth stop:
+
+```
+ PR #43 · 2/3   Extract the parser
+```
+
+Click that badge, press `F` until it comes round, or pick `Stack` from
+the toggle row. The panel becomes the ladder:
+
+```
+┌ Stack #7 2/3 → main ───────────┐
+││ #44 ◷ Wire it up              │
+│▶ #43   Extract the parser      │
+││ #42 ✔ Add the lexer           │
+│└ main                          │
+└──── Change  Files  Commits  Stack ┘
+```
+
+Newest on top, the trunk at the foot, and `▶` on the rung you are
+standing on — the way a stack is drawn everywhere else. The mark after
+each number says where that link stands:
+
+| Mark | Meaning |
+| --- | --- |
+| `✔` | Merged — no longer your problem |
+| `✕` | Closed |
+| `◷` | Still a draft |
+| `✓` | Approved |
+| `✗` | Changes requested |
+
+| Key / mouse | Action |
+| --- | --- |
+| Click the `PR #n · i/N` badge | Open the stack panel |
+| Click a rung | Review that pull request (asks to check out first) |
+| `Alt+↑` / `Alt+↓` | One rung up / down — the same two directions `gh stack up` and `gh stack down` name |
+| `F` | Walk to the panel — the fourth stop, and only where there is a stack |
+
+`Alt+↑` and `Alt+↓` work from the diff too, so you can walk a chain
+without going back to the panel. They stop at both ends rather than
+wrapping, and say which end you reached.
+
+Clicking another rung goes through the same **check out / review only**
+prompt the pull request list uses. Moving up a stack usually means
+checking the branch out, and a click that rewrote your working tree
+without asking would be a click you could not take back.
+
+**Each link's diff is its own work, not the chain's.** A stacked pull
+request targets the branch below it, and Loupe reads every diff between
+the two refs GitHub names — so opening #43 shows what #43 does, with
+#42's work already underneath as context. Nothing extra was needed for
+that; it is what stacking is for. The status line names what you are
+standing on:
+
+```
+Stack #7 — 2 of 3, onto main. This one sits on #42 Add the lexer.
+```
+
+The stack is re-read on every refresh (`r`, or the `⟳` button), because
+a stack changes under you when somebody merges the link below yours —
+which is exactly the moment you want to be told. If the chain goes away
+entirely, the panel hands itself back rather than leaving you looking at
+nothing.
+
+`s` — the [layers](#layers--what-you-already-changed-and-what-is-new) —
+works here too, and means the same thing one link at a time: purple is
+what you have already pushed *for this pull request*, amber is what you
+are writing twice.
+
+Loupe does not restructure a stack. `gh stack add`, `submit`, `sync`,
+`rebase` and `merge` rewrite branches, and that is the extension's job;
+this panel is for reviewing one.
 
 ### Every file in the repository
 

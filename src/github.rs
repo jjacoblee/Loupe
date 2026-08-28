@@ -194,6 +194,214 @@ pub struct PrDetail {
     pub url: String,
 }
 
+// --------------------------------------------------------------- stacks
+
+/// One pull request in a stack, with where it sits in the chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackPr {
+    /// 1 is the pull request closest to the trunk; the next one up is
+    /// stacked on it, and so on.
+    pub position: u32,
+    pub number: u64,
+    pub title: String,
+    /// `OPEN`, `CLOSED` or `MERGED`.
+    pub state: String,
+    pub is_draft: bool,
+    /// `APPROVED`, `CHANGES_REQUESTED` or `REVIEW_REQUIRED`. `None` where
+    /// GitHub has no opinion to give — a merged or closed pull request,
+    /// or one no review has been asked for on.
+    pub review_decision: Option<String>,
+    pub head_ref_name: String,
+    /// The branch this one targets: the head of the pull request below
+    /// it, or the trunk for the one at the bottom. This is what makes the
+    /// diff of a stacked pull request its own change and not the whole
+    /// chain's.
+    pub base_ref_name: String,
+    pub url: String,
+}
+
+impl StackPr {
+    /// True once this pull request is off the board — merged or closed.
+    pub fn done(&self) -> bool {
+        self.state == "MERGED" || self.state == "CLOSED"
+    }
+}
+
+/// A chain of pull requests that land on one branch together.
+///
+/// Each targets the branch of the one below it, so every pull request in
+/// the chain has a diff of its own work alone. GitHub tracks the chain
+/// itself and answers for it on the pull request, which is why this is
+/// read from the API rather than from the `gh stack` extension: the
+/// reviewer sees the stack whether or not they have that installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stack {
+    /// Uniquely identifies the stack within its repository.
+    pub number: u64,
+    /// What GitHub says the stack holds, which can exceed `entries` on a
+    /// stack longer than one page.
+    pub size: usize,
+    /// The branch the whole stack lands on.
+    pub base_ref_name: String,
+    /// Every pull request in it, bottom first.
+    pub entries: Vec<StackPr>,
+    /// Where the pull request that was asked about sits.
+    pub position: u32,
+}
+
+impl Stack {
+    /// The entry at `position`, if the page reached that far.
+    pub fn at(&self, position: u32) -> Option<&StackPr> {
+        self.entries.iter().find(|e| e.position == position)
+    }
+
+    /// Index into `entries` of the pull request the reader came in on.
+    pub fn cursor(&self) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|e| e.position == self.position)
+    }
+}
+
+/// Most pull requests read out of one stack.
+///
+/// A stack is a handful of small pull requests by design; one page is
+/// past any real chain. A longer one still draws, and `Stack::size` says
+/// what it really holds.
+const STACK_PAGE: usize = 100;
+
+/// The stack `number` belongs to, or `None` when it is not in one.
+///
+/// One GraphQL call: everything about a stack hangs off the pull request
+/// in GitHub's schema, so there is no second lookup.
+///
+/// Best-effort, like [`pr_for_current_branch`]. A GitHub Enterprise
+/// server old enough not to know the field answers with an error, and a
+/// reviewer who is not in a stack must not have their pull request
+/// refuse to open over it — so every failure reads as "not stacked".
+pub fn pr_stack(repo: &str, number: u64) -> Option<Stack> {
+    let (owner, name) = repo.split_once('/')?;
+    let query = format!(
+        "query($owner:String!,$name:String!,$number:Int!){{\
+        repository(owner:$owner,name:$name){{pullRequest(number:$number){{\
+        stackEntry{{position}}\
+        stack{{number size baseRefName entries(first:{STACK_PAGE}){{nodes{{position \
+        pullRequest{{number title state isDraft reviewDecision headRefName baseRefName url}}}}}}}}\
+        }}}}}}"
+    );
+    let out = run_gh(&[
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={query}"),
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("name={name}"),
+        "-F",
+        &format!("number={number}"),
+        "--jq",
+        ".data.repository.pullRequest",
+    ])
+    .ok()?;
+    parse_stack(&out, number)
+}
+
+/// Turn the reply into a [`Stack`]. Split out from the call so the shape
+/// GitHub sends can be tested without a network.
+fn parse_stack(json: &str, number: u64) -> Option<Stack> {
+    #[derive(Deserialize)]
+    struct Reply {
+        stack: Option<RawStack>,
+        #[serde(rename = "stackEntry")]
+        entry: Option<RawPosition>,
+    }
+    #[derive(Deserialize)]
+    struct RawPosition {
+        position: u32,
+    }
+    #[derive(Deserialize)]
+    struct RawStack {
+        number: u64,
+        size: usize,
+        #[serde(rename = "baseRefName")]
+        base_ref_name: String,
+        entries: RawEntries,
+    }
+    #[derive(Deserialize)]
+    struct RawEntries {
+        nodes: Vec<RawEntry>,
+    }
+    #[derive(Deserialize)]
+    struct RawEntry {
+        position: u32,
+        #[serde(rename = "pullRequest")]
+        pr: Option<RawPr>,
+    }
+    #[derive(Deserialize)]
+    struct RawPr {
+        number: u64,
+        title: String,
+        state: String,
+        #[serde(rename = "isDraft")]
+        is_draft: bool,
+        #[serde(rename = "reviewDecision")]
+        review_decision: Option<String>,
+        #[serde(rename = "headRefName")]
+        head_ref_name: String,
+        #[serde(rename = "baseRefName")]
+        base_ref_name: String,
+        url: String,
+    }
+
+    let reply: Reply = serde_json::from_str(json.trim()).ok()?;
+    let raw = reply.stack?;
+    let mut entries: Vec<StackPr> = raw
+        .entries
+        .nodes
+        .into_iter()
+        .filter_map(|e| {
+            let pr = e.pr?;
+            Some(StackPr {
+                position: e.position,
+                number: pr.number,
+                title: pr.title,
+                state: pr.state,
+                is_draft: pr.is_draft,
+                review_decision: pr.review_decision,
+                head_ref_name: pr.head_ref_name,
+                base_ref_name: pr.base_ref_name,
+                url: pr.url,
+            })
+        })
+        .collect();
+    // Bottom first. GitHub returns them in order, but the ladder reads
+    // wrong rather than short if that ever stops being true.
+    entries.sort_by_key(|e| e.position);
+    // A stack with nothing readable in it is not a stack worth drawing.
+    if entries.is_empty() {
+        return None;
+    }
+    Some(Stack {
+        number: raw.number,
+        size: raw.size,
+        base_ref_name: raw.base_ref_name,
+        // The reply names the position directly; falling back to the
+        // entry that matches keeps the ladder marked if it ever does not.
+        position: reply
+            .entry
+            .map(|e| e.position)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|e| e.number == number)
+                    .map(|e| e.position)
+            })
+            .unwrap_or(0),
+        entries,
+    })
+}
+
 /// The open PR associated with the currently checked-out branch, if any.
 /// Without an upstream org this uses `gh pr view` with no selector, which
 /// resolves the current branch (including branch↔PR links recorded by
@@ -709,6 +917,151 @@ pub fn open_pr_web(repo: &str, number: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A three-deep stack, in the shape the GraphQL reply arrives in.
+    /// The reader is on #43, the middle one.
+    const STACK_JSON: &str = r#"{
+      "stackEntry": {"position": 2},
+      "stack": {
+        "number": 7,
+        "size": 3,
+        "baseRefName": "main",
+        "entries": {"nodes": [
+          {"position": 1, "pullRequest": {"number": 42, "title": "Add the lexer",
+            "state": "MERGED", "isDraft": false, "reviewDecision": "APPROVED",
+            "headRefName": "lexer", "baseRefName": "main",
+            "url": "https://github.com/a/b/pull/42"}},
+          {"position": 2, "pullRequest": {"number": 43, "title": "Extract the parser",
+            "state": "OPEN", "isDraft": false, "reviewDecision": "REVIEW_REQUIRED",
+            "headRefName": "parser", "baseRefName": "lexer",
+            "url": "https://github.com/a/b/pull/43"}},
+          {"position": 3, "pullRequest": {"number": 44, "title": "Wire it up",
+            "state": "OPEN", "isDraft": true, "reviewDecision": null,
+            "headRefName": "wire", "baseRefName": "parser",
+            "url": "https://github.com/a/b/pull/44"}}
+        ]}
+      }
+    }"#;
+
+    #[test]
+    fn a_stack_reads_bottom_first_with_the_reader_marked() {
+        let st = parse_stack(STACK_JSON, 43).expect("a stack");
+        assert_eq!(st.number, 7);
+        assert_eq!(st.size, 3);
+        assert_eq!(st.base_ref_name, "main");
+        assert_eq!(st.position, 2, "the reader is on the middle one");
+        let order: Vec<u64> = st.entries.iter().map(|e| e.number).collect();
+        assert_eq!(order, vec![42, 43, 44], "bottom first");
+        assert_eq!(st.at(st.position).map(|e| e.number), Some(43));
+        assert_eq!(st.cursor(), Some(1));
+    }
+
+    /// Each pull request targets the one below it. That is what makes a
+    /// stacked pull request's diff its own change rather than the chain's,
+    /// and loupe reads the diff between those two refs already.
+    #[test]
+    fn each_entry_targets_the_one_below_it() {
+        let st = parse_stack(STACK_JSON, 43).unwrap();
+        assert_eq!(st.at(1).unwrap().base_ref_name, "main");
+        assert_eq!(st.at(2).unwrap().base_ref_name, "lexer");
+        assert_eq!(st.at(3).unwrap().base_ref_name, "parser");
+        assert_eq!(st.at(2).unwrap().head_ref_name, "parser");
+    }
+
+    #[test]
+    fn a_merged_entry_is_done_and_a_draft_is_not() {
+        let st = parse_stack(STACK_JSON, 43).unwrap();
+        assert!(st.at(1).unwrap().done(), "merged");
+        assert!(!st.at(3).unwrap().done(), "an open draft is still work");
+        assert!(st.at(3).unwrap().is_draft);
+        assert_eq!(
+            st.at(1).unwrap().review_decision.as_deref(),
+            Some("APPROVED")
+        );
+        assert_eq!(st.at(3).unwrap().review_decision, None);
+    }
+
+    /// A pull request in no stack answers with two nulls, which is not an
+    /// error — most pull requests are not stacked.
+    #[test]
+    fn a_pull_request_in_no_stack_is_not_a_stack() {
+        assert!(parse_stack(r#"{"stack":null,"stackEntry":null}"#, 9000).is_none());
+    }
+
+    /// Anything unreadable reads as "not stacked" rather than sinking the
+    /// pull request that is trying to open.
+    #[test]
+    fn an_unreadable_reply_is_not_a_stack() {
+        assert!(parse_stack("", 1).is_none());
+        assert!(parse_stack("not json", 1).is_none());
+        assert!(parse_stack(r#"{"stack":{"number":1}}"#, 1).is_none());
+    }
+
+    /// GitHub returns the entries in order; the ladder must read bottom
+    /// first even if that ever stops being true.
+    #[test]
+    fn entries_are_sorted_into_stack_order() {
+        let jumbled = STACK_JSON.replace("\"position\": 1", "\"position\": 9");
+        let st = parse_stack(&jumbled, 43).unwrap();
+        let order: Vec<u32> = st.entries.iter().map(|e| e.position).collect();
+        assert_eq!(order, vec![2, 3, 9]);
+    }
+
+    /// With no `stackEntry` the position is recovered from the entry that
+    /// names the pull request asked about, so the ladder still marks it.
+    #[test]
+    fn the_reader_is_found_without_a_stack_entry() {
+        let no_entry = STACK_JSON.replace(r#""stackEntry": {"position": 2},"#, "");
+        let st = parse_stack(&no_entry, 44).unwrap();
+        assert_eq!(st.position, 3);
+        assert_eq!(st.at(st.position).map(|e| e.number), Some(44));
+    }
+
+    /// A reply recorded verbatim from the real API, for a real stack:
+    /// PRs #469 → #475 → #477 in `github/gh-stack`, read while standing
+    /// on the top one.
+    ///
+    /// Stacked pull requests are in public preview, so the shape can
+    /// still move. This is the shape loupe was written against; if
+    /// GitHub changes it, this is the test that says so.
+    const REAL_STACK_JSON: &str = r#"{"stack":{"baseRefName":"main","entries":{"nodes":[
+      {"position":1,"pullRequest":{"baseRefName":"main","headRefName":"skarim/checkout-tui-height",
+        "isDraft":false,"number":469,"reviewDecision":"APPROVED","state":"MERGED",
+        "title":"checkout: dynamic height for picker","url":"https://github.com/github/gh-stack/pull/469"}},
+      {"position":2,"pullRequest":{"baseRefName":"skarim/checkout-tui-height",
+        "headRefName":"skarim/checkout-from-current-local-branch","isDraft":false,"number":475,
+        "reviewDecision":"APPROVED","state":"MERGED",
+        "title":"checkout: detect remote stack from current branch","url":"https://github.com/github/gh-stack/pull/475"}},
+      {"position":3,"pullRequest":{"baseRefName":"skarim/checkout-from-current-local-branch",
+        "headRefName":"skarim/checkout-by-remote-branch-name","isDraft":false,"number":477,
+        "reviewDecision":"APPROVED","state":"MERGED",
+        "title":"checkout: resolve remote stack by branch name","url":"https://github.com/github/gh-stack/pull/477"}}
+      ]},"number":476,"size":3},"stackEntry":{"position":3}}"#;
+
+    #[test]
+    fn a_real_reply_from_github_reads_as_a_stack() {
+        let st = parse_stack(REAL_STACK_JSON, 477).expect("a stack");
+        // The stack has its own numbering, unrelated to any pull request
+        // number in it.
+        assert_eq!(st.number, 476);
+        assert_eq!(st.size, 3);
+        assert_eq!(st.base_ref_name, "main");
+        assert_eq!(st.position, 3, "read from the top of the chain");
+        let order: Vec<u64> = st.entries.iter().map(|e| e.number).collect();
+        assert_eq!(order, vec![469, 475, 477]);
+        // Each link targets the head of the one below it, which is what
+        // makes its diff its own work. The bottom targets the trunk.
+        assert_eq!(st.at(1).unwrap().base_ref_name, "main");
+        assert_eq!(
+            st.at(2).unwrap().base_ref_name,
+            st.at(1).unwrap().head_ref_name
+        );
+        assert_eq!(
+            st.at(3).unwrap().base_ref_name,
+            st.at(2).unwrap().head_ref_name
+        );
+        assert!(st.entries.iter().all(|e| e.done()), "all three landed");
+    }
 
     #[test]
     fn org_overrides_owner_only_when_set() {

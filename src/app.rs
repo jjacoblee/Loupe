@@ -66,6 +66,9 @@ pub enum PanelMode {
     /// The commits on this branch the upstream does not have. Open one to
     /// see its files; open a file to read that commit's diff.
     Commits,
+    /// The stack the open pull request belongs to, drawn bottom-first as
+    /// the ladder it is. Only reachable while there is a stack to draw.
+    Stack,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1132,6 +1135,12 @@ pub enum ButtonId {
     PanelChanges,
     PanelFiles,
     PanelCommits,
+    /// The panel toggle row's fourth button, and the ☰ line: the stack
+    /// the open pull request belongs to.
+    PanelStack,
+    /// The `▾` the panel toggle row collapses into when it has no room
+    /// for a button per section. Opens the sections menu.
+    PanelMenu,
     /// Editor commands that have no button of their own, reached from ☰.
     EditorDefinition,
     EditorHover,
@@ -1576,6 +1585,18 @@ pub enum FileEntry {
     /// What the Commits panel says when it has no commits to list: still
     /// reading, nothing to push, or no upstream to measure against.
     CommitNote(String),
+    /// One pull request in the Stack panel. `idx` indexes the stack's
+    /// `entries`, which are held bottom-first; the panel draws them the
+    /// other way up, because a stack is talked about with its trunk at
+    /// the bottom.
+    StackRow {
+        idx: usize,
+    },
+    /// The branch the whole stack lands on, drawn under the bottom of the
+    /// ladder. Not a target — there is no pull request to open.
+    StackTrunk,
+    /// What the Stack panel says when there is no stack to draw.
+    StackNote(String),
 }
 
 /// Which half of the local file panel a heading names.
@@ -2006,6 +2027,8 @@ struct Workspace {
     conflict: Option<ConflictView>,
     pr: Option<PrDetail>,
     checked_out: bool,
+    /// The stack, which belongs to the pull request side of the swap.
+    stack: Option<github::Stack>,
     merge_base: String,
     /// The two sides always travel together: a pull request's stack is
     /// written against its base branch, and local review's against
@@ -2059,6 +2082,10 @@ pub struct PrRefreshData {
     merge_base: String,
     files: Vec<ChangedFile>,
     viewed: HashSet<String>,
+    /// Re-read every refresh: a stack changes under you when somebody
+    /// merges the pull request below yours, which is the moment you most
+    /// want to be told.
+    stack: Option<github::Stack>,
 }
 
 pub enum QuietOutcome {
@@ -2082,6 +2109,8 @@ pub struct PrOpenedData {
     merge_base: String,
     files: Vec<ChangedFile>,
     viewed: HashSet<String>,
+    /// The stack this pull request is part of, when it is in one.
+    stack: Option<github::Stack>,
     /// Opened automatically for the current branch (vs picked from the list).
     auto: bool,
 }
@@ -2516,6 +2545,10 @@ pub struct App {
     pub stack_base: String,
     /// How many layers of the change the diff draws. See [`Layers`].
     pub layers: Layers,
+    /// The stack the open pull request belongs to, when it is in one.
+    /// `None` for local review, for a pull request on its own, and on a
+    /// server that does not have stacks.
+    pub stack: Option<github::Stack>,
     pub files: Vec<ChangedFile>,
     /// Paths marked as viewed (mirrors the GitHub PR page checkmarks).
     /// PR review only — local review stages files instead.
@@ -2921,6 +2954,7 @@ impl App {
             merge_base: String::new(),
             stack_base: String::new(),
             layers: Layers::default(),
+            stack: None,
             files: Vec::new(),
             viewed: HashSet::new(),
             stage: HashMap::new(),
@@ -3757,6 +3791,9 @@ impl App {
                 // …and the bottom of the stack: what the whole branch is
                 // written against, rather than what its last commit was.
                 self.stack_base = d.stack_base.unwrap_or_default();
+                // A GitHub stack belongs to a pull request, and this side
+                // has none.
+                self.set_stack(None);
                 self.reset_blame_review();
                 self.files = d.files;
                 self.viewed.clear();
@@ -3830,8 +3867,11 @@ impl App {
                 self.checked_out = d.checked_out;
                 self.merge_base = d.merge_base;
                 // Under a pull request the two are the same commit: the
-                // change is already written against the base branch.
+                // change is already written against the base branch. In a
+                // stack that base is the pull request below this one, so
+                // the diff is this link's own work and nothing under it.
                 self.stack_base = self.merge_base.clone();
+                self.set_stack(d.stack);
                 self.reset_blame_review();
                 self.files = d.files;
                 self.viewed = d.viewed;
@@ -4260,6 +4300,10 @@ impl App {
             let files = github::changed_files(&repo, number)?;
             // Viewed state is cosmetic — don't fail the open over it.
             let viewed = github::viewed_files(&repo, number).unwrap_or_default();
+            // …and so is the stack: most pull requests are not in one,
+            // and a server that has never heard of them must still open
+            // this one. `pr_stack` answers None to every failure.
+            let stack = github::pr_stack(&repo, number);
             Ok(Outcome::PrOpened(Box::new(PrOpenedData {
                 repo,
                 repo_root,
@@ -4268,6 +4312,7 @@ impl App {
                 merge_base,
                 files,
                 viewed,
+                stack,
                 auto,
             })))
         });
@@ -6257,10 +6302,10 @@ impl App {
     /// The collapse set for whichever list the panel is showing.
     pub(crate) fn collapsed(&mut self) -> &mut HashSet<String> {
         match self.panel {
-            // The Commits panel draws no directories, so nothing asks it
-            // this. It answers with the change's set rather than a third
-            // one nobody would ever read.
-            PanelMode::Changes | PanelMode::Commits => &mut self.collapsed_dirs,
+            // Neither the Commits panel nor the Stack panel draws a
+            // directory, so nothing asks either of them this. They answer
+            // with the change's set rather than a third nobody reads.
+            PanelMode::Changes | PanelMode::Commits | PanelMode::Stack => &mut self.collapsed_dirs,
             PanelMode::Files => &mut self.collapsed_files,
         }
     }
@@ -6268,7 +6313,7 @@ impl App {
     /// The same set, for the renderer, which only reads it.
     pub fn collapsed_set(&self) -> &HashSet<String> {
         match self.panel {
-            PanelMode::Changes | PanelMode::Commits => &self.collapsed_dirs,
+            PanelMode::Changes | PanelMode::Commits | PanelMode::Stack => &self.collapsed_dirs,
             PanelMode::Files => &self.collapsed_files,
         }
     }
@@ -6314,6 +6359,31 @@ impl App {
                 self.refresh_commits_if_stale();
                 self.ok("Commits — what this branch has that the upstream does not.");
             }
+            PanelMode::Stack => {
+                self.ok(match &self.stack {
+                    // What the reader most needs is not the size of the
+                    // chain but what this link rests on: that is the
+                    // branch its diff is read against, and the pull
+                    // request that has to land before this one can.
+                    Some(st) => match st.position.checked_sub(1).and_then(|p| st.at(p)) {
+                        Some(under) => format!(
+                            "Stack #{} — {} of {}, onto {}. This one sits on #{} {}.",
+                            st.number,
+                            st.position,
+                            st.size,
+                            st.base_ref_name,
+                            under.number,
+                            under.title
+                        ),
+                        None => format!(
+                            "Stack #{} — {} of {}, straight onto {}.",
+                            st.number, st.position, st.size, st.base_ref_name
+                        ),
+                    },
+                    None => "This pull request is not in a stack.".to_string(),
+                });
+                self.reveal_stack_cursor();
+            }
             PanelMode::Changes => {
                 self.ok("Back to the files this change touches.");
                 self.ensure_file_visible();
@@ -6324,11 +6394,16 @@ impl App {
 
     /// `F` walks the three panels in the order the toggle row draws them.
     pub fn toggle_panel(&mut self) {
-        self.set_panel(match self.panel {
+        // The stack is only a stop on the walk when there is one. A
+        // reader with no stacked pull request open should not pay for the
+        // feature with an empty panel between two useful ones.
+        let next = match self.panel {
             PanelMode::Changes => PanelMode::Files,
             PanelMode::Files => PanelMode::Commits,
-            PanelMode::Commits => PanelMode::Changes,
-        });
+            PanelMode::Commits if self.stack.is_some() => PanelMode::Stack,
+            PanelMode::Commits | PanelMode::Stack => PanelMode::Changes,
+        };
+        self.set_panel(next);
     }
 
     // ----------------------------------------------------- the commits
@@ -6700,6 +6775,7 @@ impl App {
             PanelMode::Changes => self.emit_changes(&mut out),
             PanelMode::Files => self.emit_files(&mut out),
             PanelMode::Commits => self.emit_commits(&mut out),
+            PanelMode::Stack => self.emit_stack(&mut out),
         }
         self.entries = out;
         let max = self.entries.len().saturating_sub(1);
@@ -6851,6 +6927,114 @@ impl App {
     pub fn files_of_commit(&self, idx: usize) -> Option<&[ChangedFile]> {
         let oid = &self.commits.get(idx)?.oid;
         self.commit_files.get(oid).map(Vec::as_slice)
+    }
+
+    // ------------------------------------------------------- the stack
+
+    /// The stack as a ladder, top first.
+    ///
+    /// The entries are held bottom-first, the order they land in and the
+    /// order GitHub numbers them. They are drawn the other way up because
+    /// that is how a stack is talked about and how everything else draws
+    /// one: the trunk at the bottom, each pull request resting on the one
+    /// under it. The trunk gets a row of its own at the foot, so the
+    /// ladder says what the chain is aimed at without the reader having
+    /// to read the panel title.
+    fn emit_stack(&self, out: &mut Vec<FileEntry>) {
+        let Some(st) = &self.stack else {
+            out.push(FileEntry::StackNote(
+                "This pull request is not in a stack.".into(),
+            ));
+            return;
+        };
+        for idx in (0..st.entries.len()).rev() {
+            out.push(FileEntry::StackRow { idx });
+        }
+        out.push(FileEntry::StackTrunk);
+    }
+
+    /// Take a fresh reading of the stack.
+    ///
+    /// The panel has to give way when a stack goes: a refresh where the
+    /// last pull request in the chain was merged, or a swap to local
+    /// review, would otherwise leave the reader looking at a panel with
+    /// nothing behind it and no obvious way out.
+    fn set_stack(&mut self, stack: Option<github::Stack>) {
+        self.stack = stack;
+        if self.stack.is_none() && self.panel == PanelMode::Stack {
+            self.panel = PanelMode::Changes;
+            self.file_scroll = 0;
+        }
+        if self.panel == PanelMode::Stack {
+            self.rebuild_entries();
+            self.reveal_stack_cursor();
+        }
+    }
+
+    /// Scroll the panel so the pull request being reviewed is on screen.
+    /// A long stack opened from the middle would otherwise start at the
+    /// top with no sign of where the reader actually is.
+    fn reveal_stack_cursor(&mut self) {
+        let Some(here) = self.stack.as_ref().and_then(|st| st.cursor()) else {
+            return;
+        };
+        let Some(pos) = self
+            .entries
+            .iter()
+            .position(|e| matches!(e, FileEntry::StackRow { idx } if *idx == here))
+        else {
+            return;
+        };
+        let h = (self.layout.file_list.height as usize).max(1);
+        if pos < self.file_scroll {
+            self.file_scroll = pos;
+        } else if pos >= self.file_scroll + h {
+            self.file_scroll = pos + 1 - h;
+        }
+    }
+
+    /// Move one rung up or down the stack — `Alt+↑` and `Alt+↓`.
+    ///
+    /// The same two directions `gh stack up` and `gh stack down` name, so
+    /// the habit carries over from the extension. Up is away from the
+    /// trunk. It lands on the same prompt a click on the rung does.
+    pub fn step_stack(&mut self, delta: i32) {
+        let Some(st) = &self.stack else {
+            self.err("This pull request is not in a stack.");
+            return;
+        };
+        let Some(here) = st.cursor() else {
+            return;
+        };
+        let next = here as i32 + delta;
+        if next < 0 || next as usize >= st.entries.len() {
+            self.err(if delta > 0 {
+                "Top of the stack — nothing rests on this one."
+            } else {
+                "Bottom of the stack — this one sits straight on the base branch."
+            });
+            return;
+        }
+        self.open_stack_pr(next as usize);
+    }
+
+    /// Open another pull request out of the stack.
+    ///
+    /// Through the same prompt the pull request list uses, because it is
+    /// the same question and it has the same two answers: check the
+    /// branch out, or read it where you stand. Moving up a stack usually
+    /// means checking out, and a click that rewrote the working tree
+    /// without asking would be a click nobody could take back.
+    pub fn open_stack_pr(&mut self, idx: usize) {
+        let Some(entry) = self.stack.as_ref().and_then(|st| st.entries.get(idx)) else {
+            return;
+        };
+        let number = entry.number;
+        if self.pr.as_ref().is_some_and(|p| p.number == number) {
+            self.ok(format!("PR #{number} — already open."));
+            return;
+        }
+        self.overlay = Overlay::CheckoutPrompt(number);
     }
 
     /// The whole repository. No conflict heading — a merge conflict is a
@@ -7684,7 +7868,14 @@ impl App {
                 }
                 let page = self.diff_page() as i32;
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
                 match key.code {
+                    // --- the stack, one rung at a time. The two
+                    // directions `gh stack up` and `gh stack down` name,
+                    // under the arrows, so the habit carries over. Read
+                    // before the plain arrows, which take any modifier.
+                    KeyCode::Up if alt => self.step_stack(1),
+                    KeyCode::Down if alt => self.step_stack(-1),
                     // --- motions (they move the cursor; the view follows)
                     KeyCode::Up | KeyCode::Char('k') => self.cursor_by(-1),
                     KeyCode::Down | KeyCode::Char('j') => self.cursor_by(1),
@@ -8291,8 +8482,18 @@ impl App {
                         self.open_menu(x, y);
                         return true;
                     }
+                    Some(ButtonId::PanelMenu) => {
+                        self.open_section_menu(x, y);
+                        return true;
+                    }
                     Some(id) if self.activate(id) => return true,
                     _ => {}
+                }
+                // `PR #44 · 3/5` says there is a stack; clicking it is
+                // the shortest way to ask what the other four are.
+                if self.stack.is_some() && contains(self.layout.badge, x, y) {
+                    self.set_panel(PanelMode::Stack);
+                    return true;
                 }
                 // The file panel keeps working with the editor or a
                 // document open. Switching files parks the buffer rather
@@ -8658,8 +8859,9 @@ impl App {
             FileEntry::ConflictHeading { .. } => {}
             FileEntry::CommitRow { idx, .. } => self.toggle_commit(idx),
             FileEntry::CommitFileRow { commit, file } => self.open_commit_file(commit, file),
-            // A note is a sentence, not a target.
-            FileEntry::CommitNote(_) => {}
+            FileEntry::StackRow { idx } => self.open_stack_pr(idx),
+            // A note is a sentence, and the trunk is not a pull request.
+            FileEntry::CommitNote(_) | FileEntry::StackNote(_) | FileEntry::StackTrunk => {}
             FileEntry::StageHeading { section, count, .. } => {
                 // The right-hand end moves the whole section across; the
                 // rest of the row folds it away.
@@ -8769,7 +8971,10 @@ impl App {
             FileEntry::ConflictHeading { .. }
             | FileEntry::StageHeading { .. }
             | FileEntry::CommitRow { .. }
-            | FileEntry::CommitNote(_) => return,
+            | FileEntry::CommitNote(_)
+            | FileEntry::StackRow { .. }
+            | FileEntry::StackTrunk
+            | FileEntry::StackNote(_) => return,
             FileEntry::CommitFileRow { commit, file } => {
                 match self.files_of_commit(*commit).and_then(|fs| fs.get(*file)) {
                     Some(f) => (f.path.clone(), false),
@@ -9385,18 +9590,10 @@ impl App {
             ButtonId::TreeToggle,
             self.tree_view,
         ));
-        rows.push(switch(
-            "📁 Every file in the repository".into(),
-            "F",
-            ButtonId::PanelFiles,
-            self.panel == PanelMode::Files,
-        ));
-        rows.push(switch(
-            "◷  Commits not pushed yet".into(),
-            "F",
-            ButtonId::PanelCommits,
-            self.panel == PanelMode::Commits,
-        ));
+        // The same list the panel's own ▾ opens, so there is one place
+        // that decides what the sections are — and so this menu can get
+        // back to the change, which it could not before.
+        rows.extend(self.section_items());
         rows.push(switch(
             "👤 Blame column".into(),
             "B",
@@ -9958,6 +10155,84 @@ impl App {
             .unwrap_or((0, 0))
     }
 
+    /// What the file panel can show, as a menu: one line per section,
+    /// with a mark on the one in front of the reader.
+    ///
+    /// The panel's own button row drops buttons it has no room for, and
+    /// it drops from the left — so the change itself, which is the
+    /// leftmost and the one everybody comes back to, was the first to go.
+    /// A narrow panel could reach every other section and not that one.
+    /// This list never runs out of room.
+    pub fn section_items(&self) -> Vec<MenuRow> {
+        let item = |label: String, id: ButtonId, on: bool| {
+            MenuRow::Item(MenuItem {
+                label,
+                hint: "F",
+                id,
+                enabled: true,
+                checked: Some(on),
+            })
+        };
+        let mut rows = vec![item(
+            "◈  The change".into(),
+            ButtonId::PanelChanges,
+            self.panel == PanelMode::Changes,
+        )];
+        rows.push(item(
+            "📁 Every file in the repository".into(),
+            ButtonId::PanelFiles,
+            self.panel == PanelMode::Files,
+        ));
+        rows.push(item(
+            "◷  Commits not pushed yet".into(),
+            ButtonId::PanelCommits,
+            self.panel == PanelMode::Commits,
+        ));
+        // Only where there is a stack. A line that never does anything is
+        // a line every reader has to read past.
+        if let Some(st) = &self.stack {
+            rows.push(item(
+                format!("⑃  Stack #{} — {} pull requests", st.number, st.size),
+                ButtonId::PanelStack,
+                self.panel == PanelMode::Stack,
+            ));
+        }
+        rows
+    }
+
+    /// The sections menu, hung under the `▾` that opens it.
+    pub fn open_section_menu(&mut self, x: u16, y: u16) {
+        let rows = self.section_items();
+        self.open_menu_at(rows, " Show in this panel ".into(), x, y);
+    }
+
+    /// The same, from wherever the `▾` is — so the keyboard and the
+    /// mouse land it in the same place, the way the ☰ menu does.
+    pub fn open_section_menu_from_button(&mut self) {
+        let (x, y) = self
+            .layout
+            .buttons
+            .iter()
+            .find(|(_, id)| *id == ButtonId::PanelMenu)
+            .map(|(r, _)| (r.x, r.y))
+            .unwrap_or_else(|| {
+                let fl = self.layout.file_list;
+                (fl.x, fl.y + fl.height)
+            });
+        self.open_section_menu(x, y);
+    }
+
+    /// What the panel is showing, in one word — the label the collapsed
+    /// toggle button wears.
+    pub fn section_label(&self) -> &'static str {
+        match self.panel {
+            PanelMode::Changes => "Change",
+            PanelMode::Files => "Files",
+            PanelMode::Commits => "Commits",
+            PanelMode::Stack => "Stack",
+        }
+    }
+
     /// `m`: open the ☰ menu where the ☰ button is, so it lands in the same
     /// place whether the mouse or the keyboard asked for it.
     pub fn open_menu_from_key(&mut self) {
@@ -10032,6 +10307,8 @@ impl App {
             ButtonId::PanelChanges => self.set_panel(PanelMode::Changes),
             ButtonId::PanelFiles => self.set_panel(PanelMode::Files),
             ButtonId::PanelCommits => self.set_panel(PanelMode::Commits),
+            ButtonId::PanelStack => self.set_panel(PanelMode::Stack),
+            ButtonId::PanelMenu => self.open_section_menu_from_button(),
             ButtonId::ViewTree => self.set_tree_view(true),
             ButtonId::ViewFlat => self.set_tree_view(false),
             ButtonId::TreeToggle => self.set_tree_view(!self.tree_view),
@@ -14141,6 +14418,7 @@ impl App {
             conflict: self.conflict.take(),
             pr: self.pr.take(),
             checked_out: self.checked_out,
+            stack: self.stack.take(),
             merge_base: std::mem::take(&mut self.merge_base),
             stack_base: std::mem::take(&mut self.stack_base),
             files: std::mem::take(&mut self.files),
@@ -14172,6 +14450,7 @@ impl App {
         self.conflict = ws.conflict;
         self.pr = ws.pr;
         self.checked_out = ws.checked_out;
+        self.set_stack(ws.stack);
         self.merge_base = ws.merge_base;
         self.stack_base = ws.stack_base;
         self.reset_blame_review();
@@ -14257,11 +14536,13 @@ impl App {
                 let merge_base = gitops::merge_base(&detail.base_ref_oid, &detail.head_ref_oid);
                 let files = github::changed_files(&repo, number)?;
                 let viewed = github::viewed_files(&repo, number).unwrap_or_default();
+                let stack = github::pr_stack(&repo, number);
                 Ok(QuietOutcome::Pr(Box::new(PrRefreshData {
                     detail,
                     merge_base,
                     files,
                     viewed,
+                    stack,
                 })))
             })());
         });
@@ -14364,6 +14645,7 @@ impl App {
                 // Under a pull request the two are the same commit: the
                 // change is already written against the base branch.
                 self.stack_base = self.merge_base.clone();
+                self.set_stack(d.stack);
                 // A refresh that found nothing must leave the pane alone;
                 // resetting here would blank it with nothing on the way
                 // to fill it back in.
@@ -18897,6 +19179,25 @@ b2
                     .map(|f| format!("    {}", f.path))
                     .unwrap_or_else(|| "    ?".into()),
                 FileEntry::CommitNote(note) => format!("… {note}"),
+                FileEntry::StackRow { idx } => {
+                    let e = &app.stack.as_ref().unwrap().entries[*idx];
+                    let here = app.stack.as_ref().unwrap().position == e.position;
+                    format!(
+                        "{} {} #{} {}",
+                        if here { "◀" } else { " " },
+                        e.position,
+                        e.number,
+                        e.title
+                    )
+                }
+                FileEntry::StackTrunk => format!(
+                    "⌄ {}",
+                    app.stack
+                        .as_ref()
+                        .map(|st| st.base_ref_name.as_str())
+                        .unwrap_or("?")
+                ),
+                FileEntry::StackNote(note) => format!("… {note}"),
             })
             .collect()
     }
@@ -19574,6 +19875,285 @@ more
         }
     }
 
+    /// A three-deep stack with the reader on the middle pull request.
+    fn stack_of_three() -> github::Stack {
+        let pr =
+            |position: u32, number: u64, title: &str, state: &str, base: &str| github::StackPr {
+                position,
+                number,
+                title: title.into(),
+                state: state.into(),
+                is_draft: false,
+                review_decision: None,
+                head_ref_name: format!("branch-{number}"),
+                base_ref_name: base.into(),
+                url: format!("https://github.com/o/r/pull/{number}"),
+            };
+        github::Stack {
+            number: 7,
+            size: 3,
+            base_ref_name: "main".into(),
+            entries: vec![
+                pr(1, 42, "Add the lexer", "MERGED", "main"),
+                pr(2, 43, "Extract the parser", "OPEN", "branch-42"),
+                pr(3, 44, "Wire it up", "OPEN", "branch-43"),
+            ],
+            position: 2,
+        }
+    }
+
+    /// A pull request review with a stack under it.
+    fn stacked_app() -> App {
+        let mut app = App::new(LaunchMode::Pr, None);
+        app.screen = Screen::Review;
+        app.local = false;
+        app.checked_out = true;
+        app.pr = Some(pr_detail(43));
+        app.stack = Some(stack_of_three());
+        app
+    }
+
+    /// A stack is drawn the way it is talked about: trunk at the bottom,
+    /// each pull request resting on the one under it.
+    #[test]
+    fn the_stack_panel_is_a_ladder_with_the_trunk_at_its_foot() {
+        let mut app = stacked_app();
+        app.set_panel(PanelMode::Stack);
+        assert_eq!(
+            panel_rows(&app),
+            vec![
+                "  3 #44 Wire it up",
+                "◀ 2 #43 Extract the parser",
+                "  1 #42 Add the lexer",
+                "⌄ main",
+            ]
+        );
+    }
+
+    /// The message names what this link rests on, because that is the
+    /// branch its diff is read against and the pull request that has to
+    /// land before it can.
+    #[test]
+    fn opening_the_panel_says_what_this_one_sits_on() {
+        let mut app = stacked_app();
+        app.set_panel(PanelMode::Stack);
+        assert!(app.status.contains("2 of 3"), "{}", app.status);
+        assert!(
+            app.status.contains("sits on #42 Add the lexer"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// …and the one at the bottom sits on the trunk itself.
+    #[test]
+    fn the_bottom_of_the_stack_sits_on_the_trunk() {
+        let mut app = stacked_app();
+        if let Some(st) = app.stack.as_mut() {
+            st.position = 1;
+        }
+        app.set_panel(PanelMode::Stack);
+        assert!(app.status.contains("straight onto main"), "{}", app.status);
+    }
+
+    /// `F` gains a fourth stop only where there is a stack. A reader with
+    /// an ordinary pull request open must not pay for the feature with an
+    /// empty panel between two useful ones.
+    #[test]
+    fn f_reaches_the_stack_only_when_there_is_one() {
+        let mut app = stacked_app();
+        app.toggle_panel();
+        assert_eq!(app.panel, PanelMode::Files);
+        app.toggle_panel();
+        assert_eq!(app.panel, PanelMode::Commits);
+        app.toggle_panel();
+        assert_eq!(app.panel, PanelMode::Stack);
+        app.toggle_panel();
+        assert_eq!(app.panel, PanelMode::Changes);
+
+        let mut plain = stacked_app();
+        plain.stack = None;
+        plain.set_panel(PanelMode::Commits);
+        plain.toggle_panel();
+        assert_eq!(plain.panel, PanelMode::Changes, "no fourth stop");
+    }
+
+    /// Moving up a stack usually means checking the branch out, and a
+    /// click that rewrote the working tree without asking would be one
+    /// nobody could take back. It goes through the prompt the pull
+    /// request list already uses.
+    #[test]
+    fn opening_another_pull_request_in_the_stack_asks_first() {
+        let mut app = stacked_app();
+        app.set_panel(PanelMode::Stack);
+        app.open_stack_pr(2);
+        assert!(
+            matches!(app.overlay, Overlay::CheckoutPrompt(44)),
+            "the checkout prompt opens for #44"
+        );
+    }
+
+    /// The one already on screen is not a target.
+    #[test]
+    fn the_stack_row_you_are_on_says_so() {
+        let mut app = stacked_app();
+        app.set_panel(PanelMode::Stack);
+        app.open_stack_pr(1);
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("already open"), "{}", app.status);
+    }
+
+    /// `Alt+↑` and `Alt+↓` walk the chain, the way `gh stack up` and
+    /// `gh stack down` do, and stop at both ends rather than wrapping.
+    #[test]
+    fn alt_arrows_walk_the_stack_and_stop_at_its_ends() {
+        let mut app = stacked_app();
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert!(
+            matches!(app.overlay, Overlay::CheckoutPrompt(44)),
+            "up is away from the trunk"
+        );
+        app.overlay = Overlay::None;
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+        assert!(
+            matches!(app.overlay, Overlay::CheckoutPrompt(42)),
+            "down is toward it"
+        );
+
+        // At the top there is nothing above.
+        app.overlay = Overlay::None;
+        if let Some(st) = app.stack.as_mut() {
+            st.position = 3;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("Top of the stack"), "{}", app.status);
+
+        // …and at the bottom, nothing below.
+        if let Some(st) = app.stack.as_mut() {
+            st.position = 1;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.status.contains("Bottom of the stack"), "{}", app.status);
+    }
+
+    /// A plain arrow still moves the diff cursor; only the modifier means
+    /// the stack.
+    #[test]
+    fn a_plain_arrow_is_still_the_diff_cursor() {
+        let mut app = stacked_app();
+        app.diff = Some(FileDiff::compute(Some("a\nb\nc\n"), Some("a\nB\nc\n")));
+        app.rebuild_display();
+        app.diff_cursor = 0;
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.diff_cursor, 1);
+        assert!(matches!(app.overlay, Overlay::None));
+    }
+
+    /// The bug this menu exists for: the panel's button row drops what it
+    /// has no room for, from the left, and the change is leftmost. A
+    /// narrow panel could reach every section except the one everybody
+    /// comes back to.
+    #[test]
+    fn the_sections_menu_lists_every_section_and_marks_the_one_you_are_on() {
+        let mut app = stacked_app();
+        app.set_panel(PanelMode::Commits);
+        let ids: Vec<ButtonId> = app
+            .section_items()
+            .iter()
+            .filter_map(|r| match r {
+                MenuRow::Item(it) => Some(it.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ButtonId::PanelChanges,
+                ButtonId::PanelFiles,
+                ButtonId::PanelCommits,
+                ButtonId::PanelStack,
+            ],
+            "the change is in the list, and it is first"
+        );
+        let checked: Vec<bool> = app
+            .section_items()
+            .iter()
+            .filter_map(|r| match r {
+                MenuRow::Item(it) => it.checked,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checked, vec![false, false, true, false]);
+    }
+
+    /// …and the way back actually works from it.
+    #[test]
+    fn the_sections_menu_gets_back_to_the_change() {
+        let mut app = stacked_app();
+        app.set_panel(PanelMode::Files);
+        assert_eq!(app.panel, PanelMode::Files);
+        app.activate(ButtonId::PanelChanges);
+        assert_eq!(app.panel, PanelMode::Changes);
+    }
+
+    /// The stack line is only there where there is a stack.
+    #[test]
+    fn the_sections_menu_leaves_out_a_stack_that_is_not_there() {
+        let mut app = stacked_app();
+        app.stack = None;
+        let ids: Vec<ButtonId> = app
+            .section_items()
+            .iter()
+            .filter_map(|r| match r {
+                MenuRow::Item(it) => Some(it.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(!ids.contains(&ButtonId::PanelStack));
+    }
+
+    /// The ☰ menu had no way back to the change either — its three panel
+    /// lines were Files, Commits and Stack. It carries the same list now.
+    #[test]
+    fn the_main_menu_can_also_get_back_to_the_change() {
+        let mut app = stacked_app();
+        app.set_panel(PanelMode::Files);
+        let has_change = app
+            .build_menu()
+            .iter()
+            .any(|r| matches!(r, MenuRow::Item(it) if it.id == ButtonId::PanelChanges));
+        assert!(has_change, "the ☰ menu offers the change");
+    }
+
+    /// The label the collapsed button wears says where you are, so the
+    /// row still answers "which section is this" with one button.
+    #[test]
+    fn the_collapsed_button_names_the_section() {
+        let mut app = stacked_app();
+        assert_eq!(app.section_label(), "Change");
+        app.set_panel(PanelMode::Files);
+        assert_eq!(app.section_label(), "Files");
+        app.set_panel(PanelMode::Commits);
+        assert_eq!(app.section_label(), "Commits");
+        app.set_panel(PanelMode::Stack);
+        assert_eq!(app.section_label(), "Stack");
+    }
+
+    /// A refresh where the stack went — the last of the chain merged, or
+    /// a swap to local review — must not leave the reader in a panel with
+    /// nothing behind it.
+    #[test]
+    fn losing_the_stack_gives_the_panel_back() {
+        let mut app = stacked_app();
+        app.set_panel(PanelMode::Stack);
+        assert_eq!(app.panel, PanelMode::Stack);
+        app.set_stack(None);
+        assert_eq!(app.panel, PanelMode::Changes);
+    }
+
     fn pr_workspace(number: u64) -> Workspace {
         let old = "x\n".to_string();
         let new = "y\n".to_string();
@@ -19585,6 +20165,7 @@ more
             conflict: None,
             pr: Some(pr_detail(number)),
             checked_out: true,
+            stack: None,
             merge_base: "c".repeat(40),
             stack_base: "c".repeat(40),
             files: vec![cf("other.rs")],
@@ -19655,6 +20236,7 @@ more
             files: vec![cf("pr_file.rs")],
             viewed: HashSet::new(),
             auto: false,
+            stack: None,
         })));
         assert!(!app.local);
         assert_eq!(app.pr.as_ref().map(|p| p.number), Some(9));
@@ -19721,6 +20303,7 @@ more
                 merge_base: "c".repeat(40),
                 files: vec![cf("test.rs")],
                 viewed: HashSet::new(),
+                stack: None,
             })),
             false,
         );
