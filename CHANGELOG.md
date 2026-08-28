@@ -7,29 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **A tab clicked from a rendered document dropped to the diff.** The
-  file panel has always followed one rule — switch to another markdown
-  file while a document is on screen and you get that file's document —
-  and a pinned tab followed it too. The tab row did not: it put the diff
-  up instead, so reading a set of plan files meant pressing `P` again
-  between every pair, or leaving the tab row alone and using the file
-  panel. All three doors now answer the same way, and a file loupe
-  cannot render still drops to its diff, because there is nothing to
-  render. The document also stays up while the next file is read, so the
-  pane no longer blinks between them.
-
-- **A narrow file panel could not get back to the change.** The panel's
-  button row drops buttons it has no room for, and it drops them from the
-  left — where `Change` sits, the one section everybody comes back to. At
-  the default width of 34 columns a fourth button (the stack) is one
-  column too many, so `Change` went, and the `☰` menu had no line for it
-  either: its three panel lines were Files, Commits and Stack. There was
-  no way back to the change but `F`. Now a row with no room for a button
-  each collapses into one `▾` that names where you are and opens every
-  section, and the `☰` menu carries the same list. Both are built from
-  one place, so a fifth section cannot reintroduce the gap.
+## [0.3.0] - 2026-08-28
 
 ### Added
 
@@ -250,6 +228,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   staged files included, so it agrees with the `STAGED` heading.
 
 ### Fixed
+
+- **A tab clicked from a rendered document dropped to the diff.** The
+  file panel has always followed one rule — switch to another markdown
+  file while a document is on screen and you get that file's document —
+  and a pinned tab followed it too. The tab row did not: it put the diff
+  up instead, so reading a set of plan files meant pressing `P` again
+  between every pair, or leaving the tab row alone and using the file
+  panel. All three doors now answer the same way, and a file loupe
+  cannot render still drops to its diff, because there is nothing to
+  render. The document also stays up while the next file is read, so the
+  pane no longer blinks between them.
+
+- **A narrow file panel could not get back to the change.** The panel's
+  button row drops buttons it has no room for, and it drops them from the
+  left — where `Change` sits, the one section everybody comes back to. At
+  the default width of 34 columns a fourth button (the stack) is one
+  column too many, so `Change` went, and the `☰` menu had no line for it
+  either: its three panel lines were Files, Commits and Stack. There was
+  no way back to the change but `F`. Now a row with no room for a button
+  each collapses into one `▾` that names where you are and opens every
+  section, and the `☰` menu carries the same list. Both are built from
+  one place, so a fifth section cannot reintroduce the gap.
 
 - **Right-clicking the PR badge did nothing while a document or the
   editor was open.** Each mode answered its own clicks and each answered
@@ -880,7 +880,8 @@ Initial public release.
 - **Hardening**: PR-controlled paths, oids, and refs validated before
   reaching `git`; no shell execution anywhere; symlink-safe editing.
 
-[Unreleased]: https://github.com/jjacoblee/Loupe/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/jjacoblee/Loupe/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jjacoblee/Loupe/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/jjacoblee/Loupe/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/jjacoblee/Loupe/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jjacoblee/Loupe/releases/tag/v0.1.0
