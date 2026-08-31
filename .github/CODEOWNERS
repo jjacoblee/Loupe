@@ -1,0 +1,12 @@
+# Code owners for Loupe.
+#
+# Every pull request that touches a matching path requires review from the
+# owners listed here. Enforcement needs "Require review from Code Owners"
+# enabled in the branch protection rule for the default branch — this file
+# alone only requests the review, it does not block the merge.
+#
+# Note: GitHub never requests review from the author of a pull request, so
+# a PR opened by @jjacoblee is not blocked on @jjacoblee's own approval.
+
+# Default owner for everything in the repository.
+* @jjacoblee

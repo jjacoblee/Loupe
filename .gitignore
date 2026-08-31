@@ -1,0 +1,21 @@
+# Build artifacts (Cargo.lock IS committed — this is a binary crate)
+/target
+
+# Per-repo loupe config — personal settings, never committed
+.loupe.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Profiling / debugging droppings
+*.profraw
+perf.data*
+flamegraph.svg

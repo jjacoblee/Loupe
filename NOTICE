@@ -1,0 +1,15 @@
+Loupe — mouse-first PR review in the terminal
+https://github.com/jjacoblee/Loupe
+
+Copyright 2026 Jacob Lee (https://github.com/jjacoblee)
+
+This product includes software developed by Jacob Lee.
+
+Licensed under the Apache License, Version 2.0. Section 4(d) of that
+license requires that this NOTICE file be carried by any derivative
+work — including products and hosted services built on Loupe.
+
+Loupe bundles third-party code. The Rust crates it links are listed with
+their licenses in THIRD-PARTY-NOTICES.md. The embedded syntax definitions
+and themes carry their own copyrights; `loupe --acknowledgements` prints
+them. Both must accompany redistributions of the binary.

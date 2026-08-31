@@ -1,0 +1,166 @@
+# loupe configuration — copy to ~/.config/loupe/config.toml (global) or to
+# .loupe.toml at a repository root (per-repo; wins over the global file).
+# Every key is optional. `loupe --help` documents the semantics.
+#
+# You rarely need to edit this by hand: the first launch runs a setup
+# wizard that writes the global file, the in-app theme picker (press t)
+# saves your theme choice, and `loupe set-theme <name>` does it from the
+# shell.
+
+# Upstream GitHub organization (or user) that pull requests are opened
+# against. When set, loupe lists and opens PRs on <org>/<repo-name> instead
+# of the clone's own owner — useful for fork workflows and for people who
+# work across several organizations. Pin per-project in .loupe.toml.
+#org = "acme"
+
+# Default startup mode when no --pr/--local/--auto flag is given:
+#   "auto"  — review uncommitted local changes if any, else the PR flow
+#   "pr"    — always go straight to pull requests
+#   "local" — always review local changes
+#mode = "auto"
+
+# Light or dark colors. On "auto" (the default) loupe asks the terminal
+# for its background color and tunes the diff greens and reds, the
+# gutters, and the chrome to match — at startup, and again every half
+# minute while you are idle. A system that turns dark in the evening
+# therefore takes loupe with it, without a restart, and picks up the
+# matching syntax theme below on the way.
+#
+# Setting this to "light" or "dark" pins it and turns detection off for
+# good. The theme picker's `Auto` button (press `t`, then `A`) is the way
+# back if you ever pin one by accident. `loupe appearance` reports what
+# your terminal actually said, and --light / --dark pin it for one
+# session.
+#appearance = "auto"
+
+# Syntax-highlighting themes, one per appearance — a theme is only
+# readable on the background it was designed for. `loupe --themes` prints
+# every valid name; press t inside loupe for a live-preview picker, and a
+# to switch light/dark. Setting only one is fine: the other slot borrows
+# from it, staying in the same family where there is a counterpart
+# (gruvbox-dark <-> gruvbox-light). Defaults: catppuccin-mocha and
+# catppuccin-latte.
+#theme = "catppuccin-mocha"
+#light_theme = "catppuccin-latte"
+
+# Starting width of the file panel, in columns. Drag the divider between the
+# panels (or press < / >) to change it while running; double-click the
+# divider to come back to the default of 34.
+#file_panel_width = 34
+
+# Language servers. Loupe never installs or bundles one; it looks on your
+# PATH for typescript-language-server, gopls or rust-analyzer and starts
+# one on demand for `gd` (go to definition), `gr` (find references) and
+# `K` (hover). A language with no server falls back to pattern matching.
+# `loupe --lsp` reports what was found. Set false to never start one.
+#language_servers = true
+
+# Run the language server's formatter (prettier, gofmt, rustfmt — whatever
+# it drives) every time the editor saves. Off by default: reformatting a
+# file mid-review would add changes to the diff nobody asked for. Ctrl+T
+# formats on demand either way, and Ctrl+Z undoes it in one keystroke.
+#format_on_save = false
+
+# Suggestions as you type a name, rather than only on Ctrl+Space. The
+# popup opens after one character of a word, and after a character the
+# server itself asks to be told about — `.` in TypeScript, `.` and `:` in
+# Rust — which is what makes `object.` list the object's fields. Tab or
+# Enter takes the highlighted one, Esc dismisses it.
+#suggest_while_typing = true
+
+# Run a linter over the buffer as you edit, and draw what it says beside
+# what the language server says: errors red, warnings yellow. Loupe knows
+# `eslint` and `ruff`, prefers the project's own copy in
+# `node_modules/.bin`, and feeds it the buffer on standard input, so you
+# see the lint for what is on screen rather than for what is on disk. A
+# linter you do not have costs nothing. `loupe --lsp` lists them.
+#linters = true
+
+# Re-scan the working tree while local review sits idle, so edits made by
+# an agent (or a second terminal) appear without a key press. It waits for
+# input to stop, never runs with the editor, an overlay or a selection
+# open, and never touches GitHub — a pull request refreshes on demand with
+# `r` or the ⟳ button. Toggle it for one session from the ☰ menu.
+#auto_refresh = true
+
+# How many layers of your own change the diff draws when it opens, and
+# what `s` starts on. A branch has two steps in it — what the remote
+# already has, and what you have done since — and this reads three
+# versions of each file instead of two: the base branch, the branch as
+# the remote has it (or your last commit, before you push), and the
+# working tree.
+#
+#   "off"    one layer, the change as a whole (the default)
+#   "stack"  all three: purple is already pushed, green and red are new,
+#            amber is a line this change has now written twice
+#   "new"    only what has changed since the push, amber still marked
+#
+# Off by default: it costs two more `git show` calls per file opened, and
+# most reviews are of somebody else's branch, where "what have I already
+# changed" is not the question. `s` walks the three either way.
+#layers = "off"
+
+# The blame pane, between the file panel and the diff: who last touched
+# each line, how long ago, and the pull request it landed in. Off by
+# default — it costs a `git blame` per file and about 30 columns of
+# width. Press B (or use the ☰ menu) to turn it on for one session.
+# Uncommitted lines and lines from the change under review get their own
+# colors, so "is this related to what I am doing now?" is answered before
+# you read a word.
+#blame = false
+
+# Its starting width in columns. Drag the second divider to change it
+# while running; double-click that divider to come back to 30. Below
+# about 22 columns the pull request number drops out, then the age.
+#blame_width = 30
+
+# Ask GitHub which pull request a blamed commit belongs to, for the
+# commits whose subject does not already say (a squash or merge commit
+# names it, a rebase merge does not). One batched `gh` call per file,
+# cached for the session. Set false to stay entirely offline.
+#blame_pr_lookup = true
+
+# ---------------------------------------------------------------- servers
+#
+# Extra language servers. Loupe drives TypeScript, Go and Rust out of the
+# box; a `[[server]]` table adds another, or replaces one of those with a
+# server you prefer. Nothing is installed or downloaded — loupe looks for
+# `command` on your PATH and starts it the first time you ask a question
+# about a file it handles.
+#
+# An extension a built-in server also claims goes to the one here.
+# `loupe --lsp` says what it found and what is missing.
+
+# [[server]]
+# lang = "Python"
+# extensions = ["py", "pyi"]
+# command = "pyright-langserver"
+# args = ["--stdio"]
+# install = "npm install -g pyright"
+
+# [[server]]
+# lang = "Ruby"
+# extensions = ["rb", "rake"]
+# command = "ruby-lsp"
+# install = "gem install ruby-lsp"
+
+# ----------------------------------------------------------------------
+#
+# Extra linters. Loupe runs `eslint` and `ruff` out of the box; a
+# `[[linter]]` table adds another, or replaces one of those.
+#
+# `format` says which JSON shape the command prints:
+#   "eslint" — [{ "messages": [{ "ruleId", "severity", "message",
+#                                "line", "column", … }] }]
+#   "ruff"   — [{ "code", "message", "location": { "row", "column" }, … }]
+#
+# The buffer goes to the command on standard input, so the command has to
+# accept it there. `args` is everything before the file name; loupe adds
+# the stdin flags itself.
+
+# [[linter]]
+# name = "biome"
+# extensions = ["ts", "tsx", "js", "jsx"]
+# command = "biome"
+# args = ["lint", "--reporter=json"]
+# format = "eslint"

@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: lint-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      # The staging tests drive a real temporary git repository and need an
+      # identity for any commits they create.
+      - name: Configure git identity for tests
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+        shell: bash
+      - name: cargo test
+        run: cargo test
+
+  notices:
+    name: third-party notices
+    runs-on: ubuntu-latest
+    env:
+      CARGO_ABOUT_VERSION: "0.9.2"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/bin/cargo-about
+          key: notices-${{ runner.os }}-about${{ env.CARGO_ABOUT_VERSION }}-${{ hashFiles('Cargo.lock', 'about.toml') }}
+      # Pinned deliberately. THIRD-PARTY-NOTICES.md is a generated file that
+      # the next step diffs byte for byte, so a cargo-about release that
+      # changed its rendering would fail this job on an unrelated pull
+      # request. Bump the pin and regenerate the file in the same commit.
+      - name: Install cargo-about
+        run: |
+          set -euo pipefail
+          want="cargo-about ${CARGO_ABOUT_VERSION}"
+          if [ "$(cargo about --version 2>/dev/null || true)" != "$want" ]; then
+            cargo install cargo-about --locked --features cli \
+              --version "${CARGO_ABOUT_VERSION}"
+          fi
+      # THIRD-PARTY-NOTICES.md ships in every release archive, so a stale
+      # copy means shipping binaries whose attribution does not match what
+      # is actually linked into them. Regenerate and diff.
+      - name: Check notices are up to date
+        run: |
+          set -euo pipefail
+          cargo about generate --fail about.hbs > /tmp/notices.md
+          if ! diff -u THIRD-PARTY-NOTICES.md /tmp/notices.md; then
+            echo
+            echo "THIRD-PARTY-NOTICES.md is out of date. Regenerate it with:"
+            echo "  cargo about generate --fail about.hbs > THIRD-PARTY-NOTICES.md"
+            exit 1
+          fi

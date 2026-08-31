@@ -1,0 +1,45 @@
+name: Bug report
+description: Something in Loupe doesn't work as documented
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: |
+        1. Ran `loupe` inside …
+        2. Clicked …
+        3. Expected …, but …
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Terminal behavior (especially mouse events) varies a lot between emulators — this section is usually the whole diagnosis.
+      value: |
+        - Loupe version (`loupe --help` header, release tag, or commit):
+        - OS:
+        - Terminal emulator (+ multiplexer, if any — tmux/screen/zellij):
+        - `git --version`:
+        - `gh --version`:
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Which mode?
+      options:
+        - Reviewing a pull request
+        - Reviewing local changes
+        - The PR picker / startup
+        - The editor
+        - Other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Status-bar error text, screenshots, an example repo/PR, a config file (`.loupe.toml` / `config.toml`) if relevant.

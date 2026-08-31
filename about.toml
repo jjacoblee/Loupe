@@ -1,0 +1,42 @@
+# Configuration for `cargo about`, which generates THIRD-PARTY-NOTICES.md —
+# the attribution that has to travel with the release binaries. Regenerate
+# with `cargo about generate --output-file THIRD-PARTY-NOTICES.md about.hbs`;
+# the release workflow does this on every tag.
+
+# Only the targets we actually ship binaries for (see .github/workflows/
+# release.yml). Without this, cargo-about walks every platform's cfg tree
+# and pulls in notices for crates that never reach a Loupe binary.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Build-time-only crates never ship inside the binary, so their notices do
+# not belong in a redistribution notice.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Order matters: for a crate offering a choice (`MIT OR Apache-2.0`), the
+# first match here is the one recorded, so Apache-2.0 leads to match
+# Loupe's own license.
+#
+# Every license below is permissive. Loupe has no copyleft dependency, and
+# adding one should fail this check loudly rather than slip into a release.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "0BSD",
+    "Unlicense",
+    "MPL-2.0",
+]
